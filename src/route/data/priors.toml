@@ -1,0 +1,27 @@
+# Static seed rules -> Beta priors, per SPEC section 5.
+#
+# A pool the rules favour for a cell starts at Beta(favoured) = Beta(8, 2);
+# one they don't starts at Beta(unfavoured) = Beta(2, 8). Cold start behaves
+# exactly like these hand-written rules; observations swamp the prior and the
+# crossover to adaptive is automatic and per-cell. There is deliberately no
+# flag or threshold for "become adaptive".
+#
+# Changing the shape vocabulary is a SCHEMA BUMP, not a config tweak.
+
+schema = 1
+favoured = [8, 2]
+unfavoured = [2, 8]
+
+[rules]
+"coding:implement" = ["claude", "codex"]
+"coding:refactor"  = ["claude", "codex"]
+"coding:test"      = ["codex", "kimi"]
+"coding:debug"     = ["claude", "codex"]
+"coding:review"    = ["kimi", "claude"]
+"batch:classify"   = ["local-batch"]
+"batch:summarize"  = ["local-batch"]
+"batch:extract"    = ["local-batch"]
+"batch:embed"      = ["local-batch"]
+"research"         = ["kimi", "claude"]
+"writing"          = ["claude", "kimi"]
+"orchestration"    = ["claude"]

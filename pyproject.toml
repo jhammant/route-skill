@@ -1,0 +1,33 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "route-skill"
+version = "0.1.0"
+description = "Decide where a task should run — Claude, Codex, Kimi, or a local model — and learn from what happens."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [{ name = "jhammant" }]
+keywords = ["routing", "bandit", "llm", "claude", "codex", "kimi"]
+dependencies = [
+    "banditry @ git+https://github.com/jhammant/banditry",
+    "tomli; python_version < '3.11'",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[project.scripts]
+route = "route.cli:main"
+auto = "route.cli:main_auto"
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/route"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

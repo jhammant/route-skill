@@ -1,0 +1,178 @@
+"""Vetoes (step 2) and quota gating (steps 3-4).
+
+Vetoes are hard gates, not scores: any veto short-circuits to ``claude``
+regardless of quota or complexity. Quota gates *availability* — an arm whose
+pool reports ``critical`` headroom is REMOVED from eligibility, never merely
+penalised. The bandit decides quality among what survives.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import subprocess
+from dataclasses import dataclass, field
+
+from .pools import Pool
+from .shapes import FALLBACK_SHAPE
+
+#: The pool every veto short-circuits to.
+VETO_TARGET = "claude"
+
+
+@dataclass(frozen=True)
+class Veto:
+    name: str
+    reason: str
+    target: str = VETO_TARGET
+
+
+_NEEDS_CONTEXT_RE = re.compile(
+    r"\b(this (conversation|chat|thread)|as (we )?discussed|the above|"
+    r"what we were (doing|working on)|earlier in this)\b",
+    re.IGNORECASE,
+)
+_CROSS_REPO_RE = re.compile(
+    r"\b(cross[- ]repo|multi[- ]repo|across (repos|repositories|directories|projects)|"
+    r"multiple (repos|repositories|directories)|several (repos|directories))\b",
+    re.IGNORECASE,
+)
+_PRIVATE_RE = re.compile(
+    r"\b(private data|secrets?|credentials?|passwords?|\.env\b|api keys?|"
+    r"personal data|pii|customer data|medical|financial records)\b",
+    re.IGNORECASE,
+)
+_NO_ACCEPTANCE_RE = re.compile(
+    r"\b(no (clear )?(acceptance|way to verify)|can'?t (be )?verif|unverifiable)\b",
+    re.IGNORECASE,
+)
+
+
+def detect_veto(
+    text: str,
+    *,
+    shape: str | None = None,
+    pool_pin: str | None = None,
+    private: bool = False,
+    no_acceptance: bool = False,
+    needs_context: bool = False,
+    cross_repo: bool = False,
+) -> Veto | None:
+    """Evaluate hard gates before anything else. First veto wins.
+
+    Explicit flags beat inferred cues; a user pool pin beats everything.
+    """
+    if pool_pin:
+        return Veto("user-pin", f"user pinned pool '{pool_pin}'", target=pool_pin)
+    if needs_context or _NEEDS_CONTEXT_RE.search(text):
+        return Veto("needs-context", "needs this conversation's context — no other pool has it")
+    if cross_repo or _CROSS_REPO_RE.search(text):
+        return Veto("cross-repo", "cross-repo / multi-directory orchestration — remote pools are dir-sandboxed")
+    if private or _PRIVATE_RE.search(text):
+        return Veto("private-data", "private data must not leave the machine")
+    if no_acceptance or _NO_ACCEPTANCE_RE.search(text):
+        return Veto("no-acceptance", "no clear acceptance check — can't verify a hand-off")
+    if shape == FALLBACK_SHAPE:
+        return Veto("orchestration", "orchestration never routes away")
+    return None
+
+
+def eligible_for(shape: str, pools: dict[str, Pool]) -> list[str]:
+    """Step 3: arms that accept this shape at all, registry order."""
+    return [name for name, pool in pools.items() if pool.accepts(shape)]
+
+
+def parse_quota(payload: dict) -> dict[str, str]:
+    """Normalise quotamax JSON to {pool: headroom}.
+
+    Accepts {"codex": "ok"}, {"codex": {"headroom": "ok"}}, or either nested
+    under a "pools" key. Headroom values: ok | low | critical.
+    """
+    data = payload.get("pools", payload) if isinstance(payload, dict) else {}
+    out: dict[str, str] = {}
+    for pool, value in data.items():
+        if isinstance(value, dict):
+            value = value.get("headroom", value.get("status", "ok"))
+        out[str(pool)] = str(value).lower()
+    return out
+
+
+def fetch_quota(cmd: tuple[str, ...] = ("quotamax", "agent", "--json"), timeout: float = 5.0) -> dict[str, str]:
+    """Live quota from quotamax. Fail-open: any error means no quota data."""
+    try:
+        proc = subprocess.run(list(cmd), capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    if proc.returncode != 0:
+        return {}
+    try:
+        return parse_quota(json.loads(proc.stdout))
+    except ValueError:
+        return {}
+
+
+def apply_quota(
+    eligible: list[str],
+    quota: dict[str, str],
+    *,
+    quota_pool: dict[str, str | None] | None = None,
+) -> list[str]:
+    """Step 4: remove arms whose pool reports critical headroom.
+
+    ``quota_pool`` maps arm -> quotamax pool name; arms mapped to None (local
+    models) have no quota and always survive.
+    """
+    mapping = quota_pool or {"claude": "claude", "codex": "codex", "kimi": "kimi"}
+    out = []
+    for arm in eligible:
+        pool_name = mapping.get(arm)
+        if pool_name is not None and quota.get(pool_name) == "critical":
+            continue
+        out.append(arm)
+    return out
+
+
+@dataclass
+class GateResult:
+    """The survivors of steps 2-4, plus why."""
+
+    veto: Veto | None
+    eligible: list[str]
+    removed_by_quota: list[str] = field(default_factory=list)
+
+
+def gate(
+    text: str,
+    shape: str,
+    pools: dict[str, Pool],
+    *,
+    quota: dict[str, str] | None = None,
+    pool_pin: str | None = None,
+    private: bool = False,
+    no_acceptance: bool = False,
+    needs_context: bool = False,
+    cross_repo: bool = False,
+) -> GateResult:
+    """Steps 2-4 in order: veto, eligibility, quota."""
+    veto = detect_veto(
+        text,
+        shape=shape,
+        pool_pin=pool_pin,
+        private=private,
+        no_acceptance=no_acceptance,
+        needs_context=needs_context,
+        cross_repo=cross_repo,
+    )
+    if veto is not None:
+        return GateResult(veto=veto, eligible=[veto.target])
+    eligible = eligible_for(shape, pools)
+    if quota:
+        survivors = apply_quota(eligible, quota)
+        removed = [a for a in eligible if a not in survivors]
+        eligible = survivors
+    else:
+        removed = []
+    if not eligible:
+        # Nobody can take it — stay here rather than route into the void.
+        return GateResult(veto=Veto("no-survivors", "no eligible arm survived quota gating"), eligible=[VETO_TARGET])
+    return GateResult(veto=None, eligible=eligible, removed_by_quota=removed)

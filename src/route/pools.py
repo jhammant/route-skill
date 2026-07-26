@@ -55,7 +55,12 @@ class Pool:
     remote: bool = False
     cost: str = "included"  # included | paid | local
     strength: int = 0
-    dispatch: str = ""  # command template; {task} is substituted, quoted
+    dispatch: str = ""  # command template for REAL work; {task} is substituted
+    #: Single-prompt command used by `route benchmark`. Distinct from
+    #: dispatch because real-work commands often take a file and a template
+    #: (local-llm batch) and cannot answer a bare prompt. Empty means the
+    #: pool cannot be benchmarked by shelling out.
+    probe: str = ""
     model: Model = field(default_factory=lambda: Model(name="unknown"))
     #: Server-authoritative fan-out limit (Kimi's /usages parallel.limit is
     #: 30 on ADVANCED). A swarm is a property of DISPATCH, never a separate
@@ -88,6 +93,7 @@ def _default_pools() -> dict[str, Pool]:
             cost="paid",
             strength=strength("codex"),
             dispatch="codex exec {task}",
+            probe="codex exec {task}",
             model=Model(name="gpt-5.6-sol"),
             parallel_limit=4,
         ),
@@ -98,6 +104,7 @@ def _default_pools() -> dict[str, Pool]:
             cost="paid",
             strength=strength("kimi"),
             dispatch="kimi -p {task}",
+            probe="kimi -p {task}",
             model=Model(name="kimi"),
             parallel_limit=30,  # /usages parallel.limit, ADVANCED
         ),
@@ -108,6 +115,7 @@ def _default_pools() -> dict[str, Pool]:
             cost="local",
             strength=strength("local-batch"),
             dispatch="local-llm batch {task}",
+            probe="local-llm ask {task}",
             model=Model(name="qwen3.6-27b", quant="4bit"),
             parallel_limit=2,
         ),
@@ -118,6 +126,7 @@ def _default_pools() -> dict[str, Pool]:
             cost="local",
             strength=strength("local-agent"),
             dispatch="local-llm agent {task}",
+            probe="local-llm ask {task}",
             model=Model(name="qwen3.6-27b", quant="4bit"),
             parallel_limit=2,
         ),
@@ -145,6 +154,7 @@ def load_pools(path: str | Path | None = None) -> dict[str, Pool]:
             cost=str(spec.get("cost", "included")),
             strength=int(spec.get("strength", 0)),
             dispatch=str(spec.get("dispatch", "")),
+            probe=str(spec.get("probe", "")),
             model=Model(
                 name=str(model_spec.get("name", "unknown")),
                 quant=str(model_spec.get("quant", "")),

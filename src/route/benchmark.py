@@ -158,10 +158,14 @@ def shell_runner(pools: dict[str, Pool], timeout: float = 120.0) -> Runner:
 
     def run(arm: str, prompt: str) -> str:
         pool = pools[arm]
-        if not pool.dispatch:
-            raise RuntimeError(f"pool {arm!r} has no dispatch command")
-        argv = [prompt if tok == "{task}" else tok for tok in shlex.split(pool.dispatch)]
-        if "{task}" not in shlex.split(pool.dispatch):
+        # benchmarking asks ONE question, so it needs the single-prompt
+        # command. A real-work dispatch (e.g. "local-llm batch") takes a
+        # file and a template and cannot answer a bare prompt.
+        command = pool.probe or pool.dispatch
+        if not command:
+            raise RuntimeError(f"pool {arm!r} has no probe command; cannot benchmark it")
+        argv = [prompt if tok == "{task}" else tok for tok in shlex.split(command)]
+        if "{task}" not in shlex.split(command):
             argv.append(prompt)
         proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
         if proc.returncode != 0:

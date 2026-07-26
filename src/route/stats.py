@@ -33,6 +33,9 @@ class Decision:
     wall_clock_s: float | None = None
     tokens: int | None = None
     escalations: int = 0
+    #: Per-unit accept/reject detail for a swarm dispatch. Counts only —
+    #: the posterior sees one weighted observation, never this list.
+    units: list[bool] | None = None
 
 
 @dataclass
@@ -106,12 +109,32 @@ def _prior_of(router: Router, shape: str, arm: str) -> tuple[float, float]:
     return float(a), float(b)
 
 
+def _bench_obs(router: Router) -> dict[tuple[str, str, str], float]:
+    """{(shape, tier, arm): benchmark observations} from the bench namespace."""
+    from .benchmark import parse_bench_key  # local import: stats <-> benchmark
+
+    totals: dict[tuple[str, str, str], float] = {}
+    for key in router.storage.keys("bench:"):
+        parsed = parse_bench_key(key)
+        if parsed is None:
+            continue
+        shape, tier, event = parsed
+        if event != "impression":
+            continue
+        for arm, count in router.storage.counts(key).items():
+            slot = (shape, tier, arm)
+            totals[slot] = totals.get(slot, 0.0) + count
+    return totals
+
+
 def report_cells(router: Router) -> list[dict]:
     """Per-cell, per-arm: observations, success rate, prior vs posterior.
 
     Showing prior and posterior side by side is the transparency that makes
     an adaptive router trustworthy — you can see exactly when evidence took
-    over from the rules.
+    over from the rules. Real vs benchmark observations are reported in
+    SEPARATE columns, so it is always visible how much of a cell's
+    confidence is manufactured.
     """
     cells: dict[tuple[str, str], list[str]] = {}
     for key in router.storage.keys("route:"):
@@ -120,6 +143,7 @@ def report_cells(router: Router) -> list[dict]:
             continue
         shape, tier = parsed
         cells.setdefault((shape, tier), [])
+    bench = _bench_obs(router)
     rows = []
     for shape, tier in sorted(cells):
         posterior = router.posterior(shape, tier)
@@ -132,6 +156,8 @@ def report_cells(router: Router) -> list[dict]:
                 "cell": f"{shape}:{tier}",
                 "arm": arm,
                 "obs": oa + ob,
+                "real_obs": oa + ob,
+                "bench_obs": bench.get((shape, tier, arm), 0),
                 "success_rate": round(oa / (oa + ob), 4) if (oa + ob) else None,
                 "prior": f"Beta({prior_a:g},{prior_b:g})",
                 "posterior": f"Beta({pa:g},{pb:g})",

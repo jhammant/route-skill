@@ -12,6 +12,7 @@ from route.federate import (
     K_ANONYMITY,
     TEAM_DISCOUNT,
     FederationState,
+    aggregate,
     assert_payload_clean,
     export,
     merge_exports,
@@ -181,3 +182,91 @@ def test_push_is_opt_in_and_strips_meta(router, pools, tmp_path):
     shared = json.loads(out.read_text())
     assert "meta" not in shared
     assert shared["records"] == payload["records"]
+
+
+# -- aggregate: the publishable community prior --------------------------------
+
+
+def _rec(alpha, beta, context="coding:refactor:hard", arm="codex", model="gpt-5.6-sol"):
+    return {"schema": 1, "context": context, "arm": arm, "model": model,
+            "alpha": alpha, "beta": beta}
+
+
+def _write_export(path, records):
+    path.write_text(json.dumps({"schema": 1, "kind": "routing-quality",
+                                "records": records}))
+
+
+def test_aggregate_k_anonymity_suppresses_cells_below_three_contributors(tmp_path):
+    d = tmp_path / "exports"
+    d.mkdir()
+    _write_export(d / "a.json", [_rec(4, 1)])
+    _write_export(d / "b.json", [_rec(3, 2)])
+    payload = aggregate(d)
+    assert payload["records"] == []
+    assert payload["suppressed"] == [{
+        "context": "coding:refactor:hard",
+        "reason": f"k-anonymity: 2 contributor(s) < {K_ANONYMITY}",
+    }]
+
+    _write_export(d / "c.json", [_rec(5, 1)])
+    payload = aggregate(d)
+    assert len(payload["records"]) == 1
+    assert payload["suppressed"] == []
+    assert payload["meta"]["contributors"]["coding:refactor:hard"] == 3
+
+
+def test_aggregate_one_installation_cannot_dominate(tmp_path):
+    """Trimmed-mean rates + median totals: an outlier with huge counts loses."""
+    d = tmp_path / "exports"
+    d.mkdir()
+    _write_export(d / "dominant.json", [_rec(10000, 100)])  # 99% at 10100 counts
+    for i, (a, b) in enumerate([(4, 6), (5, 5), (3, 7)]):
+        _write_export(d / f"user{i}.json", [_rec(a, b)])
+
+    payload = aggregate(d)
+    (rec,) = payload["records"]
+    rate = rec["alpha"] / (rec["alpha"] + rec["beta"])
+    # The 99% outlier is trimmed away; the published rate is the crowd's.
+    assert rate == pytest.approx(0.45, abs=0.01)
+    assert rate < 0.6
+    # And its mountain of counts is gone: total reflects the median
+    # contributor, far below even the per-installation cap.
+    assert rec["alpha"] + rec["beta"] == pytest.approx(10)
+    assert rec["alpha"] + rec["beta"] <= CONTRIBUTION_CAP
+
+
+def test_aggregate_caps_each_contributor_before_combining(tmp_path):
+    d = tmp_path / "exports"
+    d.mkdir()
+    for i in range(3):
+        _write_export(d / f"user{i}.json", [_rec(CONTRIBUTION_CAP * 10, 0)])
+    payload = aggregate(d)
+    (rec,) = payload["records"]
+    assert rec["alpha"] + rec["beta"] <= CONTRIBUTION_CAP
+
+
+def test_cli_federate_merge_sums_counts(tmp_path, capsys):
+    from route.cli import main
+
+    a, b = tmp_path / "a.json", tmp_path / "b.json"
+    _write_export(a, [_rec(4, 1)])
+    _write_export(b, [_rec(3, 2)])
+    assert main(["federate", "merge", str(a), str(b)]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["records"][0]["alpha"] == 7
+    assert out["records"][0]["beta"] == 3
+
+
+def test_cli_federate_aggregate_writes_out_file(tmp_path, capsys):
+    from route.cli import main
+
+    d = tmp_path / "exports"
+    d.mkdir()
+    for i, (x, y) in enumerate([(4, 1), (5, 1), (3, 2)]):
+        _write_export(d / f"user{i}.json", [_rec(x, y)])
+    out_file = tmp_path / "community.json"
+    assert main(["federate", "aggregate", str(d), "--out", str(out_file)]) == 0
+    payload = json.loads(out_file.read_text())
+    assert len(payload["records"]) == 1
+    assert_payload_clean(payload)

@@ -1,4 +1,4 @@
-"""route / auto / stats / federate — the command line.
+"""route / auto / stats / federate / benchmark — the command line.
 
 ``route <task>`` decides and explains, then waits for confirmation.
 ``auto <task>`` decides and dispatches immediately. Dispatch hands to the
@@ -15,15 +15,27 @@ import shlex
 import subprocess
 import sys
 import time
+from dataclasses import asdict
+from pathlib import Path
 
 from . import __version__
+from .benchmark import (
+    BENCHMARK_DISCOUNT,
+    SUITES,
+    enable_seed,
+    local_llm_throughput_path,
+    run_benchmark,
+    seed_priors,
+)
 from .complexity import estimate_complexity
 from .eligibility import fetch_quota, gate
 from .federate import (
     FederationState,
+    aggregate,
     assert_payload_clean,
     export,
     export_throughput,
+    merge_exports,
     pull,
     push,
     status,
@@ -32,11 +44,21 @@ from .pools import load_pools
 from .router import Router, cell_name
 from .shapes import classify_shape
 from .stats import Decision, Stats, report_arm, report_cells, report_throughput
+from .storage import JsonStorage
 
 
 def _build_router() -> Router:
     fed = FederationState()
-    return Router(community=fed.community_priors())
+    storage = JsonStorage()
+    # Community priors (0.4x) and, if `benchmark --seed` was used, benchmark
+    # priors (0.3x) both seed the live cells; own observations grow past them.
+    community: dict[str, dict[str, tuple[float, float]]] = fed.community_priors()
+    for context, arms in seed_priors(storage).items():
+        cell = community.setdefault(context, {})
+        for arm, (a, b) in arms.items():
+            have_a, have_b = cell.get(arm, (0.0, 0.0))
+            cell[arm] = (have_a + a, have_b + b)
+    return Router(storage=storage, community=community)
 
 
 def decide(args: argparse.Namespace, *, auto: bool) -> int:
@@ -173,8 +195,65 @@ def cmd_federate(args: argparse.Namespace) -> int:
     elif args.federate_cmd == "pull":
         result = pull(args.source, fed, trust=args.trust)
         print(json.dumps(result, sort_keys=True))
+    elif args.federate_cmd == "merge":
+        payloads = []
+        for name in args.files:
+            payloads.append(json.loads(Path(name).read_text(encoding="utf-8")))
+        if not payloads:
+            print("route federate merge: give at least one export file", file=sys.stderr)
+            return 2
+        # Beta posteriors compose by ADDITION: alpha=sigma, beta=sigma.
+        print(json.dumps(merge_exports(*payloads), indent=2, sort_keys=True))
+    elif args.federate_cmd == "aggregate":
+        if not args.files:
+            print("route federate aggregate: give a directory of exports", file=sys.stderr)
+            return 2
+        payload = aggregate(args.files[0])
+        if args.out:
+            out_path = Path(args.out)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+            print(f"wrote community aggregate: {out_path}")
+        else:
+            print(json.dumps(payload, indent=2, sort_keys=True))
     elif args.federate_cmd == "status":
         print(json.dumps(status(router, pools, fed), indent=2, sort_keys=True))
+    return 0
+
+
+def cmd_benchmark(args: argparse.Namespace) -> int:
+    pools = load_pools()
+    if args.arm:
+        arms = [args.arm]
+    elif args.compare:
+        arms = [a.strip() for a in args.compare.split(",") if a.strip()]
+    else:
+        arms = list(pools)
+    unknown = [a for a in arms if a not in pools]
+    if unknown:
+        print(f"route benchmark: unknown arm(s) {unknown}", file=sys.stderr)
+        return 2
+    suites = [args.suite] if args.suite else list(SUITES)
+    results = run_benchmark(
+        arms,
+        suites,
+        pools,
+        storage=JsonStorage(),
+        stats=Stats(),
+        local_llm_path=local_llm_throughput_path(),
+    )
+    seeded = False
+    if args.seed:
+        # Merge benchmark evidence into live priors at 0.3x — below the 0.4x
+        # community weight. Synthetic evidence never outranks real work.
+        enable_seed()
+        seeded = True
+    print(json.dumps({
+        "results": [asdict(r) for r in results],
+        "namespace": "bench:{shape}:{tier}",
+        "seeded": seeded,
+        "seed_discount": BENCHMARK_DISCOUNT if seeded else None,
+    }, indent=2, sort_keys=True))
     return 0
 
 
@@ -199,12 +278,24 @@ def _parser(prog: str) -> argparse.ArgumentParser:
     o.set_defaults(func=cmd_outcome)
 
     f = sub.add_parser("federate")
-    f.add_argument("federate_cmd", choices=["export", "push", "pull", "status"])
+    f.add_argument("federate_cmd", choices=["export", "push", "pull", "status", "merge", "aggregate"])
+    f.add_argument("files", nargs="*",
+                   help="merge: export files to sum; aggregate: directory of exports")
+    f.add_argument("--out", help="aggregate: write the community aggregate here")
     f.add_argument("--yes", action="store_true", help="opt in to sharing (push only)")
-    f.add_argument("--source", default="", help="community prior file or URL (pull)")
+    f.add_argument("--from", "--source", dest="source", default="",
+                   help="community prior file or URL (pull)")
     f.add_argument("--trust", choices=["community", "team"], default="community")
     f.add_argument("--throughput", action="store_true", help="include the throughput dataset")
     f.set_defaults(func=cmd_federate)
+
+    b = sub.add_parser("benchmark", help="manufacture evidence instead of waiting for it")
+    b.add_argument("--arm", help="benchmark one arm (e.g. a model just downloaded)")
+    b.add_argument("--suite", choices=list(SUITES), help="run one suite")
+    b.add_argument("--seed", action="store_true",
+                   help="merge results into live priors at 0.3x (below the 0.4x community weight)")
+    b.add_argument("--compare", help="comma-separated arms, head-to-head on the same tasks")
+    b.set_defaults(func=cmd_benchmark)
     return p
 
 
@@ -221,7 +312,7 @@ def _add_task_flags(p: argparse.ArgumentParser) -> None:
     p.add_argument("--no-quota", action="store_true", help="skip quotamax")
 
 
-_SUBCOMMANDS = {"task", "stats", "outcome", "federate"}
+_SUBCOMMANDS = {"task", "stats", "outcome", "federate", "benchmark"}
 
 
 def _run(argv: list[str] | None, *, auto: bool) -> int:

@@ -220,7 +220,11 @@ def export_throughput(stats: Stats) -> dict:
 
 
 def merge_exports(*payloads: dict) -> dict:
-    """Federation is summation: alpha=sigma, beta=sigma, per (context, arm, model)."""
+    """Federation is summation: alpha=sigma, beta=sigma, per (context, arm, model).
+
+    Beta posteriors compose by ADDITION — merging N users is just summing
+    counts, no gradients, no weights, no consensus protocol.
+    """
     merged: dict[tuple[str, str, str], dict] = {}
     contributors: dict[str, int] = {}
     for payload in payloads:
@@ -241,6 +245,103 @@ def merge_exports(*payloads: dict) -> dict:
         "meta": {"contributors": contributors},
     }
     return assert_payload_clean(out)
+
+
+# -- aggregate ------------------------------------------------------------------
+
+
+def _trimmed_mean(values: list[float], trim: float) -> float:
+    """Drop the top/bottom ``trim`` fraction, average the rest."""
+    ordered = sorted(values)
+    k = int(len(ordered) * trim)
+    core = ordered[k:len(ordered) - k] or ordered
+    return sum(core) / len(core)
+
+
+def _median(values: list[float]) -> float:
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[mid]
+    return (ordered[mid - 1] + ordered[mid]) / 2
+
+
+def aggregate(
+    directory: str | Path,
+    *,
+    k: int = K_ANONYMITY,
+    cap: int = CONTRIBUTION_CAP,
+    trim: float = 0.25,
+) -> dict:
+    """Build the publishable community aggregate from many contributor exports.
+
+    Each ``*.json`` file in ``directory`` is ONE installation's export (the
+    V1 infrastructure is a static file in a public repo, rebuilt nightly by
+    CI — no server). Anti-gaming, applied per (context, arm, model) cell:
+
+    - per-installation cap: each contributor's counts are scaled down to
+      ``cap`` total before anything is combined
+    - k-anonymity: a cell with fewer than ``k`` distinct contributors is
+      suppressed, listed under ``suppressed`` with the reason
+    - trimmed-mean robust aggregation: the published rate is the trimmed
+      mean of per-contributor success rates, scaled to the MEDIAN
+      contributor's total count — so no single contributor can dominate a
+      cell with either an outlier rate or a mountain of counts
+    """
+    paths = sorted(Path(directory).glob("*.json"))
+    # context -> (arm, model) -> [per-contributor (alpha, beta)]
+    cells: dict[str, dict[tuple[str, str], list[tuple[float, float]]]] = {}
+    contributors: dict[str, set[int]] = {}
+    for idx, path in enumerate(paths):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        for rec in payload.get("records", []):
+            alpha, beta = float(rec["alpha"]), float(rec["beta"])
+            total = alpha + beta
+            if total > cap:  # one installation cannot dominate a cell
+                scale = cap / total
+                alpha, beta = alpha * scale, beta * scale
+            context = rec["context"]
+            key = (rec["arm"], rec["model"])
+            cells.setdefault(context, {}).setdefault(key, []).append((alpha, beta))
+            contributors.setdefault(context, set()).add(idx)
+
+    records: list[dict] = []
+    suppressed: list[dict] = []
+    contributor_counts: dict[str, int] = {}
+    for context in sorted(cells):
+        n_contributors = len(contributors[context])
+        contributor_counts[context] = n_contributors
+        if n_contributors < k:
+            suppressed.append({
+                "context": context,
+                "reason": f"k-anonymity: {n_contributors} contributor(s) < {k}",
+            })
+            continue
+        for (arm, model), observations in sorted(cells[context].items()):
+            pairs = [(a, b) for a, b in observations if a + b > 0]
+            if not pairs:
+                continue
+            rate = _trimmed_mean([a / (a + b) for a, b in pairs], trim)
+            total = _median([a + b for a, b in pairs])
+            records.append({
+                "schema": SCHEMA,
+                "context": context,
+                "arm": arm,
+                "model": model,
+                "alpha": round(rate * total, 3),
+                "beta": round((1 - rate) * total, 3),
+            })
+    payload = {
+        "schema": SCHEMA,
+        "kind": "routing-quality",
+        "records": records,
+        "suppressed": suppressed,
+        "meta": {"contributors": contributor_counts},
+    }
+    return assert_payload_clean(payload)
 
 
 # -- pull / push / status -------------------------------------------------------

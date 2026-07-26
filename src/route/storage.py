@@ -40,21 +40,23 @@ class JsonStorage:
     """File-backed counter storage implementing banditry's Storage protocol.
 
     One JSON file holds every bucket: ``{key: {arm: count}}``. The file is
-    loaded lazily and rewritten atomically on every mutation.
+    loaded lazily and rewritten atomically on every mutation. Counts may be
+    fractional — a swarm records ONE observation weighted by the fraction of
+    units accepted (SPEC 'Swarms', statistical honesty).
     """
 
     def __init__(self, path: str | Path | None = None) -> None:
         self.path = Path(path) if path is not None else state_dir() / "bandits.json"
-        self._data: dict[str, dict[str, int]] | None = None
+        self._data: dict[str, dict[str, float]] | None = None
 
-    def _load(self) -> dict[str, dict[str, int]]:
+    def _load(self) -> dict[str, dict[str, float]]:
         if self._data is None:
             try:
                 raw = json.loads(self.path.read_text(encoding="utf-8"))
             except (OSError, ValueError):
                 raw = {}
             self._data = {
-                str(k): {str(arm): int(c) for arm, c in v.items()}
+                str(k): {str(arm): c for arm, c in v.items() if isinstance(c, (int, float))}
                 for k, v in raw.items()
                 if isinstance(v, dict)
             }
@@ -77,13 +79,13 @@ class JsonStorage:
 
     # -- banditry Storage protocol ----------------------------------------
 
-    def incr(self, key: str, arm: str, by: int = 1) -> None:
+    def incr(self, key: str, arm: str, by: float = 1) -> None:
         data = self._load()
         bucket = data.setdefault(key, {})
         bucket[arm] = bucket.get(arm, 0) + by
         self._save()
 
-    def counts(self, key: str) -> dict[str, int]:
+    def counts(self, key: str) -> dict[str, float]:
         return dict(self._load().get(key, {}))
 
     # -- introspection for stats/federation --------------------------------

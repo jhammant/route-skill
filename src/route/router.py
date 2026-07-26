@@ -110,12 +110,14 @@ class Router:
             rng=self._rng,
         )
 
-    def _seed_prior_counts(self, shape: str, cell: str, arm: str) -> tuple[int, int]:
+    def _seed_prior_counts(self, shape: str, cell: str, arm: str) -> tuple[float, float]:
         """(impressions, rewards) to seed so the effective prior is right.
 
         banditry adds alpha=beta=1 on top of raw counts, so to land on the
         rule table's Beta(a, b) we seed a-1 rewards in a-1 + b-1 impressions.
-        Community counts add prior strength on top of the rule seed.
+        Community and benchmark-seed counts add prior strength on top of the
+        rule seed; they may be fractional (already discounted), so the seed
+        counts stay fractional too.
         """
         a, b = (
             self.priors.favoured
@@ -126,8 +128,8 @@ class Router:
         # without the "route:" storage prefix.
         context = cell.split(":", 1)[1] if cell.startswith("route:") else cell
         extra_a, extra_b = self.community.get(context, {}).get(arm, (0.0, 0.0))
-        rewards = int(a - 1 + extra_a)
-        impressions = int(a - 1 + b - 1 + extra_a + extra_b)
+        rewards = a - 1 + extra_a
+        impressions = a - 1 + b - 1 + extra_a + extra_b
         return impressions, rewards
 
     def _ensure_seeded(self, shape: str, cell: str, arms: Iterable[str]) -> None:
@@ -159,11 +161,11 @@ class Router:
         bandit = self._bandit(cell, eligible)
         return bandit.select(eligible=eligible, record_impression=record_impression)
 
-    def reward(self, shape: str, tier: str, arm: str, event: str = REWARD_EVENT, by: int = 1) -> None:
+    def reward(self, shape: str, tier: str, arm: str, event: str = REWARD_EVENT, by: float = 1) -> None:
         cell = cell_name(shape, tier)
         self._bandit(cell, [arm]).reward(arm, event, by)
 
-    def record_impression(self, shape: str, tier: str, arm: str, by: int = 1) -> None:
+    def record_impression(self, shape: str, tier: str, arm: str, by: float = 1) -> None:
         """An impression with no reward — the negative outcome of escalation."""
         self.storage.incr(f"{cell_name(shape, tier)}:{IMPRESSION_EVENT}", arm, by)
 
@@ -181,17 +183,18 @@ class Router:
             out[arm] = (won + 1.0, lost + 1.0)
         return out
 
-    def observed_counts(self, shape: str, tier: str) -> dict[str, tuple[int, int]]:
+    def observed_counts(self, shape: str, tier: str) -> dict[str, tuple[float, float]]:
         """Real observations only — seeded prior pseudo-counts subtracted.
 
         Returns {arm: (alpha, beta)} of user-observed accepted/not-accepted.
-        This is the only data federation may ever see.
+        Values may be fractional: a swarm's single weighted observation counts
+        as exactly one trial. This is the only data federation may ever see.
         """
         cell = cell_name(shape, tier)
         seeds = self.storage.counts(f"{cell}:{SEED_EVENT}")
         impressions = self.storage.counts(f"{cell}:{IMPRESSION_EVENT}")
         rewards = self.storage.counts(f"{cell}:{REWARD_EVENT}")
-        out: dict[str, tuple[int, int]] = {}
+        out: dict[str, tuple[float, float]] = {}
         for arm in impressions.keys() | rewards.keys():
             seed_imps = seeds.get(arm, 0)
             seed_rewards = seeds.get(f"{arm}:rewards", 0)

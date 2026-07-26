@@ -57,6 +57,10 @@ class Pool:
     strength: int = 0
     dispatch: str = ""  # command template; {task} is substituted, quoted
     model: Model = field(default_factory=lambda: Model(name="unknown"))
+    #: Server-authoritative fan-out limit (Kimi's /usages parallel.limit is
+    #: 30 on ADVANCED). A swarm is a property of DISPATCH, never a separate
+    #: arm — the bandit picks the pool, the concurrency planner picks n.
+    parallel_limit: int = 1
 
     def accepts(self, shape: str) -> bool:
         return shape in self.shapes
@@ -85,6 +89,7 @@ def _default_pools() -> dict[str, Pool]:
             strength=strength("codex"),
             dispatch="codex exec {task}",
             model=Model(name="gpt-5.6-sol"),
+            parallel_limit=4,
         ),
         "kimi": Pool(
             name="kimi",
@@ -94,6 +99,7 @@ def _default_pools() -> dict[str, Pool]:
             strength=strength("kimi"),
             dispatch="kimi -p {task}",
             model=Model(name="kimi"),
+            parallel_limit=30,  # /usages parallel.limit, ADVANCED
         ),
         "local-batch": Pool(
             name="local-batch",
@@ -103,6 +109,7 @@ def _default_pools() -> dict[str, Pool]:
             strength=strength("local-batch"),
             dispatch="local-llm batch {task}",
             model=Model(name="qwen3.6-27b", quant="4bit"),
+            parallel_limit=2,
         ),
         "local-agent": Pool(
             name="local-agent",
@@ -112,6 +119,7 @@ def _default_pools() -> dict[str, Pool]:
             strength=strength("local-agent"),
             dispatch="local-llm agent {task}",
             model=Model(name="qwen3.6-27b", quant="4bit"),
+            parallel_limit=2,
         ),
     }
 
@@ -142,5 +150,6 @@ def load_pools(path: str | Path | None = None) -> dict[str, Pool]:
                 quant=str(model_spec.get("quant", "")),
                 version=str(model_spec.get("version", "")),
             ),
+            parallel_limit=int(spec.get("parallel_limit", 1)),
         )
     return pools

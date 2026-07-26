@@ -1,14 +1,40 @@
 # route-skill
 
-Decide **where a task should run** — Claude, Codex, Kimi, or a local model — from
-task shape, task complexity, and live quota; dispatch it; record what happened; and
-get better at the decision over time. Learning is federatable, so a fleet of users
-converges on which model is actually good at what.
+**Your weekly Claude quota expires unused while Codex sits idle and a 128 GB Mac
+does nothing.** You know some tasks belong on a cheaper pool, but deciding
+*which* — every time, against live quota, without sending a 4,000-item batch job
+to an agent that only takes files — is a judgement call you make badly when
+you're busy, and never record.
 
-Two skills from one engine:
+`route-skill` makes that decision explicitly, dispatches it, and gets better at
+it. Task shape rules out pools that structurally cannot do the work, quota rules
+out pools with no headroom, and a Thompson-sampled bandit picks among what's
+left — learning per task-shape which pool actually delivers.
 
-- **`/route <task>`** — decide and explain, wait for confirmation
-- **`/auto <task>`** — decide and dispatch immediately
+```text
+$ route "classify 4000 commit messages into categories"
+  shape     batch:classify        eligible  claude, local-batch
+  tier      trivial               chosen    local-batch
+  why       codex and kimi cannot take a batch shape; local has headroom
+```
+
+```mermaid
+flowchart LR
+  A[task] --> B[shape<br/>closed vocabulary]
+  B --> C{veto?<br/>needs context,<br/>private data}
+  C -->|yes| Z[stay on Claude]
+  C -->|no| D[eligible arms<br/>by shape]
+  D --> E[drop arms with<br/>no quota]
+  E --> F[bandit picks<br/>Thompson]
+  F --> G[dispatch]
+  G --> H[outcome to posterior]
+  H -.->|federate counts, never content| I[(community prior)]
+  I -.->|0.4x weight| F
+```
+
+There is deliberately **no "switch to adaptive" flag**. Each arm's Beta prior *is*
+the hand-written rule table, so a cold cell behaves exactly like the rules and
+evidence takes over on its own, per cell, as it accumulates.
 
 ## The decision, in order
 

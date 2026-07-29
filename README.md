@@ -1,40 +1,75 @@
 # route-skill
 
 **Your weekly Claude quota expires unused while Codex sits idle and a 128 GB Mac
-does nothing.** You know some tasks belong on a cheaper pool, but deciding
-*which* — every time, against live quota, without sending a 4,000-item batch job
-to an agent that only takes files — is a judgement call you make badly when
-you're busy, and never record.
+does nothing.** You know some tasks belong on a cheaper pool. Deciding *which* —
+every time, against live quota, without sending a 4,000-item batch job to an
+agent that only accepts files — is a judgement call you make badly when you're
+busy, and never record.
 
-`route-skill` makes that decision explicitly, dispatches it, and gets better at
-it. Task shape rules out pools that structurally cannot do the work, quota rules
-out pools with no headroom, and a Thompson-sampled bandit picks among what's
-left — learning per task-shape which pool actually delivers.
+`route-skill` makes the decision explicitly, dispatches it, and gets better at
+it. Shape rules out pools that structurally cannot do the work, quota rules out
+pools with no headroom, and a Thompson-sampled bandit picks among the rest —
+learning per task-shape which pool actually delivers.
 
 ```text
 $ route "classify 4000 commit messages into categories"
-  shape     batch:classify        eligible  claude, local-batch
-  tier      trivial               chosen    local-batch
-  why       codex and kimi cannot take a batch shape; local has headroom
+{
+  "shape": "batch:classify",  "tier": "trivial",
+  "chosen": "local-batch",    "eligible": ["claude", "local-batch"],
+  "why": "posterior"
+}
 ```
+
+## Sensitive work runs on hardware you own
+
+Mention credentials, customer data or a `.env` and the remote pools are removed
+outright — and it prefers your **local** machine over Claude, because that is
+the only arm where the data never leaves at all:
+
+```text
+$ route "audit the customer database credentials"
+{
+  "chosen": "local-batch",
+  "data_class": "sensitive",
+  "removed_by_sensitivity": ["codex", "kimi", "free"],
+  "why": "posterior+sensitive:local-preferred(auto-detected)"
+}
+```
+
+That is a **veto, not a score** — it holds even when every other arm is idle. If
+nothing eligible remains, it fails loudly rather than quietly falling back to a
+remote pool, which is the exact failure the flag exists to prevent.
+
+Detection is explicit by design (`--sensitive`, a task field, or a path
+allowlist in `sensitive.toml`). The content match above is a **one-way safety
+net**: a hit escalates caution, a miss proves nothing. Do not rely on it —
+a heuristic that misses silently ships private data to a third party.
+
+## Five arms, four cost classes
+
+| arm | cost class | for |
+|---|---|---|
+| `claude` | `included` | anything needing this conversation's context |
+| `codex`, `kimi` | `paid` | hard self-contained coding, separate quota pools |
+| `local-batch`, `local-agent` | `local` | volume + anything sensitive — memory-bound, free |
+| `free` | `free` | delay-tolerant batch via [`free-llm`](https://github.com/jhammant/free-llm-skill) — eleven pooled free tiers |
 
 ```mermaid
 flowchart LR
   A[task] --> B[shape<br/>closed vocabulary]
-  B --> C{veto?<br/>needs context,<br/>private data}
-  C -->|yes| Z[stay on Claude]
-  C -->|no| D[eligible arms<br/>by shape]
-  D --> E[drop arms with<br/>no quota]
+  B --> C{vetoes<br/>context · sensitive · cross-repo}
+  C -->|sensitive| L[local only]
+  C -->|clear| D[eligible by shape]
+  D --> E[drop arms with no quota]
   E --> F[bandit picks<br/>Thompson]
   F --> G[dispatch]
   G --> H[outcome to posterior]
-  H -.->|federate counts, never content| I[(community prior)]
-  I -.->|0.4x weight| F
+  G --> S[route ship<br/>PR + provenance]
 ```
 
-There is deliberately **no "switch to adaptive" flag**. Each arm's Beta prior *is*
-the hand-written rule table, so a cold cell behaves exactly like the rules and
-evidence takes over on its own, per cell, as it accumulates.
+There is deliberately **no "switch to adaptive" flag**. Each arm's Beta prior
+*is* the hand-written rule table, so a cold cell behaves exactly like the rules
+and evidence takes over on its own, per cell, as it accumulates.
 
 ## The decision, in order
 

@@ -27,7 +27,9 @@ Rules that still apply in auto mode:
 - Vetoes are hard gates. If a veto fires (needs this conversation's context,
   cross-repo orchestration, private data, no clear acceptance check, user
   pinned a pool), the task stays with `claude` — auto mode never overrides a
-  veto.
+  veto. `--sensitive` instead vetoes the remote third-party pools and prefers
+  local arms; if no eligible arm survives, `/auto` fails loudly rather than
+  falling back to a remote pool.
 - Quota-critical arms are removed before the bandit chooses, so auto mode can
   never route into a pool with no headroom.
 - Failed verification escalates at most one hop, to the next-stronger eligible

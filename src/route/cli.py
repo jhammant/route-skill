@@ -28,7 +28,7 @@ from .benchmark import (
     seed_priors,
 )
 from .complexity import estimate_complexity
-from .eligibility import fetch_quota, gate
+from .eligibility import SensitiveRoutingError, fetch_quota, gate
 from .federate import (
     FederationState,
     aggregate,
@@ -42,7 +42,10 @@ from .federate import (
 )
 from .pools import load_pools
 from .router import Router, cell_name
+from .eligibility import probably_private
+from .sensitive import detect_sensitive
 from .shapes import classify_shape
+from .ship import RunResult, ShipAbort, build_pr_body, ship
 from .stats import Decision, Stats, report_arm, report_cells, report_throughput
 from .storage import JsonStorage
 
@@ -72,36 +75,70 @@ def decide(args: argparse.Namespace, *, auto: bool) -> int:
     tier = args.tier or estimate_complexity(text)
     quota = fetch_quota() if not args.no_quota else {}
 
-    result = gate(
-        text,
-        shape,
-        pools,
-        quota=quota,
-        pool_pin=args.pool,
-        private=args.private,
-        no_acceptance=args.no_acceptance,
-        needs_context=args.needs_context,
-        cross_repo=args.cross_repo,
-    )
+    # dataClass: 'open' by default, 'sensitive' only on an explicit signal
+    # (--sensitive, a sensitive:true task field, or the sensitive.toml path
+    # allowlist). Never inferred from content heuristics.
+    sensitive = detect_sensitive(text, flag=args.sensitive)
+    # The content regex is a one-way safety net: it may only ever move a task
+    # toward MORE caution, never less. If it thinks this might be private, the
+    # safest destination is the machine the data cannot leave — not Claude,
+    # which is also a remote service. Treating a regex hit as `sensitive`
+    # unifies both paths on local-preferred instead of leaving the
+    # auto-detected case (the one users actually hit) with the worse outcome.
+    #
+    # It is never the reverse: the regex NOT firing proves nothing, which is why
+    # detect_sensitive stays explicit-only.
+    auto_sensitive = False
+    if not sensitive and probably_private(text):
+        sensitive = True
+        auto_sensitive = True
+
+    try:
+        result = gate(
+            text,
+            shape,
+            pools,
+            quota=quota,
+            pool_pin=args.pool,
+            private=args.private,
+            sensitive=sensitive,
+            no_acceptance=args.no_acceptance,
+            needs_context=args.needs_context,
+            cross_repo=args.cross_repo,
+        )
+    except SensitiveRoutingError as exc:
+        # Fail loudly — never silently fall back to a remote arm.
+        print(f"route: {exc}", file=sys.stderr)
+        return 1
 
     router = _build_router()
     if result.veto is not None:
         chosen = result.veto.target
         why = f"veto:{result.veto.name}"
     else:
-        chosen = router.select(shape, tier, result.eligible)
+        # Sensitive work PREFERS local arms over claude: free, private, and
+        # the data physically never leaves the machine.
+        prefer = [a for a in result.eligible if not pools[a].remote] if sensitive else None
+        chosen = router.select(shape, tier, result.eligible, prefer=prefer)
         observed = router.observed_counts(shape, tier)
         why = "posterior" if any(sum(v) for v in observed.values()) else "prior"
+        if prefer and chosen in prefer:
+            why += "+sensitive:local-preferred"
+        if auto_sensitive:
+            why += "(auto-detected)"
 
     plan = {
         "shape": shape,
         "tier": tier,
         "cell": cell_name(shape, tier),
+        "data_class": result.data_class,
         "eligible": result.eligible,
         "removed_by_quota": result.removed_by_quota,
         "chosen": chosen,
         "why": why,
     }
+    if result.removed_by_sensitivity:
+        plan["removed_by_sensitivity"] = result.removed_by_sensitivity
     if result.veto is not None:
         plan["veto"] = {"name": result.veto.name, "reason": result.veto.reason}
     print(json.dumps(plan, indent=2, sort_keys=True))
@@ -257,6 +294,55 @@ def cmd_benchmark(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_cmd(argv: list[str]) -> RunResult:
+    """Real runner for ship: one subprocess, captured, never a shell."""
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True)
+    except OSError as exc:
+        return RunResult(127, "", str(exc))
+    return RunResult(proc.returncode, proc.stdout, proc.stderr)
+
+
+def _confirm(prompt: str) -> bool:
+    try:
+        answer = input(f"{prompt} [y/N] ")
+    except EOFError:
+        return False
+    return answer.strip().lower() in ("y", "yes")
+
+
+def cmd_ship(args: argparse.Namespace) -> int:
+    task_desc = " ".join(args.task_desc).strip()
+    body = build_pr_body(
+        shape=args.shape or "(unrouted)",
+        tier=args.tier or "?",
+        arm=args.arm or "?",
+        why=args.why or "?",
+        verification=args.verification or "?",
+        task=task_desc,
+    )
+    try:
+        result = ship(
+            reader=_run_cmd,
+            runner=_run_cmd,
+            confirm=_confirm,
+            display=print,
+            repo=args.repo,
+            base=args.base,
+            draft=args.draft,
+            open_pr=args.pr,
+            title=args.title or task_desc,
+            body=body,
+            show_diff=args.diff,
+        )
+    except ShipAbort as exc:
+        print(f"route ship: {exc}", file=sys.stderr)
+        return 1
+    for message in result.messages:
+        print(message)
+    return 0
+
+
 def _parser(prog: str) -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog=prog)
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
@@ -296,6 +382,22 @@ def _parser(prog: str) -> argparse.ArgumentParser:
                    help="merge results into live priors at 0.3x (below the 0.4x community weight)")
     b.add_argument("--compare", help="comma-separated arms, head-to-head on the same tasks")
     b.set_defaults(func=cmd_benchmark)
+
+    sh = sub.add_parser("ship", help="push the task branch and open a PR with routing provenance")
+    sh.add_argument("--pr", action="store_true",
+                    help="open a PR via gh (default: push and print the compare URL)")
+    sh.add_argument("--repo", help="target owner/name — forks first when you lack push access")
+    sh.add_argument("--base", help="PR base branch (default: the repo's default branch)")
+    sh.add_argument("--draft", action="store_true", help="open the PR as a draft")
+    sh.add_argument("--diff", action="store_true", help="show the full diff, not just --stat")
+    sh.add_argument("--title", default="", help="PR title (default: the task description)")
+    sh.add_argument("--shape", default="", help="provenance: routed shape")
+    sh.add_argument("--tier", default="", help="provenance: complexity tier")
+    sh.add_argument("--arm", default="", help="provenance: arm that did the work")
+    sh.add_argument("--why", default="", help="provenance: why that arm was chosen")
+    sh.add_argument("--verification", default="", help="provenance: e.g. '62 tests pass'")
+    sh.add_argument("task_desc", nargs="*", help="the task description, carried into the PR body")
+    sh.set_defaults(func=cmd_ship)
     return p
 
 
@@ -305,6 +407,8 @@ def _add_task_flags(p: argparse.ArgumentParser) -> None:
     p.add_argument("--shape", help="override shape classification")
     p.add_argument("--tier", help="override complexity tier")
     p.add_argument("--private", action="store_true", help="veto: data must not leave the machine")
+    p.add_argument("--sensitive", action="store_true",
+                   help="dataClass sensitive: veto remote pools (codex/kimi/free), prefer local")
     p.add_argument("--no-acceptance", action="store_true", help="veto: no clear acceptance check")
     p.add_argument("--needs-context", action="store_true", help="veto: needs this conversation")
     p.add_argument("--cross-repo", action="store_true", help="veto: cross-repo orchestration")
@@ -312,7 +416,7 @@ def _add_task_flags(p: argparse.ArgumentParser) -> None:
     p.add_argument("--no-quota", action="store_true", help="skip quotamax")
 
 
-_SUBCOMMANDS = {"task", "stats", "outcome", "federate", "benchmark"}
+_SUBCOMMANDS = {"task", "stats", "outcome", "federate", "benchmark", "ship"}
 
 
 def _run(argv: list[str] | None, *, auto: bool) -> int:

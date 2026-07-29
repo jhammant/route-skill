@@ -38,15 +38,23 @@ Then:
 
 Overrides: `--pool <name>` pins a pool (explicit beats inferred); `--private`,
 `--no-acceptance`, `--needs-context`, `--cross-repo` force the matching veto.
+`--sensitive` sets the dataClass to `sensitive`: remote third-party pools
+(`codex`, `kimi`, `free`) are vetoed at the eligibility stage, `claude` and
+the local arms survive, and local is PREFERRED — sensitive work belongs on
+your own metal. A path allowlist in `~/.config/route/sensitive.toml`
+(`paths = ["~/dev/clients/*"]`) marks tasks naming those files sensitive
+without the flag. If nothing eligible survives, routing fails loudly — it
+never falls back to a remote arm.
 
 The `free` arm: a fourth cost class (`free`, alongside `included`/`paid`/`local`)
 that dispatches through the free-llm proxy on `127.0.0.1:8080` — hosted free
 tiers at £0/month, rate-limited and REMOTE. It takes `batch:*` work plus
 `coding:test`/`coding:review` only, and is eligible only while the proxy's
-`/healthz` answers. Several free tiers train on submitted prompts, so the
-private-data veto is absolute: a task carrying private data NEVER routes to
-`free` — the veto short-circuits to `claude` before quota or the bandit are
-consulted.
+`/healthz` answers. Several free tiers train on submitted prompts, so
+sensitive data NEVER routes to `free` — the sensitive gate vetoes it before
+quota or the bandit are consulted. The `--private` content regex still fires
+as an additional safety net (pinning the task to `claude`), but it must never
+be the only signal relied on: when in doubt, the user marks `--sensitive`.
 
 Privacy: routing and federation see shapes and counts only — never task text,
 file paths, or repo names. `route federate export` shows exactly what would be

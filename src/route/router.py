@@ -154,8 +154,18 @@ class Router:
         eligible: Iterable[str],
         *,
         record_impression: bool = True,
+        prefer: Iterable[str] | None = None,
     ) -> str:
         eligible = list(eligible)
+        if prefer:
+            # A preference bonus realised as a restriction: when any
+            # preferred arm is eligible, the bandit chooses among those only.
+            # Used to land sensitive work on local arms rather than
+            # defaulting to claude (SPEC-ship section 1); claude stays
+            # eligible and is the fallback when no local arm survives.
+            preferred = [a for a in eligible if a in set(prefer)]
+            if preferred:
+                eligible = preferred
         cell = cell_name(shape, tier)
         self._ensure_seeded(shape, cell, eligible)
         bandit = self._bandit(cell, eligible)

@@ -4,6 +4,13 @@ Vetoes are hard gates, not scores: any veto short-circuits to ``claude``
 regardless of quota or complexity. Quota gates *availability* — an arm whose
 pool reports ``critical`` headroom is REMOVED from eligibility, never merely
 penalised. The bandit decides quality among what survives.
+
+Sensitive data (SPEC-ship section 1) is also an eligibility-stage veto, but
+a different shape: remote third-party pools (``codex``, ``kimi``, ``free``)
+are removed, while ``claude`` AND the local arms survive — local is the only
+arm where sensitive data is safe by construction, and it is PREFERRED at
+selection. If nothing survives, ``gate`` raises rather than falling back to
+a remote arm.
 """
 
 from __future__ import annotations
@@ -19,6 +26,18 @@ from .shapes import FALLBACK_SHAPE
 
 #: The pool every veto short-circuits to.
 VETO_TARGET = "claude"
+
+#: dataClass values: ``open`` (default) or ``sensitive`` (SPEC-ship section 1).
+DATA_OPEN = "open"
+DATA_SENSITIVE = "sensitive"
+
+
+class SensitiveRoutingError(Exception):
+    """A sensitive task has no eligible arm.
+
+    Raised instead of falling back: silently routing sensitive work to a
+    remote arm is the exact failure the flag exists to prevent.
+    """
 
 
 @dataclass(frozen=True)
@@ -49,6 +68,14 @@ _NO_ACCEPTANCE_RE = re.compile(
 )
 
 
+def probably_private(text: str) -> bool:
+    """Content safety net. A hit means "treat as sensitive"; a miss proves nothing.
+
+    Only ever used to increase caution — never to clear a task for a remote arm.
+    """
+    return bool(_PRIVATE_RE.search(text or ""))
+
+
 def detect_veto(
     text: str,
     *,
@@ -58,10 +85,14 @@ def detect_veto(
     no_acceptance: bool = False,
     needs_context: bool = False,
     cross_repo: bool = False,
+    skip_private: bool = False,
 ) -> Veto | None:
     """Evaluate hard gates before anything else. First veto wins.
 
     Explicit flags beat inferred cues; a user pool pin beats everything.
+    ``skip_private`` suppresses the private-data safety net when the caller
+    handles sensitivity itself (the sensitive dataClass), so later vetoes —
+    e.g. orchestration — still surface.
     """
     if pool_pin:
         return Veto("user-pin", f"user pinned pool '{pool_pin}'", target=pool_pin)
@@ -69,7 +100,7 @@ def detect_veto(
         return Veto("needs-context", "needs this conversation's context — no other pool has it")
     if cross_repo or _CROSS_REPO_RE.search(text):
         return Veto("cross-repo", "cross-repo / multi-directory orchestration — remote pools are dir-sandboxed")
-    if private or _PRIVATE_RE.search(text):
+    if not skip_private and (private or _PRIVATE_RE.search(text)):
         return Veto("private-data", "private data must not leave the machine")
     if no_acceptance or _NO_ACCEPTANCE_RE.search(text):
         return Veto("no-acceptance", "no clear acceptance check — can't verify a hand-off")
@@ -164,6 +195,23 @@ class GateResult:
     veto: Veto | None
     eligible: list[str]
     removed_by_quota: list[str] = field(default_factory=list)
+    data_class: str = DATA_OPEN
+    removed_by_sensitivity: list[str] = field(default_factory=list)
+
+
+def sensitive_veto(
+    eligible: list[str], pools: dict[str, Pool]
+) -> tuple[list[str], list[str]]:
+    """The sensitive-data gate, applied at the ELIGIBILITY stage.
+
+    Remote third-party pools (``codex``, ``kimi``, ``free``) are REMOVED — a
+    veto, not a score. ``claude`` stays (the task is already there) and local
+    arms stay: they are the only arms where sensitive data is safe by
+    construction, because it physically never leaves the machine.
+    """
+    survivors = [a for a in eligible if a == VETO_TARGET or not pools[a].remote]
+    removed = [a for a in eligible if a not in survivors]
+    return survivors, removed
 
 
 def gate(
@@ -174,11 +222,19 @@ def gate(
     quota: dict[str, str] | None = None,
     pool_pin: str | None = None,
     private: bool = False,
+    sensitive: bool = False,
     no_acceptance: bool = False,
     needs_context: bool = False,
     cross_repo: bool = False,
 ) -> GateResult:
-    """Steps 2-4 in order: veto, eligibility, quota."""
+    """Steps 2-4 in order: veto, eligibility, quota.
+
+    When ``sensitive`` (an explicit signal only — see ``sensitive.py``), the
+    private-data content regex is subsumed: instead of pinning the task to
+    ``claude``, remote third-party arms are vetoed at the eligibility stage
+    and local arms are kept, so sensitive work can prefer the machine it is
+    already on. If that leaves nothing, raise — never fall back to remote.
+    """
     veto = detect_veto(
         text,
         shape=shape,
@@ -187,10 +243,21 @@ def gate(
         no_acceptance=no_acceptance,
         needs_context=needs_context,
         cross_repo=cross_repo,
+        # The sensitive dataClass handles private data better than the regex
+        # safety net (keep claude AND local-*, prefer local), so it subsumes
+        # the private-data veto — later vetoes still apply.
+        skip_private=sensitive,
     )
     if veto is not None:
-        return GateResult(veto=veto, eligible=[veto.target])
+        return GateResult(
+            veto=veto,
+            eligible=[veto.target],
+            data_class=DATA_SENSITIVE if sensitive else DATA_OPEN,
+        )
     eligible = eligible_for(shape, pools)
+    removed_sensitive: list[str] = []
+    if sensitive:
+        eligible, removed_sensitive = sensitive_veto(eligible, pools)
     if quota:
         survivors = apply_quota(eligible, quota)
         removed = [a for a in eligible if a not in survivors]
@@ -198,6 +265,20 @@ def gate(
     else:
         removed = []
     if not eligible:
+        if sensitive:
+            raise SensitiveRoutingError(
+                "sensitive task has no eligible arm: remote arms "
+                f"{removed_sensitive or '[]'} are vetoed for sensitive data, "
+                f"quota removed {removed or '[]'}, and no local arm accepts "
+                f"'{shape}'. Refusing to fall back to a remote arm — that is "
+                "the failure the sensitive flag exists to prevent."
+            )
         # Nobody can take it — stay here rather than route into the void.
         return GateResult(veto=Veto("no-survivors", "no eligible arm survived quota gating"), eligible=[VETO_TARGET])
-    return GateResult(veto=None, eligible=eligible, removed_by_quota=removed)
+    return GateResult(
+        veto=None,
+        eligible=eligible,
+        removed_by_quota=removed,
+        data_class=DATA_SENSITIVE if sensitive else DATA_OPEN,
+        removed_by_sensitivity=removed_sensitive,
+    )

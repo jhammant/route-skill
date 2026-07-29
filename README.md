@@ -60,9 +60,9 @@ task text
 2. **Veto** — hard gates, not scores. Needs this conversation's context, cross-repo
    orchestration, private data, no clear acceptance check, or an explicit `--pool`
    pin: any of these short-circuits to `claude` regardless of quota or complexity.
-   The private-data gate is absolute: several hosted free tiers (Gemini, Mistral)
-   train on submitted prompts, so a task carrying private data can **never** land
-   on the `free` arm — the veto fires before eligibility, quota, or the bandit.
+   The private-data gate is a *safety net* only (see **Sensitive data** below):
+   several hosted free tiers (Gemini, Mistral) train on submitted prompts, so a
+   task carrying private data can **never** land on the `free` arm.
 3. **Eligibility** — `pools.py` is a config-driven arm registry
    (`~/.config/route/pools.toml`); a new model is a config entry, not a code change.
    A `batch:*` shape never yields `codex`/`kimi`; a `coding:*` shape never yields
@@ -104,9 +104,47 @@ off against quality:
   `coding:refactor`, `coding:debug`, or orchestration, because free-tier models
   are materially weaker. Eligible only while the proxy answers on `/healthz`;
   an unreachable proxy just removes the arm. Because the providers are third
-  parties and several train on prompts, **private data never routes to `free`**
-  — the private-data veto short-circuits to `claude` no matter what quota or
-  the bandit say.
+  parties and several train on prompts, **sensitive data never routes to
+  `free`** — for a `sensitive` task the arm is vetoed at the eligibility
+  stage, hardest of all the remote vetoes.
+
+## Sensitive data — prefer local, never fall back remote
+
+Every task carries a `dataClass`: `open` (default) or `sensitive`. When a task
+is sensitive, the remote third-party pools — `codex`, `kimi`, `free` — are
+removed at the **eligibility** stage (a veto, not a score). `claude` stays
+eligible, and so do `local-batch` / `local-agent` — the only arms where the
+data is safe *by construction*, because it physically never leaves the
+machine. Among the survivors, local arms are **preferred** over `claude`:
+sensitive work is exactly what an idle local machine is for — free, private,
+and already paid for. If sensitivity leaves **no** eligible arm, routing fails
+loudly with the reason; it never silently falls back to a remote arm, because
+that fallback is the exact failure the flag exists to prevent.
+
+Sensitivity is detected from **explicit signals only**:
+
+1. `--sensitive` on the command line.
+2. A `sensitive: true` field on a task passed programmatically.
+3. A path allowlist in `~/.config/route/sensitive.toml`:
+
+   ```toml
+   paths = ["~/dev/clients/*", "~/Documents/finance/*"]
+   ```
+
+   A task naming a file under one of those paths is sensitive.
+
+The old content-matching regex (`--private`, matching "secrets", ".env",
+"credentials", …) still fires as an **additional safety net** — it
+conservatively pins the task to `claude`. But it must never be the only
+signal you rely on: a false negative silently sends private data to a third
+party, and no regex is worth that risk. When unsure, mark it yourself.
+
+```text
+$ route --sensitive "rotate the API credentials in the production .env file"
+  shape     coding:implement      eligible  claude, local-agent
+  tier      moderate              chosen    local-agent
+  why       prior+sensitive:local-preferred   (codex, kimi vetoed: sensitive)
+```
 
 ## Install
 
@@ -134,7 +172,47 @@ route federate export          # what WOULD be shared — prints it, shares noth
 route federate push --yes      # opt-in contribute (writes a submission file)
 route federate pull --source community.json
 route federate status          # what's shared, when, what's held back
+
+route ship                     # show the diff, confirm, push the task branch
+route ship --pr                # …and open a PR carrying the routing provenance
+route ship --pr --repo owner/awesome-list --base main   # upstream: forks first
 ```
+
+## `route ship` — from routed task to reviewable PR
+
+A routed coding task ends as edits on a branch, and then stops. `ship` closes
+the loop: it shows you `git status` + `git diff --stat` (the full diff with
+`--diff`, never redacted), asks for explicit confirmation, pushes the branch,
+and opens a PR whose body carries the routing provenance:
+
+```markdown
+Routed by /route.
+
+| | |
+|---|---|
+| shape | coding:implement |
+| complexity | moderate |
+| arm | kimi |
+| why | claude weekly at 88%; task self-contained with a clear acceptance check |
+| verification | 62 tests pass |
+```
+
+That table records *why this model wrote this code* — provenance that is
+otherwise lost the moment the session ends.
+
+Hard safety rules:
+
+- **Never pushes or opens a PR without explicit confirmation on that
+  invocation.** Pushing is outward-facing and effectively irreversible.
+- **Never merges** — `ship` opens PRs; a human merges them.
+- **Never force-pushes**, and never pushes the default branch.
+- A tree dirty outside the task's branch aborts the ship rather than sweeping
+  unrelated changes in.
+- If `gh` is absent, it pushes and prints the compare URL instead of failing.
+- Targeting a repo without push access (`--repo owner/theirs`) forks first via
+  `gh repo fork`, pushes to the fork, and opens the PR from there — the
+  standard listing-submission flow. The confirmation prompt names the target
+  repo, because opening a PR on someone else's project is a public act.
 
 ## Federation — counts, not content
 

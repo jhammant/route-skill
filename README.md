@@ -48,7 +48,7 @@ task text
    ├─▶ 3. ELIGIBLE   which arms can do this shape at all?
    ├─▶ 4. QUOTA      drop arms with no headroom (quotamax)
    ├─▶ 5. SELECT     bandit picks among survivors (banditry)
-   ├─▶ 6. DISPATCH   hand to /codex, /kimi, /local-llm, or stay
+   ├─▶ 6. DISPATCH   hand to /codex, /kimi, /local-llm, /free-llm, or stay
    └─▶ 7. OUTCOME    record reward, update posterior, maybe escalate
 ```
 
@@ -60,10 +60,14 @@ task text
 2. **Veto** — hard gates, not scores. Needs this conversation's context, cross-repo
    orchestration, private data, no clear acceptance check, or an explicit `--pool`
    pin: any of these short-circuits to `claude` regardless of quota or complexity.
+   The private-data gate is absolute: several hosted free tiers (Gemini, Mistral)
+   train on submitted prompts, so a task carrying private data can **never** land
+   on the `free` arm — the veto fires before eligibility, quota, or the bandit.
 3. **Eligibility** — `pools.py` is a config-driven arm registry
    (`~/.config/route/pools.toml`); a new model is a config entry, not a code change.
    A `batch:*` shape never yields `codex`/`kimi`; a `coding:*` shape never yields
-   `local-batch`.
+   `local-batch`. Arms with a health endpoint (`free`) are eligible only while it
+   answers — an unreachable proxy removes the arm, never an error.
 4. **Quota** — `quotamax agent --json`. An arm at `critical` headroom is **removed**,
    not penalised. Quota gates availability; the bandit decides quality.
 5. **Select** — `router.py` wraps [banditry](https://github.com/jhammant/banditry):
@@ -78,6 +82,31 @@ task text
    (diff kept) > `verified` (tests passed) > `completed` (ran). Escalation is capped
    at one hop to the next-stronger eligible arm, and records a *negative* outcome
    for the arm it leaves behind.
+
+## The arms and their cost classes
+
+Each arm declares a **cost class**, which is what the bandit is really trading
+off against quality:
+
+- `included` — **claude**: subscription quota you have already paid for.
+- `paid` — **codex**, **kimi**: metered API spend.
+- `local` — **local-batch**, **local-agent**: memory-bound models on your own
+  hardware via `local-llm`. With an optional `endpoint` in `pools.toml`, the
+  same tool can back several arms (`local-batch-lmstudio` vs
+  `local-batch-ollama` — dispatch gets `--endpoint <url>` appended) and the
+  bandit learns which backend is better per task shape.
+- `free` — **free**: £0/month, but rate-limited and **remote**. Dispatches
+  through the [free-llm](https://github.com/jhammant/free-llm-skill) proxy on
+  `127.0.0.1:8080`, which pools hosted free tiers (Groq, NVIDIA NIM, OpenRouter,
+  Cloudflare, GitHub Models, Gemini, Z.AI, ModelScope, SambaNova, OVH, Mistral)
+  without ever exceeding a provider's published rate limit. It takes `batch:*`
+  work plus the simplest coding shapes (`coding:test`, `coding:review`) — never
+  `coding:refactor`, `coding:debug`, or orchestration, because free-tier models
+  are materially weaker. Eligible only while the proxy answers on `/healthz`;
+  an unreachable proxy just removes the arm. Because the providers are third
+  parties and several train on prompts, **private data never routes to `free`**
+  — the private-data veto short-circuits to `claude` no matter what quota or
+  the bandit say.
 
 ## Install
 

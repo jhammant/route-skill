@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+import urllib.request
 from dataclasses import dataclass, field
 
 from .pools import Pool
@@ -77,9 +78,33 @@ def detect_veto(
     return None
 
 
+def probe_health(url: str, timeout: float = 1.0) -> bool:
+    """GET a health endpoint with a short timeout. True only on a 2xx.
+
+    Fail-safe by contract: any error — connection refused, timeout, DNS,
+    malformed URL — means unreachable, and unreachable is never an error.
+    """
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:  # noqa: S310
+            return 200 <= resp.status < 300
+    except (OSError, ValueError):
+        return False
+
+
 def eligible_for(shape: str, pools: dict[str, Pool]) -> list[str]:
-    """Step 3: arms that accept this shape at all, registry order."""
-    return [name for name, pool in pools.items() if pool.accepts(shape)]
+    """Step 3: arms that accept this shape at all, registry order.
+
+    An arm with a ``health_url`` (the free-llm proxy) is eligible only while
+    the endpoint answers — an unreachable proxy simply removes the arm.
+    """
+    out = []
+    for name, pool in pools.items():
+        if not pool.accepts(shape):
+            continue
+        if pool.health_url and not probe_health(pool.health_url):
+            continue
+        out.append(name)
+    return out
 
 
 def parse_quota(payload: dict) -> dict[str, str]:

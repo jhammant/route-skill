@@ -1,9 +1,9 @@
 """Arm registry — config-driven so a new model is a config entry, not code.
 
-Shipped arms: ``claude``, ``codex``, ``kimi``, ``local-batch``, ``local-agent``.
-Users override or extend via ``~/.config/route/pools.toml``; each arm declares
-the shapes it accepts, whether it needs a repo, whether it is remote, its
-cost class, and its pinned model identity (model + quant + version — a
+Shipped arms: ``claude``, ``codex``, ``kimi``, ``local-batch``, ``local-agent``,
+``free``. Users override or extend via ``~/.config/route/pools.toml``; each arm
+declares the shapes it accepts, whether it needs a repo, whether it is remote,
+its cost class, and its pinned model identity (model + quant + version — a
 ``qwen3.6-27b`` at 4-bit and at bf16 must never merge into one arm).
 """
 
@@ -22,10 +22,14 @@ except ImportError:  # Python 3.10
     import tomli as tomllib  # type: ignore[no-redef]
 
 #: Fallback order for escalation — later is stronger.
-STRENGTH_ORDER: tuple[str, ...] = ("local-batch", "local-agent", "kimi", "codex", "claude")
+STRENGTH_ORDER: tuple[str, ...] = ("free", "local-batch", "local-agent", "kimi", "codex", "claude")
 
 _CODING = tuple(s for s in SHAPES if s.startswith("coding:"))
 _BATCH = tuple(s for s in SHAPES if s.startswith("batch:"))
+
+#: free-llm-skill: a local OpenAI-compatible proxy pooling hosted free tiers.
+FREE_LLM_ENDPOINT = "http://127.0.0.1:8080/v1"
+FREE_LLM_HEALTH = "http://127.0.0.1:8080/healthz"
 
 
 @dataclass(frozen=True)
@@ -53,7 +57,7 @@ class Pool:
     shapes: tuple[str, ...]
     needs_repo: bool = False
     remote: bool = False
-    cost: str = "included"  # included | paid | local
+    cost: str = "included"  # included | paid | local | free
     strength: int = 0
     dispatch: str = ""  # command template for REAL work; {task} is substituted
     #: Single-prompt command used by `route benchmark`. Distinct from
@@ -61,11 +65,28 @@ class Pool:
     #: (local-llm batch) and cannot answer a bare prompt. Empty means the
     #: pool cannot be benchmarked by shelling out.
     probe: str = ""
+    #: OpenAI-compatible base URL for a local server (LM Studio, Ollama,
+    #: free-llm). When set, ``--endpoint <value>`` is appended to dispatch
+    #: and probe, so one tool can back several arms (local-batch-lmstudio
+    #: vs local-batch-ollama) and the bandit learns which backend wins.
+    endpoint: str = ""
+    #: Health URL probed before the arm is eligible (the free-llm proxy's
+    #: /healthz). Empty means always considered; unreachable means simply
+    #: not eligible, never an error.
+    health_url: str = ""
     model: Model = field(default_factory=lambda: Model(name="unknown"))
     #: Server-authoritative fan-out limit (Kimi's /usages parallel.limit is
     #: 30 on ADVANCED). A swarm is a property of DISPATCH, never a separate
     #: arm — the bandit picks the pool, the concurrency planner picks n.
     parallel_limit: int = 1
+
+    def __post_init__(self) -> None:
+        if self.endpoint:
+            suffix = f" --endpoint {self.endpoint}"
+            if self.dispatch:
+                object.__setattr__(self, "dispatch", self.dispatch + suffix)
+            if self.probe:
+                object.__setattr__(self, "probe", self.probe + suffix)
 
     def accepts(self, shape: str) -> bool:
         return shape in self.shapes
@@ -130,6 +151,26 @@ def _default_pools() -> dict[str, Pool]:
             model=Model(name="qwen3.6-27b", quant="4bit"),
             parallel_limit=2,
         ),
+        "free": Pool(
+            name="free",
+            # Batch work primarily, plus the simplest coding shapes. Free-tier
+            # models are materially weaker: never refactor, debug, or
+            # orchestration.
+            shapes=_BATCH + ("coding:test", "coding:review"),
+            # REMOTE: the proxy is local but the providers are third parties,
+            # and several free tiers train on submitted prompts.
+            remote=True,
+            cost="free",
+            strength=strength("free"),
+            dispatch="local-llm batch {task}",
+            probe="local-llm ask {task}",
+            endpoint=FREE_LLM_ENDPOINT,
+            health_url=FREE_LLM_HEALTH,
+            model=Model(name="free-llm-pool"),
+            # The proxy self-limits to provider rate limits — do not stack
+            # fan-out on top of it.
+            parallel_limit=4,
+        ),
     }
 
 
@@ -155,6 +196,8 @@ def load_pools(path: str | Path | None = None) -> dict[str, Pool]:
             strength=int(spec.get("strength", 0)),
             dispatch=str(spec.get("dispatch", "")),
             probe=str(spec.get("probe", "")),
+            endpoint=str(spec.get("endpoint", "")),
+            health_url=str(spec.get("health_url", "")),
             model=Model(
                 name=str(model_spec.get("name", "unknown")),
                 quant=str(model_spec.get("quant", "")),

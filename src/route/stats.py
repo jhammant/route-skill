@@ -12,6 +12,7 @@ Local runs also record throughput: (model, quant, context_length, hardware)
 from __future__ import annotations
 
 import json
+import sys
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -80,12 +81,41 @@ class Stats:
     def record_decision(self, decision: Decision) -> None:
         _append_jsonl(self.decisions_path, asdict(decision))
 
-    def record_outcome_events(self, events: list[str]) -> None:
-        """Attach outcome events to the most recent decision."""
+    def record_outcome_events(
+        self, events: list[str], decision_ts: float | None = None
+    ) -> None:
+        """Attach outcome events to a decision.
+
+        With ``decision_ts``, the row whose ``ts`` matches (within float
+        round-tripping tolerance) — so a consumer reconciling long after the
+        dispatch annotates the decision it actually observed. Without it, the
+        most recent decision, which is what an inline caller means.
+
+        An unmatched ``decision_ts`` warns and writes nothing: a rotated or
+        hand-edited log must never take down outcome recording, because the
+        bandit reward is the part that matters.
+        """
         rows = _read_jsonl(self.decisions_path)
         if not rows:
             return
-        rows[-1]["outcome_events"] = sorted(set(rows[-1].get("outcome_events", [])) | set(events))
+        if decision_ts is None:
+            index = len(rows) - 1
+        else:
+            matches = [
+                i for i, r in enumerate(rows)
+                if abs(float(r.get("ts", 0.0)) - decision_ts) < 1e-6
+            ]
+            if not matches:
+                print(
+                    f"route: no decision at ts={decision_ts!r}; "
+                    "outcome events not attached",
+                    file=sys.stderr,
+                )
+                return
+            index = matches[-1]
+        rows[index]["outcome_events"] = sorted(
+            set(rows[index].get("outcome_events", [])) | set(events)
+        )
         self.decisions_path.write_text(
             "".join(json.dumps(r, sort_keys=True) + "\n" for r in rows), encoding="utf-8"
         )

@@ -144,10 +144,15 @@ def decide(args: argparse.Namespace, *, auto: bool) -> int:
         plan["veto"] = {"name": result.veto.name, "reason": result.veto.reason}
     print(json.dumps(plan, indent=2, sort_keys=True))
 
-    Stats().record_decision(Decision(
-        cell=plan["cell"], shape=shape, tier=tier,
-        eligible=result.eligible, chosen=chosen, why=why,
-    ))
+    decision = Decision(
+        cell=plan["cell"],
+        shape=shape,
+        tier=tier,
+        eligible=result.eligible,
+        chosen=chosen,
+        why=why,
+    )
+    Stats().record_decision(decision)
 
     hooks = discover_hooks()
     contexts: list[str] = []
@@ -155,7 +160,15 @@ def decide(args: argparse.Namespace, *, auto: bool) -> int:
     def _fire_decision() -> None:
         for hook in hooks:
             contexts.append(
-                fire(hook, {"event": "decision", "task": text, "plan": plan})
+                fire(
+                    hook,
+                    {
+                        "event": "decision",
+                        "task": text,
+                        "plan": plan,
+                        "decision_ts": decision.ts,
+                    },
+                )
             )
 
     def _fire_complete(
@@ -171,6 +184,7 @@ def decide(args: argparse.Namespace, *, auto: bool) -> int:
                     "exit_code": exit_code,
                     "wall_clock_s": wall_clock_s,
                     "hook_context": hook_context,
+                    "decision_ts": decision.ts,
                     "exception": exception,
                 },
             )
@@ -250,7 +264,9 @@ def cmd_outcome(args: argparse.Namespace) -> int:
 
     router = _build_router()
     record_outcome(router, args.shape, args.tier, args.arm, args.outcome)
-    Stats().record_outcome_events(list(OUTCOME_EVENTS[args.outcome]))
+    Stats().record_outcome_events(
+        list(OUTCOME_EVENTS[args.outcome]), decision_ts=args.decision_ts
+    )
     print(json.dumps({"recorded": args.outcome, "arm": args.arm,
                       "cell": cell_name(args.shape, args.tier)}))
     return 0
@@ -411,6 +427,13 @@ def _parser(prog: str) -> argparse.ArgumentParser:
     o.add_argument("--tier", required=True)
     o.add_argument("--arm", required=True)
     o.add_argument("--outcome", required=True, choices=["accepted", "verified", "completed", "failed"])
+    o.add_argument(
+        "--decision-ts",
+        type=float,
+        default=None,
+        help="attach outcome events to the decision logged at this "
+        "timestamp (default: the most recent decision)",
+    )
     o.set_defaults(func=cmd_outcome)
 
     f = sub.add_parser("federate")

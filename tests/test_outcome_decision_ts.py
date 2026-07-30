@@ -78,3 +78,77 @@ def test_unmatched_decision_ts_writes_nothing_and_warns(capsys):
 
 def test_empty_log_is_a_no_op():
     Stats().record_outcome_events(["completed"], decision_ts=100.0)  # must not raise
+
+
+def test_hook_payloads_carry_the_decision_ts(tmp_path, monkeypatch):
+    """Both events must carry it: `decision` so the hook can store it,
+    `complete` so a hook that only records on completion still gets it."""
+    import stat
+
+    from route.hooks import HOOKS_DIRNAME
+    from route.storage import config_dir
+
+    seen = tmp_path / "payloads.jsonl"
+    hook = config_dir() / HOOKS_DIRNAME / "10-capture"
+    hook.parent.mkdir(parents=True, exist_ok=True)
+    hook.write_text(f"#!/bin/sh\ncat >> '{seen}'\nprintf '\\n' >> '{seen}'\necho ''\n")
+    hook.chmod(hook.stat().st_mode | stat.S_IXUSR)
+
+    from route import cli
+
+    cli.main(
+        [
+            "task",
+            "write a test",
+            "--shape",
+            "coding:test",
+            "--tier",
+            "trivial",
+            "--pool",
+            "claude",
+        ]
+    )
+
+    payloads = [
+        json.loads(line) for line in seen.read_text().splitlines() if line.strip()
+    ]
+    assert payloads, "no hook payloads captured"
+    events = {p["event"]: p for p in payloads}
+    assert "decision" in events and "complete" in events
+    assert isinstance(events["decision"]["decision_ts"], float)
+    assert events["complete"]["decision_ts"] == events["decision"]["decision_ts"]
+
+    logged = [
+        json.loads(line)
+        for line in Stats().decisions_path.read_text().splitlines()
+        if line.strip()
+    ]
+    assert logged[-1]["ts"] == events["decision"]["decision_ts"]
+
+
+def test_cmd_outcome_forwards_decision_ts():
+    stats = Stats()
+    stats.record_decision(_decision("coding:test", "claude", 100.0))
+    stats.record_decision(_decision("coding:test", "claude", 200.0))
+
+    from route import cli
+
+    cli.main(
+        [
+            "outcome",
+            "--shape",
+            "coding:test",
+            "--tier",
+            "trivial",
+            "--arm",
+            "claude",
+            "--outcome",
+            "accepted",
+            "--decision-ts",
+            "100.0",
+        ]
+    )
+
+    rows = _rows(stats)
+    assert rows[0]["outcome_events"] == ["accepted", "completed", "verified"]
+    assert rows[1]["outcome_events"] == []

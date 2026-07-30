@@ -28,7 +28,13 @@ from .storage import config_dir
 HOOK_TIMEOUT_S = 15
 
 #: Cap on the stdout carried from ``decision`` to ``complete``.
-HOOK_CONTEXT_MAX_BYTES = 4096
+#:
+#: Characters, not bytes: ``subprocess.run(text=True)`` hands back a decoded
+#: ``str``, so slicing it counts code points. Counting bytes instead would
+#: mean re-encoding and risk cutting a multi-byte character in half, for no
+#: gain — the point of the cap is to bound the payload, and a bounded number
+#: of characters is a bounded payload.
+HOOK_CONTEXT_MAX_CHARS = 4096
 
 #: Hook directory, relative to the route config dir.
 HOOKS_DIRNAME = "dispatch-hooks.d"
@@ -83,4 +89,4 @@ def fire(hook: Path, payload: dict) -> str:
             f"route: dispatch hook {hook.name} exited {proc.returncode}",
             file=sys.stderr,
         )
-    return proc.stdout[:HOOK_CONTEXT_MAX_BYTES].strip()
+    return proc.stdout[:HOOK_CONTEXT_MAX_CHARS].strip()

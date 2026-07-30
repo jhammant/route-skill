@@ -86,6 +86,18 @@ def test_fire_truncates_oversized_stdout(tmp_path):
     assert len(fire(hook, {})) == 4096
 
 
+def test_fire_truncation_counts_characters_not_bytes(tmp_path):
+    """The cap is documented in characters, so multi-byte output must not be
+    cut short at 4096/N characters — nor allowed past 4096 characters."""
+    hook = _make_hook(
+        tmp_path / "h",
+        "#!/bin/sh\nfor i in $(seq 1 5000); do printf '\\303\\251'; done\n",
+    )
+    out = fire(hook, {})
+    assert len(out) == 4096
+    assert set(out) == {"\u00e9"}
+
+
 def test_fire_returns_empty_on_nonzero_exit_but_does_not_raise(tmp_path):
     hook = _make_hook(tmp_path / "h", "#!/bin/sh\necho out\nexit 3\n")
     assert fire(hook, {}) == "out"
@@ -159,15 +171,14 @@ def test_broken_hook_does_not_change_return_code(tmp_path, monkeypatch):
     assert cli.main_auto(["--pool", "local-agent", "write the docs"]) == 0
 
 
-def test_exception_during_dispatch_still_fires_complete_and_propagates(
+def test_keyboard_interrupt_fires_complete_as_130_and_propagates(
     tmp_path, monkeypatch
 ):
     """decision fired -> complete must fire even if _dispatch raises.
 
-    Covers Ctrl-C (KeyboardInterrupt) and any exception _dispatch doesn't
-    swallow itself (e.g. a malformed dispatch template raising ValueError out
-    of shlex.split). The exception must still propagate unchanged — this
-    seam is advisory, never a replacement for real error handling.
+    Ctrl-C is the one case that reports 130, the shell's SIGINT convention.
+    The exception must still propagate unchanged — this seam is advisory,
+    never a replacement for real error handling.
     """
     log = _recording_hook(tmp_path, monkeypatch)
 
@@ -180,6 +191,34 @@ def test_exception_during_dispatch_still_fires_complete_and_propagates(
     events = _events(log)
     assert [e["event"] for e in events] == ["decision", "complete"]
     assert events[1]["exit_code"] == 130
+    assert events[1]["exception"] == "KeyboardInterrupt"
+
+
+def test_other_exception_is_not_reported_as_an_interrupt(tmp_path, monkeypatch):
+    """A broken pool config must not look like the user pressing Ctrl-C.
+
+    ``shlex.split`` on a malformed dispatch template raises ValueError. If
+    that reported 130 too, a consumer scoring arms could not tell a user's
+    interrupt from a configuration bug and would punish the arm for both.
+    """
+    log = _recording_hook(tmp_path, monkeypatch)
+
+    def _raising_dispatch(template, task):
+        raise ValueError("No closing quotation")
+
+    monkeypatch.setattr(cli, "_dispatch", _raising_dispatch)
+    with pytest.raises(ValueError):
+        cli.main_auto(["--pool", "local-agent", "write the docs"])
+    complete = _events(log)[1]
+    assert complete["exit_code"] == 1
+    assert complete["exception"] == "ValueError"
+
+
+def test_successful_dispatch_reports_no_exception(tmp_path, monkeypatch):
+    log = _recording_hook(tmp_path, monkeypatch)
+    monkeypatch.setattr(cli, "_dispatch", lambda template, task: 0)
+    cli.main_auto(["--pool", "local-agent", "write the docs"])
+    assert _events(log)[1]["exception"] is None
 
 
 def test_no_hooks_configured_does_not_invoke_subprocess(monkeypatch):

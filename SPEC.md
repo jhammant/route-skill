@@ -142,21 +142,34 @@ concatenate onto one line.
   str, "plan": dict}`.
 - `complete` — fired once dispatch is done, always after `decision` if
   `decision` fired: normally when `_dispatch` returns, but also when it
-  raises (including `KeyboardInterrupt` on Ctrl-C) — the exception still
-  propagates unchanged afterwards, with `exit_code` reported as `130` in that
-  case. Carries the real `exit_code` and `wall_clock_s` (on the `stay` path,
-  where nothing is actually dispatched, `wall_clock_s` is `0.0`). Each hook
-  gets back whatever it printed on `decision` as `hook_context`, so an
-  integration can thread its own record id through without inventing
-  side-channel state keyed on pid. Payload: `{"event": "complete", "task":
-  str, "plan": dict, "exit_code": int, "wall_clock_s": float, "hook_context":
-  str}`.
+  raises — the exception still propagates unchanged afterwards. Carries the
+  real `exit_code` and `wall_clock_s` (on the `stay` path, where nothing is
+  actually dispatched, `wall_clock_s` is `0.0`). `exception` names the
+  exception type when one escaped `_dispatch`, and is `null` otherwise:
+  `KeyboardInterrupt` reports `exit_code` `130` (the shell's SIGINT
+  convention), anything else reports `1`. The two are kept distinct
+  deliberately — a consumer scoring arms must be able to tell a user's Ctrl-C
+  from a broken pool config (a malformed dispatch template raises `ValueError`
+  out of `shlex.split`), and `exception` names which. Each hook gets back
+  whatever it printed on `decision` as `hook_context`, so an integration can
+  thread its own record id through without inventing side-channel state keyed
+  on pid. Payload: `{"event": "complete", "task": str, "plan": dict,
+  "exit_code": int, "wall_clock_s": float, "hook_context": str, "exception":
+  str | null}`.
 
 Hooks are advisory: a missing, non-executable, slow (>15s), or non-zero-exit
 hook is reported on stderr and otherwise ignored — it can never change
 `_dispatch`'s return code or block a dispatch from happening. A hook's
-stdout is captured as `hook_context` up to a 4096-byte cap and
-`.strip()`-ped; anything beyond that cap is silently dropped.
+stdout is captured as `hook_context` up to a 4096-**character** cap and
+`.strip()`-ped; anything beyond that cap is silently dropped. The cap counts
+characters rather than bytes because the pipe is read as decoded text, so a
+multi-byte hook context is bounded at 4096 code points, not 4096 bytes.
+
+One caveat on Ctrl-C: `complete` fires *before* `KeyboardInterrupt`
+propagates, and it fires synchronously, so an interrupt can be delayed by up
+to the 15s hook timeout per configured hook before the process actually exits.
+That is the price of never leaving an external tracker's record open, and it
+is why the timeout is bounded.
 
 ### Swarms — fan-out when the pool has headroom
 

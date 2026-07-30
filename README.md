@@ -249,6 +249,47 @@ Hard safety rules:
   standard listing-submission flow. The confirmation prompt names the target
   repo, because opening a PR on someone else's project is a public act.
 
+## Dispatch hooks — tell your tracker what was routed
+
+route knows which arm ran a task; your issue tracker does not. The dispatch
+hook seam is an opt-in, vendor-neutral way to close that gap.
+
+Drop an executable into `<config dir>/dispatch-hooks.d/` (`ROUTE_CONFIG_DIR`,
+else `XDG_CONFIG_HOME/route`, else `~/.config/route`) — or point
+`ROUTE_DISPATCH_HOOKS` at an `os.pathsep`-separated list of scripts, which
+replaces that directory set entirely. With neither present nothing is spawned
+and behaviour is byte-identical to before the seam existed.
+
+Two events per decision, each a JSON object delivered whole on the hook's
+stdin:
+
+```json
+{"event": "decision", "task": "...", "plan": {...}}
+{"event": "complete", "task": "...", "plan": {...}, "exit_code": 0,
+ "wall_clock_s": 12.3, "hook_context": "ISSUE-42", "exception": null}
+```
+
+Whatever a hook prints on `decision` comes back to that same hook on
+`complete` as `hook_context`, so an integration can thread its own issue key
+through without inventing side-channel state:
+
+```sh
+#!/bin/sh
+# ~/.config/route/dispatch-hooks.d/50-tracker
+payload=$(cat)                       # one JSON object, no trailing newline
+case "$(printf %s "$payload" | jq -r .event)" in
+  decision)                          # whatever this prints becomes hook_context
+    tracker open --arm "$(printf %s "$payload" | jq -r .plan.chosen)" ;;
+  complete)
+    tracker close --id "$(printf %s "$payload" | jq -r .hook_context)" \
+                  --exit "$(printf %s "$payload" | jq -r .exit_code)" ;;
+esac
+```
+
+Hooks are advisory: missing, non-executable, slow (>15s), or failing hooks are
+reported on stderr and otherwise ignored. A hook can never change a dispatch's
+exit code or stop it happening. Full payload and failure semantics: `SPEC.md`.
+
 ## Federation — counts, not content
 
 The unit of sharing is the Beta posterior, because Beta is conjugate to Bernoulli

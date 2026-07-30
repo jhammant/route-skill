@@ -45,7 +45,9 @@ def discover_hooks() -> list[Path]:
     override = os.environ.get("ROUTE_DISPATCH_HOOKS")
     if override is not None:
         return [
-            Path(os.path.expanduser(part)) for part in override.split(os.pathsep) if part
+            Path(os.path.expanduser(part))
+            for part in override.split(os.pathsep)
+            if part
         ]
     directory = config_dir() / HOOKS_DIRNAME
     if not directory.is_dir():

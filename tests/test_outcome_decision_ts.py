@@ -9,22 +9,28 @@ from __future__ import annotations
 
 import json
 
-import pytest
-
 from route.stats import Decision, Stats
 
 
 def _decision(cell: str, chosen: str, ts: float) -> Decision:
     shape, tier = cell.split(":", 1)
     return Decision(
-        cell=cell, shape=shape, tier=tier,
-        eligible=[chosen], chosen=chosen, why="prior", ts=ts,
+        cell=cell,
+        shape=shape,
+        tier=tier,
+        eligible=[chosen],
+        chosen=chosen,
+        why="prior",
+        ts=ts,
     )
 
 
 def _rows(stats: Stats) -> list[dict]:
-    return [json.loads(line) for line in
-            stats.decisions_path.read_text().splitlines() if line.strip()]
+    return [
+        json.loads(line)
+        for line in stats.decisions_path.read_text().splitlines()
+        if line.strip()
+    ]
 
 
 def test_without_decision_ts_annotates_the_last_row():

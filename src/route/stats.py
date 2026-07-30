@@ -89,7 +89,8 @@ class Stats:
         With ``decision_ts``, the row whose ``ts`` matches (within float
         round-tripping tolerance) — so a consumer reconciling long after the
         dispatch annotates the decision it actually observed. Without it, the
-        most recent decision, which is what an inline caller means.
+        most recent decision is targeted, which is what an inline caller
+        means.
 
         An unmatched ``decision_ts`` warns and writes nothing: a rotated or
         hand-edited log must never take down outcome recording, because the
@@ -102,7 +103,8 @@ class Stats:
             index = len(rows) - 1
         else:
             matches = [
-                i for i, r in enumerate(rows)
+                i
+                for i, r in enumerate(rows)
                 if abs(float(r.get("ts", 0.0)) - decision_ts) < 1e-6
             ]
             if not matches:

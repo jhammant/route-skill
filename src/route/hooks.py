@@ -55,3 +55,30 @@ def discover_hooks() -> list[Path]:
         for path in directory.iterdir()
         if path.is_file() and os.access(path, os.X_OK)
     )
+
+
+def fire(hook: Path, payload: dict) -> str:
+    """Run one hook with ``payload`` on stdin; return its stdout.
+
+    Never raises. A hook that is missing, not executable, slow, or failing
+    yields ``""`` and a line on stderr.
+    """
+    try:
+        proc = subprocess.run(
+            [str(hook)],
+            input=json.dumps(payload),
+            text=True,
+            capture_output=True,
+            timeout=HOOK_TIMEOUT_S,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(f"route: dispatch hook {hook.name}: {exc}", file=sys.stderr)
+        return ""
+    if proc.stderr:
+        sys.stderr.write(proc.stderr)
+    if proc.returncode != 0:
+        print(
+            f"route: dispatch hook {hook.name} exited {proc.returncode}",
+            file=sys.stderr,
+        )
+    return proc.stdout[:HOOK_CONTEXT_MAX_BYTES].strip()

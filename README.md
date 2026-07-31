@@ -290,6 +290,39 @@ Hooks are advisory: missing, non-executable, slow (>15s), or failing hooks are
 reported on stderr and otherwise ignored. A hook can never change a dispatch's
 exit code or stop it happening. Full payload and failure semantics: `SPEC.md`.
 
+## `contrib/beads` — the reward nobody was recording
+
+route records an impression on every decision and a reward only when something
+calls `auto outcome`. Nothing does by default, so impressions pile up, rewards
+do not, and every posterior decays back toward its prior: the router keeps
+deciding, but it never learns.
+
+`contrib/beads/` is a working integration that closes that loop against
+[beads](https://github.com/gastownhall/beads), a Dolt-backed issue tracker.
+A dispatch attached to a real work item (`ROUTE_BEAD=proj-42 auto "..."`)
+records its routing decision on that item through the dispatch hook seam; a
+reconciler reads the item's *lifecycle* back and turns it into an outcome:
+
+| what happened to the work item | what route learns |
+|---|---|
+| closed after a clean dispatch | `accepted` — the real signal |
+| closed, or still open, after a failed dispatch | `failed` |
+| reopened after closing | `failed` — the output did not hold |
+| Ctrl-C, or blocked on something unrelated | nothing; not the arm's fault |
+
+The judgement worth learning from is a *human* closing the work item, which is
+why the integration never creates one itself — a reward it generated and then
+read back would encode nothing. It writes enum values, counts and a timestamp;
+never the task text.
+
+```sh
+contrib/beads/install.sh    # gated on `bd`; with beads absent, installs nothing
+```
+
+beads is a standalone Go binary, so there is no package dependency in either
+direction — the installer is the only thing that knows both exist. Full
+rationale, decision table and failure semantics: `contrib/beads/README.md`.
+
 ## Federation — counts, not content
 
 The unit of sharing is the Beta posterior, because Beta is conjugate to Bernoulli

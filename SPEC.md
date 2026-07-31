@@ -171,6 +171,33 @@ to the 15s hook timeout per configured hook before the process actually exits.
 That is the price of never leaving an external tracker's record open, and it
 is why the timeout is bounded.
 
+#### Reference integration — `contrib/beads`
+
+The seam above is vendor-neutral and stays that way; `contrib/beads/` is a
+worked example of what it is *for*, shipped because without some caller of
+`auto outcome` the outcome ladder above is unreachable in practice and every
+posterior decays back to its prior.
+
+Three properties are normative for any integration built on this seam, not
+just this one:
+
+- **One writer for the reward.** The hook records evidence (`exit_code`,
+  `wall_clock_s`, chosen arm) onto an external record. A separate reconciler
+  is the only thing that calls `auto outcome`. Two writers double-count, and
+  a double-counted Beta posterior is wrong in a way nothing downstream can
+  detect.
+- **The reward must come from outside route.** An integration that creates
+  its own tracking record and then reads it back is learning from itself. The
+  signal `contrib/beads` uses is a human closing the work item.
+- **`decision_ts` attributes the reward.** `auto outcome --decision-ts` binds
+  a late-arriving verdict to the decision that earned it rather than to the
+  most recent decision in that cell; without it, a task closed a week later
+  credits whichever arm happened to run most recently.
+
+The integration lives outside the package (`packages = ["src/route"]`), is
+gated at install time on the tracker's CLI being present, and is inert without
+it: an install with no `bd` on PATH is byte-identical to a stock one.
+
 ### Swarms — fan-out when the pool has headroom
 
 Some arms can run **many instances at once**. Kimi's `/usages` payload reports

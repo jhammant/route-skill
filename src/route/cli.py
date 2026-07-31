@@ -40,6 +40,7 @@ from .federate import (
     push,
     status,
 )
+from .hooks import discover_hooks, fire
 from .pools import load_pools
 from .router import Router, cell_name
 from .eligibility import probably_private
@@ -148,8 +149,36 @@ def decide(args: argparse.Namespace, *, auto: bool) -> int:
         eligible=result.eligible, chosen=chosen, why=why,
     ))
 
+    hooks = discover_hooks()
+    contexts: list[str] = []
+
+    def _fire_decision() -> None:
+        for hook in hooks:
+            contexts.append(
+                fire(hook, {"event": "decision", "task": text, "plan": plan})
+            )
+
+    def _fire_complete(
+        exit_code: int, wall_clock_s: float, exception: str | None = None
+    ) -> None:
+        for hook, hook_context in zip(hooks, contexts):
+            fire(
+                hook,
+                {
+                    "event": "complete",
+                    "task": text,
+                    "plan": plan,
+                    "exit_code": exit_code,
+                    "wall_clock_s": wall_clock_s,
+                    "hook_context": hook_context,
+                    "exception": exception,
+                },
+            )
+
     if chosen == "claude":
         print("dispatch: stay (this task belongs here)")
+        _fire_decision()
+        _fire_complete(0, 0.0)
         return 0
 
     pool = pools[chosen]
@@ -163,7 +192,28 @@ def decide(args: argparse.Namespace, *, auto: bool) -> int:
             print("not dispatched")
             return 0
 
-    return _dispatch(pool.dispatch, text)
+    _fire_decision()
+    started = time.monotonic()
+    try:
+        exit_code = _dispatch(pool.dispatch, text)
+    except KeyboardInterrupt:
+        # decision already fired — complete must fire too, or an external
+        # tracker's record stays open forever. Re-raise unchanged: the
+        # user-visible exit code and traceback are not this seam's to alter.
+        # 130 is the shell's SIGINT convention, and belongs to Ctrl-C ALONE:
+        # reporting it for every exception would make a user's interrupt
+        # indistinguishable from a broken pool config, and a consumer scoring
+        # arms would punish the arm for both.
+        _fire_complete(130, time.monotonic() - started, "KeyboardInterrupt")
+        raise
+    except BaseException as exc:
+        # Anything else is a genuine failure of this dispatch: generic
+        # failure code, plus the exception type so a consumer can tell a
+        # ValueError out of shlex.split from an OSError from the arm.
+        _fire_complete(1, time.monotonic() - started, type(exc).__name__)
+        raise
+    _fire_complete(exit_code, time.monotonic() - started)
+    return exit_code
 
 
 def _dispatch(template: str, task: str) -> int:

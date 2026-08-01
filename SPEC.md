@@ -78,6 +78,32 @@ is **removed from eligibility**, not penalised. Quota gates *availability*; the 
 decides *quality* among what's available. Keeping these separate is what stops a
 cheap-but-bad pool winning just because it's idle.
 
+#### Headroom hooks
+
+quotamax knows the pools it knows. An arm behind a vendor with no quota API — or one
+whose harness is not installed on this machine at all — has no way to say it cannot
+take work, so the bandit keeps selecting it and every dispatch fails identically.
+
+Executables in `<config_dir>/headroom-hooks.d` fill that in. Each is run with `--json`
+and emits `parse_quota`-compatible output on stdout; the result is merged over
+quotamax's, and the existing `critical` removal does the rest. **No new logic in the
+gate** — a hook's only power is to report headroom for a pool, and what that means
+was already decided.
+
+Discovery mirrors `dispatch-hooks.d` exactly — sorted by name,
+`ROUTE_HEADROOM_HOOKS` (`os.pathsep`-separated) replaces the directory set, empty
+string disables — because two hook directories with two sets of rules is a thing to
+trip over for no gain. Name order is meaningful: a later hook wins on a pool an
+earlier one also reported, so `10-presence` can report what is installed at all and
+`50-vendor` can refine one of those pools with a real number.
+
+Hooks are consulted even when quotamax failed or is absent: they cover the pools it
+does not, and gating them on it would tie one arm's availability to an unrelated tool
+being installed. Fail-open per hook, as everywhere else in quota — missing,
+non-executable, slow, failing or emitting garbage contributes nothing and does not
+disturb the hooks around it. The safe direction is "no opinion", never "unavailable":
+a broken hook must not be able to make an arm ineligible.
+
 ### 5. Select — the bandit, and why there is no "switch to adaptive"
 
 `router.py` wraps `banditry`. **One bandit per context cell**, named

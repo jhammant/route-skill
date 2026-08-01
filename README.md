@@ -250,6 +250,32 @@ Hard safety rules:
   standard listing-submission flow. The confirmation prompt names the target
   repo, because opening a PR on someone else's project is a public act.
 
+## Headroom hooks — teach route about a pool quotamax can't see
+
+quotamax knows the pools it knows. An arm behind a vendor with no quota API, or one
+whose CLI simply isn't installed here, has no way to say it can't take work — so the
+bandit keeps picking it and every dispatch fails the same way.
+
+Drop an executable into `<config dir>/headroom-hooks.d/`. It's run with `--json` and
+prints headroom for whatever pools it knows about:
+
+```sh
+# ~/.config/route/headroom-hooks.d/10-presence
+#!/bin/sh
+command -v my-arm >/dev/null || { echo '{"my-arm": "critical"}'; exit 0; }
+echo '{"my-arm": "ok"}'
+```
+
+`critical` removes the arm from eligibility — the same path quotamax's own output
+takes, so there is no new gate logic to learn. Hooks run in name order and a later one
+wins on a pool an earlier one also reported, so `10-presence` can cover "is it even
+installed" and `50-vendor` can refine one pool with a real number.
+
+They're consulted even when quotamax is absent, and they fail open: missing, slow,
+failing, or printing garbage all mean *no opinion* — never "unavailable". A broken
+hook can't take an arm out. `ROUTE_HEADROOM_HOOKS` (`os.pathsep`-separated) replaces
+the directory; set it empty to switch hooks off.
+
 ## Dispatch hooks — tell your tracker what was routed
 
 route knows which arm ran a task; your issue tracker does not. The dispatch

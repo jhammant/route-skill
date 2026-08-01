@@ -202,6 +202,7 @@ route stats --arm codex        # one pool, by shape
 route stats --throughput       # local model performance table
 
 route outcome --shape coding:refactor --tier hard --arm codex --outcome accepted
+route outcome … --decision-ts 1754035200.5 --tokens 4096   # backfill what it cost
 
 route federate export          # what WOULD be shared — prints it, shares nothing
 route federate push --yes      # opt-in contribute (writes a submission file)
@@ -248,6 +249,113 @@ Hard safety rules:
   `gh repo fork`, pushes to the fork, and opens the PR from there — the
   standard listing-submission flow. The confirmation prompt names the target
   repo, because opening a PR on someone else's project is a public act.
+
+## Dispatch hooks — tell your tracker what was routed
+
+route knows which arm ran a task; your issue tracker does not. The dispatch
+hook seam is an opt-in, vendor-neutral way to close that gap.
+
+Drop an executable into `<config dir>/dispatch-hooks.d/` (`ROUTE_CONFIG_DIR`,
+else `XDG_CONFIG_HOME/route`, else `~/.config/route`) — or point
+`ROUTE_DISPATCH_HOOKS` at an `os.pathsep`-separated list of scripts, which
+replaces that directory set entirely. With neither present nothing is spawned
+and behaviour is byte-identical to before the seam existed.
+
+Two events per decision, each a JSON object delivered whole on the hook's
+stdin:
+
+```json
+{"event": "decision", "task": "...", "plan": {...}}
+{"event": "complete", "task": "...", "plan": {...}, "exit_code": 0,
+ "wall_clock_s": 12.3, "hook_context": "ISSUE-42", "exception": null}
+```
+
+Whatever a hook prints on `decision` comes back to that same hook on
+`complete` as `hook_context`, so an integration can thread its own issue key
+through without inventing side-channel state:
+
+```sh
+#!/bin/sh
+# ~/.config/route/dispatch-hooks.d/50-tracker
+payload=$(cat)                       # one JSON object, no trailing newline
+case "$(printf %s "$payload" | jq -r .event)" in
+  decision)                          # whatever this prints becomes hook_context
+    tracker open --arm "$(printf %s "$payload" | jq -r .plan.chosen)" ;;
+  complete)
+    tracker close --id "$(printf %s "$payload" | jq -r .hook_context)" \
+                  --exit "$(printf %s "$payload" | jq -r .exit_code)" ;;
+esac
+```
+
+Hooks are advisory: missing, non-executable, slow (>15s), or failing hooks are
+reported on stderr and otherwise ignored. A hook can never change a dispatch's
+exit code or stop it happening. Full payload and failure semantics: `SPEC.md`.
+
+### Offering context to the arm
+
+A dispatched arm starts cold. It gets the task and nothing else — not the
+conventions of the repo it is about to edit, not what was already tried. The
+tracker a hook talks to usually knows some of that, so a `decision` hook may
+**offer** context by printing a JSON object with a `prepend` key instead of
+plain text:
+
+```sh
+  decision)
+    printf '%s' "$(jq -n --arg c "$(tracker notes --format md)" \
+                        '{hook_context: "ISSUE-42", prepend: $c}')" ;;
+```
+
+`prepend` is placed ahead of the task for the dispatch only, separated by a
+blank line. `hook_context` keeps its meaning; omit it and it is `""`.
+
+It is an offer, and route decides:
+
+- **plain text still means plain text.** The structured form is recognised by
+  the `prepend` key. A hook that already prints a JSON object as its opaque
+  context is unaffected.
+- **`sensitive` work takes nothing.** Offers are applied only when the plan's
+  `data_class` is `open`, so no hook can widen what a task classified
+  sensitive carries to an arm.
+- **capped at 4096 characters**, charged against the arm's context window,
+  not route's.
+- **dispatch-only.** The recorded decision, both hook payloads, and anything
+  federated keep the task the user typed.
+- **dropped on `stay`**, where nothing is dispatched.
+- **fail-open.** Malformed JSON or a non-string `prepend` costs the offer, not
+  the dispatch.
+
+## `contrib/beads` — the reward nobody was recording
+
+route records an impression on every decision and a reward only when something
+calls `auto outcome`. Nothing does by default, so impressions pile up, rewards
+do not, and every posterior decays back toward its prior: the router keeps
+deciding, but it never learns.
+
+`contrib/beads/` is a working integration that closes that loop against
+[beads](https://github.com/gastownhall/beads), a Dolt-backed issue tracker.
+A dispatch attached to a real work item (`ROUTE_BEAD=proj-42 auto "..."`)
+records its routing decision on that item through the dispatch hook seam; a
+reconciler reads the item's *lifecycle* back and turns it into an outcome:
+
+| what happened to the work item | what route learns |
+|---|---|
+| closed after a clean dispatch | `accepted` — the real signal |
+| closed, or still open, after a failed dispatch | `failed` |
+| reopened after closing | `failed` — the output did not hold |
+| Ctrl-C, or blocked on something unrelated | nothing; not the arm's fault |
+
+The judgement worth learning from is a *human* closing the work item, which is
+why the integration never creates one itself — a reward it generated and then
+read back would encode nothing. It writes enum values, counts and a timestamp;
+never the task text.
+
+```sh
+contrib/beads/install.sh    # gated on `bd`; with beads absent, installs nothing
+```
+
+beads is a standalone Go binary, so there is no package dependency in either
+direction — the installer is the only thing that knows both exist. Full
+rationale, decision table and failure semantics: `contrib/beads/README.md`.
 
 ## Federation — counts, not content
 

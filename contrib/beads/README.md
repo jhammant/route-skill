@@ -145,6 +145,45 @@ Beads annotated by an older route that did not carry `decision_ts` still
 reconcile: ageing falls back to the bead's `updated_at`, which moves whenever
 anything touches the bead and so can only ever delay ageing, never hasten it.
 
+## Project memory as offered context
+
+An arm dispatched to another machine, another model and another process starts
+cold. It gets the task and nothing else — not the convention someone landed on
+last week, not the thing that was already tried and did not work. beads has
+that: `bd remember` notes are exactly the durable facts a project accumulates
+and a fresh context does not have.
+
+So on `decision` the hook searches those memories and offers the hits to route
+as `prepend`, and route puts them ahead of the task for that dispatch. Both
+the project database and the shared `--global` one are searched; the global
+one holds the cross-repo infrastructure facts an arm is likeliest to be
+missing.
+
+Search terms are the distinctive words of the task itself (≥5 characters,
+stopwords dropped, first 5). Crude on purpose: `bd memories` is a substring
+search, and precision buys little that the caps below do not already bound.
+
+What holds it in check:
+
+- **`sensitive` work is never even read for.** The hook checks `data_class`
+  *before* touching `bd memories`. route drops the offer for non-`open` work
+  regardless, but not assembling one means there is no moment where project
+  memory sits next to a task the classifier called sensitive.
+- **The budget is divided, not spent front-to-back.** A single memory
+  routinely runs past a thousand characters; filling greedily would seat the
+  first and truncate the rest away. Each hit is cut to its share of
+  `ROUTE_BEAD_CONTEXT_MAX_CHARS` and marked `[…]`, so the arm sees every match
+  and can tell which it is seeing only the head of.
+- **No memories means the old behaviour, byte for byte** — the bare bead id on
+  stdout, no JSON envelope.
+- **No `ROUTE_BEAD` is not a blocker.** That variable governs the reward loop;
+  an arm dispatched outside it is just as cold. The offer is made with an
+  empty correlation token.
+
+Task text still never leaves the machine through this path: it is read to
+derive search terms and is otherwise untouched, and nothing is written to
+beads that was not written before.
+
 ## Fail open, everywhere
 
 A missing `bd`, a missing `jq`, a cwd that is not a beads workspace, an
@@ -171,5 +210,8 @@ uses. See beads' own documentation for server setup.
 |----------|---------|--------|
 | `ROUTE_BEAD` | unset | bead id to annotate; unset means record nothing |
 | `ROUTE_BEAD_BD_TIMEOUT` | `10` | seconds before a `bd` call is abandoned |
+| `ROUTE_BEAD_CONTEXT_MAX_CHARS` | `3000` | character budget for offered memory; `0` disables the offer |
+| `ROUTE_BEAD_CONTEXT_MAX_TERMS` | `5` | task words searched for |
+| `ROUTE_BEAD_CONTEXT_MAX_MEMORIES` | `4` | memories offered at most |
 | `ROUTE_AUTO` | unset | path to route's `auto` CLI, if not on PATH |
 | `ROUTE_BEADS_BIN_DIR` | `~/.local/bin` | where `install.sh` puts `route-reconcile` |

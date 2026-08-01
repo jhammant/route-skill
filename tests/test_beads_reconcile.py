@@ -10,6 +10,7 @@ writer only.
 from __future__ import annotations
 
 import importlib.util
+import json
 import shutil
 import stat
 import subprocess
@@ -291,3 +292,139 @@ def test_hook_is_inert_and_silent_on_stdout_without_bd(tmp_path, monkeypatch):
     assert proc.returncode == 0
     assert proc.stdout == ""
     assert "bd not installed" in proc.stderr
+
+
+# --- the hook offers project memory as context --------------------------
+#
+# A dispatched arm starts cold; beads holds what the project already learned.
+# These pin what the hook is allowed to offer, and when it must offer nothing.
+
+
+def _hook_env(tmp_path, bd_body: str, **extra) -> dict:
+    """A PATH with a stub `bd`, and a cwd that is a valid beads workspace."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    for tool in (
+        "bash",
+        "sh",
+        "env",
+        "cat",
+        "jq",
+        "git",
+        "timeout",
+        "tr",
+        "awk",
+        "grep",
+        "head",
+        "printf",
+    ):
+        found = shutil.which(tool)
+        if found and not (bin_dir / tool).exists():
+            (bin_dir / tool).symlink_to(found)
+    stub = bin_dir / "bd"
+    stub.write_text(bd_body)
+    stub.chmod(0o755)
+    beads = tmp_path / ".beads"
+    beads.mkdir(exist_ok=True)
+    (beads / "metadata.json").write_text('{"dolt_database": "test_db"}')
+    return {"PATH": str(bin_dir), "HOME": str(tmp_path), **extra}
+
+
+#: Answers `bd memories <term> --json`; anything else (update, label) succeeds
+#: silently, as the real bd does on the write path.
+_BD_STUB = """#!/bin/sh
+case "$1" in
+  memories) printf '%s' '{"schema_version": 1, "cache-ttl": "the cache TTL is 90s"}' ;;
+  *) exit 0 ;;
+esac
+"""
+
+_BD_STUB_NO_MEMORIES = """#!/bin/sh
+case "$1" in
+  memories) printf '%s' '{"schema_version": 1}' ;;
+  *) exit 0 ;;
+esac
+"""
+
+
+def _run_hook(tmp_path, env: dict, payload: dict) -> subprocess.CompletedProcess:
+    HOOK.chmod(HOOK.stat().st_mode | stat.S_IXUSR)
+    return subprocess.run(
+        [str(HOOK)],
+        input=json.dumps(payload),
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=str(tmp_path),
+        timeout=30,
+    )
+
+
+def _decision(**plan) -> dict:
+    return {
+        "event": "decision",
+        "task": "fix the cache expiry in the loader",
+        "plan": {"chosen": "local-agent", "data_class": "open", **plan},
+        "decision_ts": "2026-01-01T00:00:00Z",
+    }
+
+
+@pytest.mark.skipif(shutil.which("jq") is None, reason="hook needs jq")
+def test_matching_memory_is_offered_alongside_the_bead_id(tmp_path):
+    env = _hook_env(tmp_path, _BD_STUB, ROUTE_BEAD="proj-1")
+    proc = _run_hook(tmp_path, env, _decision())
+    assert proc.returncode == 0
+    out = json.loads(proc.stdout)
+    assert out["hook_context"] == "proj-1"
+    assert "the cache TTL is 90s" in out["prepend"]
+
+
+@pytest.mark.skipif(shutil.which("jq") is None, reason="hook needs jq")
+def test_sensitive_work_is_offered_nothing(tmp_path):
+    """The hook does not merely decline to send — it does not read.
+
+    route drops an offer on sensitive work anyway. Not assembling one in the
+    first place means there is no window in which project memory sits in a
+    variable next to a task classified sensitive.
+    """
+    env = _hook_env(tmp_path, _BD_STUB, ROUTE_BEAD="proj-1")
+    proc = _run_hook(tmp_path, env, _decision(data_class="sensitive"))
+    assert proc.stdout == "proj-1"
+
+
+@pytest.mark.skipif(shutil.which("jq") is None, reason="hook needs jq")
+def test_no_memories_emits_the_bare_bead_id(tmp_path):
+    """The pre-existing contract, byte for byte, when there is nothing to add."""
+    env = _hook_env(tmp_path, _BD_STUB_NO_MEMORIES, ROUTE_BEAD="proj-1")
+    proc = _run_hook(tmp_path, env, _decision())
+    assert proc.stdout == "proj-1"
+
+
+@pytest.mark.skipif(shutil.which("jq") is None, reason="hook needs jq")
+def test_an_offer_is_made_with_no_bead_attached(tmp_path):
+    """Knowledge injection does not require a work item.
+
+    ROUTE_BEAD governs the reward loop. An arm dispatched outside it is just
+    as cold, and the memories are just as useful, so the offer stands alone
+    with an empty correlation token.
+    """
+    env = _hook_env(tmp_path, _BD_STUB)
+    proc = _run_hook(tmp_path, env, _decision())
+    assert proc.returncode == 0
+    out = json.loads(proc.stdout)
+    assert out["hook_context"] == ""
+    assert "the cache TTL is 90s" in out["prepend"]
+
+
+@pytest.mark.skipif(shutil.which("jq") is None, reason="hook needs jq")
+def test_the_offer_is_held_to_its_character_budget(tmp_path):
+    long_bd = (
+        '#!/bin/sh\ncase "$1" in\n  memories) '
+        'printf \'{"schema_version": 1, "big": "%s"}\' '
+        "\"$(printf 'x%.0s' $(seq 1 9000))\" ;;\n  *) exit 0 ;;\nesac\n"
+    )
+    env = _hook_env(
+        tmp_path, long_bd, ROUTE_BEAD="proj-1", ROUTE_BEAD_CONTEXT_MAX_CHARS="500"
+    )
+    proc = _run_hook(tmp_path, env, _decision())
+    assert len(json.loads(proc.stdout)["prepend"]) <= 500

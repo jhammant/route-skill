@@ -165,6 +165,52 @@ stdout is captured as `hook_context` up to a 4096-**character** cap and
 characters rather than bytes because the pipe is read as decoded text, so a
 multi-byte hook context is bounded at 4096 code points, not 4096 bytes.
 
+##### Offered context
+
+`decision` stdout has a second, opt-in form: a JSON **object** carrying a
+`prepend` key, `{"hook_context": str, "prepend": str}`. `prepend` is context
+the hook offers for the dispatched task — the arm's cold start is the gap it
+closes, and the tracker on the other side of the hook is usually what knows
+how to close it. `hook_context` keeps its existing meaning and defaults to
+`""`.
+
+The discriminator is the **presence of the `prepend` key**, not "parses as
+JSON". A hook that already emits a JSON object as its opaque context keeps
+meaning exactly that; only a hook asking for a prepend is read as asking.
+Anything that is not an object with that key — plain text, malformed JSON, a
+bare array — is the whole `hook_context`, as before. Each field is capped
+after parsing rather than at the pipe, so `decision` stdout is read up to a
+larger bound (`HOOK_DECISION_MAX_CHARS`): truncating at the context cap would
+cut a full-sized object mid-string, fail the parse, and silently demote a
+well-formed hook to the plain-text path.
+
+An offer is not an instruction. route applies it only when:
+
+- the plan's `data_class` is `open`. This gate lives in route, not in the
+  hook: the hook is handed `data_class` and can be well-behaved about it, but
+  a guarantee resting on every hook being well-behaved is not a guarantee.
+  On any other class the offer is dropped with one line on stderr.
+- something is actually being dispatched. On the `stay` path it is discarded
+  silently — a hook cannot know which branch it is on, and offering on every
+  decision is the right behaviour for it.
+
+Applied offers are placed ahead of the task, blank-line separated, in hook
+order; the **task goes last**, because an arm that reads a long preamble
+before its instruction is likelier to answer the preamble. Each is capped at
+4096 characters, a budget separate from `hook_context`'s because it is spent
+on the arm's context window rather than route's — an injected preamble that
+crowds out the task it exists to inform is worse than none. With no offers
+the dispatched string is the task itself, unchanged. One line on stdout names
+each hook that prepended and how much, so an injected preamble is never
+invisible.
+
+This is the only thing a hook can do that an arm can see, and it is bounded
+to exactly that: the injected text reaches the arm and nothing else. The
+recorded `Decision`, both hook payloads, and every federated artefact carry
+the task the user typed — otherwise a consumer would score arms on, and a
+fleet would learn from, text no user ever wrote. A hook still cannot block a
+dispatch, redirect it, or change its exit code.
+
 One caveat on Ctrl-C: `complete` fires *before* `KeyboardInterrupt`
 propagates, and it fires synchronously, so an interrupt can be delayed by up
 to the 15s hook timeout per configured hook before the process actually exits.
@@ -189,6 +235,11 @@ just this one:
 - **The reward must come from outside route.** An integration that creates
   its own tracking record and then reads it back is learning from itself. The
   signal `contrib/beads` uses is a human closing the work item.
+- **Offered context is derived, never authored.** What an integration offers
+  as `prepend` must be something its tracker already holds — `contrib/beads`
+  offers `bd remember` notes a human wrote. A hook that composes instructions
+  of its own is steering the arm through a seam whose whole contract is that
+  it does not steer.
 - **`decision_ts` attributes the reward.** `auto outcome --decision-ts` binds
   a late-arriving verdict to the decision that earned it rather than to the
   most recent decision in that cell; without it, a task closed a week later

@@ -28,7 +28,7 @@ from .benchmark import (
     seed_priors,
 )
 from .complexity import estimate_complexity
-from .eligibility import SensitiveRoutingError, fetch_quota, gate
+from .eligibility import DATA_OPEN, SensitiveRoutingError, fetch_quota, gate
 from .federate import (
     FederationState,
     aggregate,
@@ -40,7 +40,7 @@ from .federate import (
     push,
     status,
 )
-from .hooks import discover_hooks, fire
+from .hooks import HOOK_DECISION_MAX_CHARS, discover_hooks, fire, parse_decision
 from .pools import load_pools
 from .router import Router, cell_name
 from .eligibility import probably_private
@@ -156,10 +156,11 @@ def decide(args: argparse.Namespace, *, auto: bool) -> int:
 
     hooks = discover_hooks()
     contexts: list[str] = []
+    prepends: list[str] = []
 
-    def _fire_decision() -> None:
+    def _fire_decision(dispatching: bool = True) -> None:
         for hook in hooks:
-            contexts.append(
+            context, prepend = parse_decision(
                 fire(
                     hook,
                     {
@@ -168,8 +169,53 @@ def decide(args: argparse.Namespace, *, auto: bool) -> int:
                         "plan": plan,
                         "decision_ts": decision.ts,
                     },
+                    max_chars=HOOK_DECISION_MAX_CHARS,
                 )
             )
+            contexts.append(context)
+            # `stay` dispatches nothing, so there is no prompt to prepend to.
+            # Discard silently rather than announcing a prepend that will
+            # never be read: a hook cannot know which branch it is on, and
+            # offering context on every decision is the correct thing for it
+            # to do.
+            if not prepend or not dispatching:
+                continue
+            # The sensitivity gate belongs HERE, not in the hook. A hook sees
+            # `data_class` in the payload and can be well-behaved about it,
+            # but "every hook anyone ever writes is well-behaved" is not a
+            # property route can offer. This is: whatever a hook offers,
+            # nothing extra is added to the text of a task the classifier
+            # called sensitive.
+            if plan["data_class"] != DATA_OPEN:
+                print(
+                    f"route: dispatch hook {hook.name}: prepend dropped "
+                    f"(data_class={plan['data_class']})",
+                    file=sys.stderr,
+                )
+                continue
+            prepends.append(prepend)
+            print(
+                f"dispatch: hook {hook.name} prepended "
+                f"{len(prepend)} chars of context"
+            )
+
+    def _dispatch_text() -> str:
+        """The task as the arm will see it: offered context, then the task.
+
+        The task goes LAST. Injected context is background for the work, and
+        an arm that reads a long preamble before the instruction is likelier
+        to answer the preamble. It is also what makes the plain path exactly
+        the old path: with no prepends this returns ``text`` unchanged, not a
+        re-joined equivalent of it.
+
+        Only the dispatched string is affected. ``text`` stays the task the
+        user typed everywhere else — the recorded decision, the hook payloads,
+        and the confirmation prompt — so nothing downstream learns from, or
+        federates on, text the user did not write.
+        """
+        if not prepends:
+            return text
+        return "\n\n".join([*prepends, text])
 
     def _fire_complete(
         exit_code: int, wall_clock_s: float, exception: str | None = None
@@ -191,7 +237,7 @@ def decide(args: argparse.Namespace, *, auto: bool) -> int:
 
     if chosen == "claude":
         print("dispatch: stay (this task belongs here)")
-        _fire_decision()
+        _fire_decision(dispatching=False)
         _fire_complete(0, 0.0)
         return 0
 
@@ -209,7 +255,7 @@ def decide(args: argparse.Namespace, *, auto: bool) -> int:
     _fire_decision()
     started = time.monotonic()
     try:
-        exit_code = _dispatch(pool.dispatch, text)
+        exit_code = _dispatch(pool.dispatch, _dispatch_text())
     except KeyboardInterrupt:
         # decision already fired — complete must fire too, or an external
         # tracker's record stays open forever. Re-raise unchanged: the

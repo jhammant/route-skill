@@ -17,7 +17,15 @@ from pathlib import Path
 import pytest
 
 from route import cli
-from route.hooks import HOOKS_DIRNAME, discover_hooks, fire
+from route.hooks import (
+    HOOK_CONTEXT_MAX_CHARS,
+    HOOK_DECISION_MAX_CHARS,
+    HOOK_PREPEND_MAX_CHARS,
+    HOOKS_DIRNAME,
+    discover_hooks,
+    fire,
+    parse_decision,
+)
 from route.storage import config_dir
 
 
@@ -252,3 +260,180 @@ def test_no_hooks_configured_does_not_invoke_subprocess(monkeypatch):
         ]
     )
     assert calls == []
+
+
+# --- offered context (`prepend`) ----------------------------------------
+#
+# A `decision` hook may offer context to prepend to the dispatched task. The
+# tests below pin the two halves of that bargain: a hook can offer, and route
+# alone decides whether the offer is taken.
+
+
+def test_plain_stdout_is_an_opaque_context_with_no_prepend():
+    assert parse_decision("ISSUE-1") == ("ISSUE-1", "")
+
+
+def test_json_object_without_a_prepend_key_stays_opaque():
+    """A hook already emitting JSON as its context keeps meaning that.
+
+    The discriminator is the `prepend` key, not "looks like JSON" — otherwise
+    this seam would silently redefine the output of every hook that happens
+    to serialise its correlation token.
+    """
+    raw = '{"issue": "ISSUE-1"}'
+    assert parse_decision(raw) == (raw, "")
+
+
+def test_structured_form_splits_context_from_prepend():
+    raw = _json.dumps({"hook_context": "ISSUE-1", "prepend": "## Memory\nthing"})
+    assert parse_decision(raw) == ("ISSUE-1", "## Memory\nthing")
+
+
+def test_prepend_without_a_context_yields_an_empty_context():
+    assert parse_decision('{"prepend": "background"}') == ("", "background")
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        '{"prepend": "unterminated',
+        '{"prepend": ["not", "a", "string"]}',
+        '{"prepend": null}',
+    ],
+)
+def test_malformed_or_mistyped_prepend_never_raises(raw):
+    """Fail open: a garbled hook loses its prepend, not the dispatch."""
+    context, prepend = parse_decision(raw)
+    assert prepend == ""
+    assert isinstance(context, str)
+
+
+def test_each_field_is_capped_independently():
+    raw = _json.dumps({"hook_context": "c" * 9000, "prepend": "p" * 9000})
+    context, prepend = parse_decision(raw)
+    assert len(context) == HOOK_CONTEXT_MAX_CHARS
+    assert len(prepend) == HOOK_PREPEND_MAX_CHARS
+
+
+def test_a_large_structured_payload_survives_the_pipe(tmp_path, monkeypatch):
+    """Truncation must land inside a value, not break the parse.
+
+    Capping `decision` stdout at the context cap would cut a full-sized
+    object mid-string and demote a well-formed hook to the plain-text path,
+    where its entire JSON body would become the correlation token.
+    """
+    body = "P" * (HOOK_PREPEND_MAX_CHARS + 2000)
+    payload = _json.dumps({"hook_context": "ISSUE-1", "prepend": body})
+    hook = _make_hook(
+        tmp_path / "big", f"#!/bin/sh\ncat > /dev/null\ncat <<'EOF'\n{payload}\nEOF\n"
+    )
+    monkeypatch.setenv("ROUTE_DISPATCH_HOOKS", str(hook))
+    context, prepend = parse_decision(
+        fire(hook, {"event": "decision"}, max_chars=HOOK_DECISION_MAX_CHARS)
+    )
+    assert context == "ISSUE-1"
+    assert prepend == "P" * HOOK_PREPEND_MAX_CHARS
+
+
+def _prepending_hook(tmp_path, monkeypatch, prepend="## Memory\nlocal arm is slow"):
+    payload = _json.dumps({"hook_context": "ISSUE-1", "prepend": prepend})
+    hook = _make_hook(
+        tmp_path / "prep",
+        f"#!/bin/sh\ncat > /dev/null\ncat <<'EOF'\n{payload}\nEOF\n",
+    )
+    monkeypatch.setenv("ROUTE_DISPATCH_HOOKS", str(hook))
+    return hook
+
+
+def _capture_dispatch(monkeypatch) -> list[str]:
+    seen: list[str] = []
+    monkeypatch.setattr(
+        cli, "_dispatch", lambda template, task: (seen.append(task), 0)[1]
+    )
+    return seen
+
+
+def test_offered_context_reaches_the_arm_ahead_of_the_task(tmp_path, monkeypatch):
+    _prepending_hook(tmp_path, monkeypatch)
+    seen = _capture_dispatch(monkeypatch)
+    assert cli.main_auto(["--pool", "local-agent", "write the docs"]) == 0
+    assert seen == ["## Memory\nlocal arm is slow\n\nwrite the docs"]
+
+
+def test_no_prepend_dispatches_the_task_byte_for_byte(tmp_path, monkeypatch):
+    _recording_hook(tmp_path, monkeypatch)
+    seen = _capture_dispatch(monkeypatch)
+    cli.main_auto(["--pool", "local-agent", "write the docs"])
+    assert seen == ["write the docs"]
+
+
+def test_the_recorded_task_is_the_one_the_user_typed(tmp_path, monkeypatch):
+    """Injected context is dispatch-only.
+
+    It must not reach the hook payloads, or a consumer would attribute
+    routing evidence to text the user never wrote — and, once federated,
+    so would everyone else.
+    """
+    log = tmp_path / "events.jsonl"
+    payload = _json.dumps({"hook_context": "ISSUE-1", "prepend": "background"})
+    hook = _make_hook(
+        tmp_path / "prep",
+        f"#!/bin/sh\ncat >> '{log}'\nprintf '\\n' >> '{log}'\n"
+        f"cat <<'EOF'\n{payload}\nEOF\n",
+    )
+    monkeypatch.setenv("ROUTE_DISPATCH_HOOKS", str(hook))
+    _capture_dispatch(monkeypatch)
+    cli.main_auto(["--pool", "local-agent", "write the docs"])
+    assert [e["task"] for e in _events(log)] == ["write the docs", "write the docs"]
+
+
+def test_structured_context_still_round_trips_to_complete(tmp_path, monkeypatch):
+    log = tmp_path / "events.jsonl"
+    payload = _json.dumps({"hook_context": "ISSUE-1", "prepend": "background"})
+    hook = _make_hook(
+        tmp_path / "prep",
+        f"#!/bin/sh\ncat >> '{log}'\nprintf '\\n' >> '{log}'\n"
+        f"cat <<'EOF'\n{payload}\nEOF\n",
+    )
+    monkeypatch.setenv("ROUTE_DISPATCH_HOOKS", str(hook))
+    _capture_dispatch(monkeypatch)
+    cli.main_auto(["--pool", "local-agent", "write the docs"])
+    assert _events(log)[1]["hook_context"] == "ISSUE-1"
+
+
+def test_sensitive_work_takes_no_offered_context(tmp_path, monkeypatch):
+    """route enforces this, not the hook.
+
+    The hook is handed `data_class` and can be well-behaved about it, but a
+    guarantee that depends on every hook being well-behaved is not a
+    guarantee.
+    """
+    _prepending_hook(tmp_path, monkeypatch)
+    seen = _capture_dispatch(monkeypatch)
+    cli.main_auto(["--pool", "local-agent", "--sensitive", "write the docs"])
+    assert seen == ["write the docs"]
+
+
+def test_stay_path_ignores_an_offer(tmp_path, monkeypatch, capsys):
+    """Nothing is dispatched, so there is nothing to prepend to."""
+    _prepending_hook(tmp_path, monkeypatch)
+    assert cli.main_auto(["--pool", "claude", "write the docs"]) == 0
+    assert "prepended" not in capsys.readouterr().out
+
+
+def test_offers_are_applied_in_hook_order(tmp_path, monkeypatch):
+    hooks = []
+    for name, body in (("10-first", "FIRST"), ("20-second", "SECOND")):
+        payload = _json.dumps({"prepend": body})
+        hooks.append(
+            str(
+                _make_hook(
+                    tmp_path / name,
+                    f"#!/bin/sh\ncat > /dev/null\ncat <<'EOF'\n{payload}\nEOF\n",
+                )
+            )
+        )
+    monkeypatch.setenv("ROUTE_DISPATCH_HOOKS", os.pathsep.join(hooks))
+    seen = _capture_dispatch(monkeypatch)
+    cli.main_auto(["--pool", "local-agent", "write the docs"])
+    assert seen == ["FIRST\n\nSECOND\n\nwrite the docs"]

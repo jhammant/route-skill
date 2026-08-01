@@ -290,6 +290,39 @@ Hooks are advisory: missing, non-executable, slow (>15s), or failing hooks are
 reported on stderr and otherwise ignored. A hook can never change a dispatch's
 exit code or stop it happening. Full payload and failure semantics: `SPEC.md`.
 
+### Offering context to the arm
+
+A dispatched arm starts cold. It gets the task and nothing else — not the
+conventions of the repo it is about to edit, not what was already tried. The
+tracker a hook talks to usually knows some of that, so a `decision` hook may
+**offer** context by printing a JSON object with a `prepend` key instead of
+plain text:
+
+```sh
+  decision)
+    printf '%s' "$(jq -n --arg c "$(tracker notes --format md)" \
+                        '{hook_context: "ISSUE-42", prepend: $c}')" ;;
+```
+
+`prepend` is placed ahead of the task for the dispatch only, separated by a
+blank line. `hook_context` keeps its meaning; omit it and it is `""`.
+
+It is an offer, and route decides:
+
+- **plain text still means plain text.** The structured form is recognised by
+  the `prepend` key. A hook that already prints a JSON object as its opaque
+  context is unaffected.
+- **`sensitive` work takes nothing.** Offers are applied only when the plan's
+  `data_class` is `open`, so no hook can widen what a task classified
+  sensitive carries to an arm.
+- **capped at 4096 characters**, charged against the arm's context window,
+  not route's.
+- **dispatch-only.** The recorded decision, both hook payloads, and anything
+  federated keep the task the user typed.
+- **dropped on `stay`**, where nothing is dispatched.
+- **fail-open.** Malformed JSON or a non-string `prepend` costs the offer, not
+  the dispatch.
+
 ## `contrib/beads` — the reward nobody was recording
 
 route records an impression on every decision and a reward only when something

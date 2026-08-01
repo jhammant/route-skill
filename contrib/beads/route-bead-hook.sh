@@ -138,11 +138,112 @@ case "$event" in
   *) skip "unknown event '$event'" ;;
 esac
 
-# --- decision ----------------------------------------------------------
-# ROUTE_BEAD is checked first: with it unset there is nothing to do, and this
-# is the common case, so no further work (and no `bd` call at all) happens.
-[ -n "${ROUTE_BEAD:-}" ] || skip "no ROUTE_BEAD set"
-valid_id "$ROUTE_BEAD" || skip "ROUTE_BEAD is not a valid id"
+# --- decision: offered context ------------------------------------------
+# A dispatched arm starts cold. beads already holds what this project learned
+# the hard way — `bd remember` notes written by whoever hit it last — and the
+# arm about to redo that work cannot see any of it. This builds a bounded
+# excerpt and offers it to route as `prepend`.
+#
+# Offered, not imposed: route drops it for non-`open` work and caps it. The
+# data_class check below is not redundant with route's — it is what stops the
+# memories being READ at all for sensitive work, so nothing is assembled that
+# then has to be trusted to be discarded.
+#
+# Bounded twice over: at most MAX_TERMS searches, at most MAX_MEMORIES hits,
+# and a hard character budget. A local arm may be serving a 32k window, and a
+# preamble that crowds out the task it exists to inform is worse than none.
+CONTEXT_MAX_CHARS="${ROUTE_BEAD_CONTEXT_MAX_CHARS:-3000}"
+CONTEXT_MAX_TERMS="${ROUTE_BEAD_CONTEXT_MAX_TERMS:-5}"
+CONTEXT_MAX_MEMORIES="${ROUTE_BEAD_CONTEXT_MAX_MEMORIES:-4}"
+
+# Search terms out of the task text. Deliberately crude: distinctive words are
+# long ones, and `bd memories` is a substring search, so precision costs
+# nothing a cap does not already bound. Everything stays in a pipeline —
+# the task text is never interpolated into a command line.
+search_terms() {
+  printf '%s' "$payload" \
+    | jq -r '.task // ""' \
+    | tr '[:upper:]' '[:lower:]' \
+    | tr -c 'a-z0-9' '\n' \
+    | awk 'length($0) >= 5' \
+    | grep -Ev '^(about|after|again|below|could|every|first|other|should|their|there|these|thing|those|which|while|would|write|using|make|makes)$' \
+    | awk '!seen[$0]++' \
+    | head -n "$CONTEXT_MAX_TERMS"
+}
+
+# One `bd memories` call per term, merged into a single {key: text} object.
+# `--global` is queried too: the cross-repo memories are exactly the
+# infrastructure facts an arm is likeliest to be missing.
+collect_memories() {
+  local term
+  {
+    while IFS= read -r term; do
+      [ -n "$term" ] || continue
+      timeout "$BD_TIMEOUT_S" bd memories "$term" --json 2>/dev/null
+      timeout "$BD_TIMEOUT_S" bd memories "$term" --global --json 2>/dev/null
+    done < <(search_terms)
+  } | jq -s --argjson limit "$CONTEXT_MAX_MEMORIES" '
+        (map(select(type == "object")) | add // {})
+        | del(.schema_version)
+        | to_entries
+        | map(select(.value | type == "string"))
+        | .[:$limit]
+      ' 2>/dev/null
+}
+
+# Markdown, because every arm reads it and no arm needs it explained. The
+# heading says where this came from and that it is background, so an arm does
+# not mistake a memory for the instruction.
+#
+# The budget is divided BETWEEN the hits rather than spent front-to-back: a
+# single `bd remember` note routinely runs past a thousand characters, so
+# filling greedily would seat the first memory and truncate the rest out of
+# existence. Each is cut to its share and marked with an ellipsis, so the arm
+# sees every match it was given and can tell which ones it is seeing only the
+# head of.
+render_context() {
+  jq -r --argjson budget "$CONTEXT_MAX_CHARS" '
+    if (. | length) == 0 then ""
+    else
+      (($budget / length | floor) - 120) as $share
+      | "## Project memory (beads)\n"
+      + "Background from this project'"'"'s tracker. The task follows.\n\n"
+      + (
+          map(
+            "- **\(.key)**: "
+            + (if ($share > 0) and ((.value | length) > $share)
+               then (.value[:$share] + " […]")
+               else .value end)
+          )
+          | join("\n")
+        )
+      | .[:$budget]
+    end
+  ' 2>/dev/null
+}
+
+prepend=""
+data_class=$(printf '%s' "$payload" | jq -r '.plan.data_class // ""')
+if [ "$data_class" = "open" ]; then
+  prepend=$(collect_memories | render_context)
+fi
+
+# --- decision: bead metadata --------------------------------------------
+# With ROUTE_BEAD unset there is no bead to annotate — but an offer may still
+# have been built above, and it is worth making. Emit it and stop.
+emit() { # emit <hook_context>
+  if [ -n "${prepend//[[:space:]]/}" ]; then
+    jq -cn --arg c "$1" --arg p "$prepend" '{hook_context: $c, prepend: $p}'
+  elif [ -n "$1" ]; then
+    printf '%s' "$1"
+  fi
+}
+
+if [ -z "${ROUTE_BEAD:-}" ]; then
+  emit ""
+  skip "no ROUTE_BEAD set"
+fi
+valid_id "$ROUTE_BEAD" || { emit ""; skip "ROUTE_BEAD is not a valid id"; }
 
 # Only routing metadata is written — never the task text. Every field is read
 # out of the payload by `jq -r`/`jq -c` and passed as a single argv element;
@@ -158,10 +259,14 @@ metadata=$(printf '%s' "$payload" | jq -c '{
   why:         (.plan.why      // ""),
   eligible:    (.plan.eligible // []),
   decision_ts: .decision_ts
-} | with_entries(select(.value != null))' 2>/dev/null) || skip "malformed plan"
+} | with_entries(select(.value != null))' 2>/dev/null) \
+  || { emit ""; skip "malformed plan"; }
 
 timeout "$BD_TIMEOUT_S" bd update "$ROUTE_BEAD" \
   --metadata "$metadata" >/dev/null 2>&1 \
-  || skip "bd update failed for $ROUTE_BEAD"
+  || { emit ""; skip "bd update failed for $ROUTE_BEAD"; }
 timeout "$BD_TIMEOUT_S" bd label add "$ROUTE_BEAD" route:pending >/dev/null 2>&1 || true
-printf '%s' "$ROUTE_BEAD"
+# The bead id is the correlation token `complete` reads back. It is emitted
+# bare when there is no offer to make, so a beads install with no memories
+# behaves exactly as it did before this path existed.
+emit "$ROUTE_BEAD"

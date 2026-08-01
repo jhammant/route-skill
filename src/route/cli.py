@@ -217,6 +217,25 @@ def decide(args: argparse.Namespace, *, auto: bool) -> int:
             return text
         return "\n\n".join([*prepends, text])
 
+    def _complete(
+        exit_code: int, wall_clock_s: float, exception: str | None = None
+    ) -> None:
+        """Persist what the dispatch cost, then tell the hooks about it.
+
+        The measurement is recorded FIRST, and unconditionally. Hook firing
+        is advisory and can be slow, absent or broken; the latency of a
+        dispatch is route's own data, and no consumer's failure should be
+        able to lose it. It is recorded on every path that got as far as
+        dispatching, interrupts and crashes included — an arm that hangs for
+        ten minutes and dies is exactly the observation worth keeping.
+
+        Not called on the `stay` path: nothing was dispatched there, and
+        writing 0.0 would put a fabricated latency into the same column a
+        consumer compares arms on.
+        """
+        Stats().record_perf(decision_ts=decision.ts, wall_clock_s=wall_clock_s)
+        _fire_complete(exit_code, wall_clock_s, exception)
+
     def _fire_complete(
         exit_code: int, wall_clock_s: float, exception: str | None = None
     ) -> None:
@@ -264,15 +283,15 @@ def decide(args: argparse.Namespace, *, auto: bool) -> int:
         # reporting it for every exception would make a user's interrupt
         # indistinguishable from a broken pool config, and a consumer scoring
         # arms would punish the arm for both.
-        _fire_complete(130, time.monotonic() - started, "KeyboardInterrupt")
+        _complete(130, time.monotonic() - started, "KeyboardInterrupt")
         raise
     except BaseException as exc:
         # Anything else is a genuine failure of this dispatch: generic
         # failure code, plus the exception type so a consumer can tell a
         # ValueError out of shlex.split from an OSError from the arm.
-        _fire_complete(1, time.monotonic() - started, type(exc).__name__)
+        _complete(1, time.monotonic() - started, type(exc).__name__)
         raise
-    _fire_complete(exit_code, time.monotonic() - started)
+    _complete(exit_code, time.monotonic() - started)
     return exit_code
 
 
@@ -310,8 +329,18 @@ def cmd_outcome(args: argparse.Namespace) -> int:
 
     router = _build_router()
     record_outcome(router, args.shape, args.tier, args.arm, args.outcome)
-    Stats().record_outcome_events(
+    stats = Stats()
+    stats.record_outcome_events(
         list(OUTCOME_EVENTS[args.outcome]), decision_ts=args.decision_ts
+    )
+    # A reconciler usually knows more about the run than route's own wall
+    # clock did — the arm's reported token count, or the real duration of a
+    # dispatch route never timed because something else launched it. Both are
+    # no-ops when unset, so the common `auto outcome` call is unchanged.
+    stats.record_perf(
+        decision_ts=args.decision_ts,
+        wall_clock_s=args.wall_clock,
+        tokens=args.tokens,
     )
     print(json.dumps({"recorded": args.outcome, "arm": args.arm,
                       "cell": cell_name(args.shape, args.tier)}))
@@ -479,6 +508,20 @@ def _parser(prog: str) -> argparse.ArgumentParser:
         default=None,
         help="attach outcome events to the decision logged at this "
         "timestamp (default: the most recent decision)",
+    )
+    o.add_argument(
+        "--wall-clock",
+        type=float,
+        default=None,
+        help="seconds the dispatch took, overriding route's own measurement "
+        "(for work route did not time itself)",
+    )
+    o.add_argument(
+        "--tokens",
+        type=int,
+        default=None,
+        help="tokens the arm reported for this dispatch; route never sees "
+        "this, so nothing fills it in unless a caller does",
     )
     o.set_defaults(func=cmd_outcome)
 

@@ -202,6 +202,7 @@ route stats --arm codex        # one pool, by shape
 route stats --throughput       # local model performance table
 
 route outcome --shape coding:refactor --tier hard --arm codex --outcome accepted
+route outcome … --decision-ts 1754035200.5 --tokens 4096   # backfill what it cost
 
 route federate export          # what WOULD be shared — prints it, shares nothing
 route federate push --yes      # opt-in contribute (writes a submission file)

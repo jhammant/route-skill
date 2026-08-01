@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -81,10 +82,13 @@ class Stats:
     def record_decision(self, decision: Decision) -> None:
         _append_jsonl(self.decisions_path, asdict(decision))
 
-    def record_outcome_events(
-        self, events: list[str], decision_ts: float | None = None
+    def _amend(
+        self,
+        mutate: Callable[[dict], None],
+        decision_ts: float | None,
+        what: str,
     ) -> None:
-        """Attach outcome events to a decision.
+        """Apply ``mutate`` to one logged decision and rewrite the log.
 
         With ``decision_ts``, the row whose ``ts`` matches (within float
         round-tripping tolerance) — so a consumer reconciling long after the
@@ -92,9 +96,14 @@ class Stats:
         most recent decision is targeted, which is what an inline caller
         means.
 
-        An unmatched ``decision_ts`` warns and writes nothing: a rotated or
-        hand-edited log must never take down outcome recording, because the
-        bandit reward is the part that matters.
+        An unmatched ``decision_ts`` warns (naming ``what`` was dropped) and
+        writes nothing: a rotated or hand-edited log must never take down
+        recording, because the bandit reward is the part that matters.
+
+        Everything that amends a decision after the fact goes through here.
+        Locating the row is the subtle part — the tolerance, the last-match
+        rule, the fail-soft on a rotated log — and a second copy of it would
+        be a second set of those decisions to keep in step.
         """
         rows = _read_jsonl(self.decisions_path)
         if not rows:
@@ -109,18 +118,61 @@ class Stats:
             ]
             if not matches:
                 print(
-                    f"route: no decision at ts={decision_ts!r}; "
-                    "outcome events not attached",
+                    f"route: no decision at ts={decision_ts!r}; {what} not attached",
                     file=sys.stderr,
                 )
                 return
             index = matches[-1]
-        rows[index]["outcome_events"] = sorted(
-            set(rows[index].get("outcome_events", [])) | set(events)
-        )
+        mutate(rows[index])
         self.decisions_path.write_text(
             "".join(json.dumps(r, sort_keys=True) + "\n" for r in rows), encoding="utf-8"
         )
+
+    def record_outcome_events(
+        self, events: list[str], decision_ts: float | None = None
+    ) -> None:
+        """Attach outcome events to a decision."""
+
+        def _merge(row: dict) -> None:
+            row["outcome_events"] = sorted(
+                set(row.get("outcome_events", [])) | set(events)
+            )
+
+        self._amend(_merge, decision_ts, "outcome events")
+
+    def record_perf(
+        self,
+        decision_ts: float | None = None,
+        wall_clock_s: float | None = None,
+        tokens: int | None = None,
+    ) -> None:
+        """Attach measured cost to a decision.
+
+        `Decision` has declared `wall_clock_s` and `tokens` from the start and
+        nothing ever assigned them, so every row carried nulls where the
+        latency and cost data was supposed to be. The measurement existed —
+        `cmd_task` times the dispatch — it was simply thrown away once the
+        hook payload had been built.
+
+        Both are optional and set independently. route times its own dispatch
+        and can fill `wall_clock_s` inline; it never sees a token count,
+        because it shells out to arms that report one (or do not), so `tokens`
+        arrives later through `auto outcome --tokens`.
+
+        Last write wins per field. A backfilled measurement is a correction —
+        a wrapper that knows the arm's real accounting is a better source than
+        route's wall clock, and it must not have to care which ran first.
+        """
+        if wall_clock_s is None and tokens is None:
+            return
+
+        def _set(row: dict) -> None:
+            if wall_clock_s is not None:
+                row["wall_clock_s"] = float(wall_clock_s)
+            if tokens is not None:
+                row["tokens"] = int(tokens)
+
+        self._amend(_set, decision_ts, "perf")
 
     def record_throughput(self, sample: Throughput) -> None:
         _append_jsonl(self.throughput_path, asdict(sample))

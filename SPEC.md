@@ -365,6 +365,24 @@ first run or the data is worthless.
 prior / posterior), outcome events, wall-clock, tokens, escalations. Plus, for local
 runs, `(model, quant, context_length, hardware) → tok/s, items/s, load seconds, peak GB`.
 
+Cost is filled in from two different places, because two different things know it.
+route times its own dispatch and writes `wall_clock_s` when it completes — including
+when the arm is interrupted or crashes, since an arm that burns ten minutes and dies
+is exactly the observation worth keeping. It is **not** written on the `stay` path,
+where nothing was dispatched and a `0.0` would be a fabricated latency in the column
+arms are compared on.
+
+`tokens` route never sees at all: it shells out to arms that report their own
+accounting, or do not. So it arrives afterwards, via `auto outcome --tokens` (and
+`--wall-clock`, for a dispatch route did not time itself). Last write wins per field,
+so a reconciler with better numbers does not have to care whether it ran before or
+after the inline measurement.
+
+Everything that amends a logged decision — outcome events, cost — goes through one
+row-locator. Finding the right row is the subtle part (float tolerance on
+`decision_ts`, last match wins, a rotated log warns rather than failing), and a
+second copy of those rules is a second set to keep in step.
+
 ```
 route stats                    # per-cell: obs, success rate, prior vs posterior
 route stats --arm codex        # how is one pool doing, by shape

@@ -8,8 +8,12 @@ Events, ranked by the signal that is hardest to fake:
 
 Escalation is capped at one hop: on failed verification, retry once on the
 next-stronger eligible arm. Escalating away from an arm records a negative
-outcome for it (an impression with no reward), so unreliable routes decay
+outcome for it (a resolved trial with no reward), so unreliable routes decay
 without anyone tuning weights.
+
+Every function here resolves exactly one trial for the arm it names — that is
+what makes an outcome an observation. A dispatch that never reaches this
+module is left unresolved on purpose: it is unknown, not failed.
 """
 
 from __future__ import annotations
@@ -27,15 +31,23 @@ OUTCOME_EVENTS: dict[str, tuple[str, ...]] = {
 
 
 def record_outcome(router: Router, shape: str, tier: str, arm: str, outcome: str) -> None:
-    """Record an outcome as its reward events. Unknown outcomes raise."""
-    events = OUTCOME_EVENTS[outcome]
+    """Record an outcome as its reward events. Unknown outcomes raise.
+
+    Resolves one trial whatever the outcome — including ``failed``, whose
+    event tuple is empty. That used to make ``route outcome --outcome failed``
+    a no-op on the posterior, its whole effect coming from the impression
+    already booked at selection; a reported failure now moves beta itself, and
+    is the only thing that does.
+    """
+    events = OUTCOME_EVENTS[outcome]  # raises before anything is written
     for event in events:
         router.reward(shape, tier, arm, event)
+    router.record_resolution(shape, tier, arm)
 
 
 def record_failure(router: Router, shape: str, tier: str, arm: str) -> None:
-    """A negative outcome: an impression with no reward."""
-    router.record_impression(shape, tier, arm)
+    """A negative outcome: a resolved trial with no reward."""
+    router.record_resolution(shape, tier, arm)
 
 
 def escalate(

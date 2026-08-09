@@ -125,6 +125,10 @@ favour for that cell starts at `Beta(8,2)`, one they don't at `Beta(2,8)`. With
 - the crossover is **automatic and per-cell** — frequently-used routes go adaptive
   fast, rare ones keep deferring to the rules
 
+Selection records an `impression`, but the sampler's trial counter is `resolved`,
+written only when an outcome is attributed. Therefore `beta = resolved - accepted`:
+an unreconciled dispatch is unknown and moves neither side of the posterior.
+
 There is deliberately **no flag, threshold, or phase-2 migration** for "become
 adaptive". That is the entire reason to use a bandit rather than bolt learning on later.
 
@@ -248,7 +252,7 @@ is why the timeout is bounded.
 The seam above is vendor-neutral and stays that way; `contrib/beads/` is a
 worked example of what it is *for*, shipped because without some caller of
 `auto outcome` the outcome ladder above is unreachable in practice and every
-posterior decays back to its prior.
+posterior stays at its prior.
 
 Three properties are normative for any integration built on this seam, not
 just this one:

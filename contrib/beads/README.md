@@ -1,9 +1,10 @@
 # beads integration — closing the learning loop
 
-route records an *impression* every time it picks an arm, and a *reward* only
-when something calls `auto outcome`. Out of the box nothing does. Impressions
-accumulate, rewards do not, and every arm's Beta posterior decays back toward
-its prior — the router keeps deciding, but it never learns.
+route records an *impression* every time it picks an arm. `auto outcome` records
+a *resolved* trial and, when accepted, its reward. Out of the box nothing calls
+it. Impressions accumulate while every arm's Beta posterior stays at its prior —
+the router keeps deciding, but it never learns. An unreconciled dispatch is
+unknown, not a failed trial.
 
 This is the missing caller, built on [beads](https://github.com/gastownhall/beads)
 (`bd`), a Dolt-backed issue tracker. The loop is:

@@ -109,8 +109,11 @@ task text
    one Thompson-sampling bandit per `route:{shape}:{tier}` cell, Beta priors seeded
    from the static rule table (`data/priors.toml`): favoured pools start at
    `Beta(8,2)`, the rest at `Beta(2,8)`. Cold start behaves exactly like the rules;
-   evidence swamps the prior automatically, per cell. **There is no "switch to
-   adaptive" flag — that is the entire reason to use a bandit.**
+   evidence swamps the prior automatically, per cell. Selection records an
+   impression, but only an attributed outcome records a resolved trial: the sampler
+   uses `beta = resolved - accepted`, so a dispatch with no outcome is unknown and
+   does not change the posterior. **There is no "switch to adaptive" flag — that is
+   the entire reason to use a bandit.**
 6. **Dispatch** — hands to the existing skills or returns `stay` for Claude. Never
    reimplements them, never triggers paid provisioning.
 7. **Outcome** — reward events ranked by the signal hardest to fake: `accepted`
@@ -352,10 +355,10 @@ It is an offer, and route decides:
 
 ## `contrib/beads` — the reward nobody was recording
 
-route records an impression on every decision and a reward only when something
-calls `auto outcome`. Nothing does by default, so impressions pile up, rewards
-do not, and every posterior decays back toward its prior: the router keeps
-deciding, but it never learns.
+route records an impression on every decision. A call to `auto outcome` records
+the resolved trial and, when accepted, its reward. Nothing calls it by default,
+so impressions pile up while the posterior stays at its prior: the router keeps
+deciding, but it never learns. Unreconciled dispatches are unknown, not failures.
 
 `contrib/beads/` is a working integration that closes that loop against
 [beads](https://github.com/gastownhall/beads), a Dolt-backed issue tracker.

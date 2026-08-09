@@ -81,6 +81,10 @@ def record_swarm_outcome(
         raise ValueError("units_accepted must be within [0, units_total]")
     fraction = units_accepted / units_total
     router.record_impression(shape, tier, arm, by=1)
+    # One resolved trial, weighted: alpha += fraction via the reward below,
+    # beta += 1 - fraction falls out of resolved - accepted. The impression
+    # above is the dispatch tally and no longer carries the beta.
+    router.record_resolution(shape, tier, arm, by=1)
     if fraction:
         router.reward(shape, tier, arm, REWARD_EVENT, by=fraction)
     if stats is not None:

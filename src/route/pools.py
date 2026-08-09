@@ -5,6 +5,11 @@ Shipped arms: ``claude``, ``codex``, ``kimi``, ``local-batch``, ``local-agent``,
 declares the shapes it accepts, whether it needs a repo, whether it is remote,
 its cost class, and its pinned model identity (model + quant + version — a
 ``qwen3.6-27b`` at 4-bit and at bf16 must never merge into one arm).
+
+Two overlays are read, in order: ``pools.toml`` and then ``pools.local.toml``.
+The second is for per-machine truth (an arm that is not installed here, an
+endpoint this host cannot reach) so the first can be shared verbatim across
+machines — see :func:`load_pools`.
 """
 
 from __future__ import annotations
@@ -174,18 +179,29 @@ def _default_pools() -> dict[str, Pool]:
     }
 
 
-def load_pools(path: str | Path | None = None) -> dict[str, Pool]:
-    """Shipped arms, overlaid with the user's pools.toml if present."""
-    pools = _default_pools()
-    path = Path(path) if path is not None else config_dir() / "pools.toml"
-    if not path.is_file():
-        return pools
+#: Overlay files, in application order. The first is the shared registry — on a
+#: multi-machine setup commonly a symlink into a config repo. The second is
+#: per-machine and untracked, so an operator can say "no agy on this box" or
+#: "this box cannot reach that LAN endpoint" without editing the file every
+#: machine shares (and having the installer revert it on the next run).
+OVERLAY_FILENAMES: tuple[str, ...] = ("pools.toml", "pools.local.toml")
+
+
+def _apply_overlay(pools: dict[str, Pool], path: Path) -> None:
+    """Overlay one TOML file onto ``pools``, replacing pool tables wholesale.
+
+    A table in an overlay is a COMPLETE arm definition, not a patch over what
+    it shadows: every key it omits falls back to the defaults below, not to the
+    value the previous layer held. That is how the single overlay has always
+    behaved, and two layers merging by two different rules would be worse than
+    verbose.
+    """
     raw = tomllib.loads(path.read_text(encoding="utf-8"))
     for name, spec in (raw.get("pools") or {}).items():
         shapes = tuple(spec.get("shapes", ()))
         unknown = [s for s in shapes if s not in SHAPES]
         if unknown:
-            raise ValueError(f"pools.toml: {name} declares unknown shapes {unknown}")
+            raise ValueError(f"{path.name}: {name} declares unknown shapes {unknown}")
         model_spec = spec.get("model") or {}
         pools[name] = Pool(
             name=name,
@@ -205,4 +221,28 @@ def load_pools(path: str | Path | None = None) -> dict[str, Pool]:
             ),
             parallel_limit=int(spec.get("parallel_limit", 1)),
         )
+
+
+def load_pools(
+    path: str | Path | None = None, local_path: str | Path | None = None
+) -> dict[str, Pool]:
+    """Shipped arms, overlaid with pools.toml then pools.local.toml.
+
+    Two overlays, applied in that order, last wins per pool table. The shared
+    registry stays shared; a machine that lacks an arm the registry declares,
+    or that cannot reach an endpoint it names, pins that local reality in
+    ``pools.local.toml`` — which no config-repo installer will ever revert.
+
+    Each overlay replaces a pool table wholesale; see ``_apply_overlay``.
+    """
+    pools = _default_pools()
+    base = Path(path) if path is not None else config_dir() / OVERLAY_FILENAMES[0]
+    local = (
+        Path(local_path)
+        if local_path is not None
+        else config_dir() / OVERLAY_FILENAMES[1]
+    )
+    for overlay in (base, local):
+        if overlay.is_file():
+            _apply_overlay(pools, overlay)
     return pools

@@ -100,6 +100,11 @@ task text
    task carrying private data can **never** land on the `free` arm.
 3. **Eligibility** — `pools.py` is a config-driven arm registry
    (`~/.config/route/pools.toml`); a new model is a config entry, not a code change.
+   The optional `~/.config/route/pools.local.toml` is applied afterwards and wins
+   per arm table, so it can hold machine-local truth without changing the shared
+   file. To disable an unavailable arm on one machine, override its table with
+   empty `shapes`, `probe`, and `dispatch` values. A missing or dangling local
+   file is ignored.
    A `batch:*` shape never yields `codex`/`kimi`; a `coding:*` shape never yields
    `local-batch`. Arms with a health endpoint (`free`) are eligible only while it
    answers — an unreachable proxy removes the arm, never an error.

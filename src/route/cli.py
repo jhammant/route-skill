@@ -26,6 +26,7 @@ from .benchmark import (
     local_llm_throughput_path,
     run_benchmark,
     seed_priors,
+    selectable_arms,
 )
 from .complexity import estimate_complexity
 from .eligibility import DATA_OPEN, SensitiveRoutingError, fetch_quota, gate
@@ -401,15 +402,35 @@ def cmd_federate(args: argparse.Namespace) -> int:
 
 def cmd_benchmark(args: argparse.Namespace) -> int:
     pools = load_pools()
+    # Named explicitly, the arm is benchmarked whatever it looks like, and an
+    # arm that cannot be dispatched to is an error the caller asked for. Only
+    # the implicit "everything" sweep is filtered: see `selectable_arms`.
+    explicit = True
     if args.arm:
         arms = [args.arm]
     elif args.compare:
         arms = [a.strip() for a in args.compare.split(",") if a.strip()]
     else:
-        arms = list(pools)
+        arms = selectable_arms(pools)
+        explicit = False
     unknown = [a for a in arms if a not in pools]
     if unknown:
         print(f"route benchmark: unknown arm(s) {unknown}", file=sys.stderr)
+        return 2
+    if explicit:
+        unselectable = [a for a in arms if a not in selectable_arms(pools)]
+        if unselectable:
+            print(
+                f"route benchmark: arm(s) {unselectable} declare no shapes or no "
+                "probe/dispatch command and cannot be benchmarked",
+                file=sys.stderr,
+            )
+            return 2
+    if not arms:
+        print(
+            "route benchmark: no arm declares shapes and a probe/dispatch command",
+            file=sys.stderr,
+        )
         return 2
     suites = [args.suite] if args.suite else list(SUITES)
     results = run_benchmark(

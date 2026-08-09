@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from route.outcomes import escalate, record_outcome
-from route.router import cell_name
+from route.router import IMPRESSION_EVENT, RESOLVED_EVENT, REWARD_EVENT, cell_name
 
 
 def test_escalate_picks_next_stronger_eligible_arm(router, pools):
@@ -35,16 +35,31 @@ def test_no_stronger_arm_means_no_escalation(router, pools):
 def test_escalated_from_arm_receives_a_negative_outcome(router, pools, storage):
     shape, tier = "coding:implement", "moderate"
     router.select(shape, tier, ["claude", "codex"], record_impression=False)
-    key = f"{cell_name(shape, tier)}:impression"
-    before = storage.counts(key)["codex"]
-    accepted_before = storage.counts(f"{cell_name(shape, tier)}:accepted")["codex"]
+    cell = cell_name(shape, tier)
+    impressions_before = storage.counts(f"{cell}:{IMPRESSION_EVENT}")["codex"]
+    resolved_before = storage.counts(f"{cell}:{RESOLVED_EVENT}")["codex"]
+    accepted_before = storage.counts(f"{cell}:{REWARD_EVENT}")["codex"]
+    posterior_before = router.posterior(shape, tier)["codex"]
 
     escalate(router, shape, tier, "codex", ["claude", "codex"], pools)
 
-    after = storage.counts(key)["codex"]
-    accepted_after = storage.counts(f"{cell_name(shape, tier)}:accepted")["codex"]
-    assert after == before + 1          # one more impression...
-    assert accepted_after == accepted_before  # ...with no reward = negative
+    assert storage.counts(f"{cell}:{IMPRESSION_EVENT}")["codex"] == impressions_before
+    assert storage.counts(f"{cell}:{RESOLVED_EVENT}")["codex"] == resolved_before + 1
+    assert storage.counts(f"{cell}:{REWARD_EVENT}")["codex"] == accepted_before
+    alpha, beta = posterior_before
+    assert router.posterior(shape, tier)["codex"] == (alpha, beta + 1)
+
+
+def test_recorded_outcomes_move_the_posterior(router):
+    shape, tier, arm = "coding:debug", "simple", "claude"
+    router.select(shape, tier, [arm], record_impression=False)
+    alpha, beta = router.posterior(shape, tier)[arm]
+
+    record_outcome(router, shape, tier, arm, "accepted")
+    assert router.posterior(shape, tier)[arm] == (alpha + 1, beta)
+
+    record_outcome(router, shape, tier, arm, "failed")
+    assert router.posterior(shape, tier)[arm] == (alpha + 1, beta + 1)
 
 
 def test_record_outcome_records_cumulative_events(router, storage):

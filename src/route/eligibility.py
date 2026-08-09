@@ -16,6 +16,7 @@ a remote arm.
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import urllib.request
@@ -23,6 +24,7 @@ from dataclasses import dataclass, field
 
 from .pools import Pool
 from .shapes import FALLBACK_SHAPE
+from .storage import config_dir
 
 #: The pool every veto short-circuits to.
 VETO_TARGET = "claude"
@@ -153,18 +155,93 @@ def parse_quota(payload: dict) -> dict[str, str]:
     return out
 
 
+#: Headroom hook directory, relative to the route config dir.
+HEADROOM_HOOKS_DIRNAME = "headroom-hooks.d"
+
+
+def discover_headroom_hooks() -> list[str]:
+    """Headroom hooks to consult, in order.
+
+    ``ROUTE_HEADROOM_HOOKS`` (os.pathsep-separated) REPLACES the directory
+    rather than adding to it, so a caller can always pin a known hook set —
+    set it to an empty string to disable hooks outright. Otherwise:
+    executable files in ``<config_dir>/headroom-hooks.d``, sorted by name.
+
+    Deliberately the same shape as ``hooks.discover_hooks``: two hook
+    directories with two different discovery rules is a thing to trip over
+    for no gain.
+    """
+    override = os.environ.get("ROUTE_HEADROOM_HOOKS")
+    if override is not None:
+        return [os.path.expanduser(part) for part in override.split(os.pathsep) if part]
+    directory = config_dir() / HEADROOM_HOOKS_DIRNAME
+    if not directory.is_dir():
+        return []
+    return sorted(
+        str(path)
+        for path in directory.iterdir()
+        if path.is_file() and os.access(path, os.X_OK)
+    )
+
+
+def fetch_hook_pools(timeout: float = 5.0) -> dict[str, str]:
+    """Headroom for pools quotamax does not track.
+
+    quotamax knows the pools it knows. An arm behind a vendor with no quota
+    API — or one whose harness is simply not installed on this machine — has
+    no way to say it cannot take work, and the bandit will keep selecting it.
+    A hook is the answer: an executable emitting ``parse_quota``-compatible
+    JSON on stdout, after which the existing ``critical`` removal does the
+    rest. Nothing new is needed in the gate.
+
+    Later hooks win on a pool an earlier one also reported, which is what the
+    name-ordered directory is for: `10-presence` can say what is installed at
+    all and `50-vendor` can then refine one of those pools with a real number.
+
+    Fail-open per hook, as quota is everywhere else: a hook that is missing,
+    non-executable, slow, failing or emitting garbage contributes nothing and
+    does not disturb the hooks around it. The safe direction here is "no
+    opinion", never "unavailable".
+    """
+    out: dict[str, str] = {}
+    for hook in discover_headroom_hooks():
+        if not hook or not os.access(hook, os.X_OK):
+            continue
+        try:
+            proc = subprocess.run(
+                [hook, "--json"], capture_output=True, text=True, timeout=timeout
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if proc.returncode != 0:
+            continue
+        try:
+            out.update(parse_quota(json.loads(proc.stdout)))
+        except ValueError:
+            continue
+    return out
+
+
 def fetch_quota(cmd: tuple[str, ...] = ("quotamax", "agent", "--json"), timeout: float = 5.0) -> dict[str, str]:
-    """Live quota from quotamax. Fail-open: any error means no quota data."""
+    """Live quota from quotamax, then from any headroom hooks.
+
+    Fail-open: any error means no quota data. Hooks are consulted even when
+    quotamax failed or is not installed at all — they cover the pools it does
+    not, so gating them on it would tie one arm's availability to an
+    unrelated tool being present.
+    """
+    quota: dict[str, str] = {}
     try:
         proc = subprocess.run(list(cmd), capture_output=True, text=True, timeout=timeout)
     except (OSError, subprocess.TimeoutExpired):
-        return {}
-    if proc.returncode != 0:
-        return {}
-    try:
-        return parse_quota(json.loads(proc.stdout))
-    except ValueError:
-        return {}
+        proc = None
+    if proc is not None and proc.returncode == 0:
+        try:
+            quota = parse_quota(json.loads(proc.stdout))
+        except ValueError:
+            quota = {}
+    quota.update(fetch_hook_pools(timeout=timeout))
+    return quota
 
 
 def apply_quota(

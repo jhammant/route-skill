@@ -13,10 +13,12 @@ from route.benchmark import (
     bench_counts,
     enable_seed,
     run_benchmark,
+    selectable_arms,
     seed_enabled,
     seed_priors,
 )
 from route.federate import COMMUNITY_DISCOUNT
+from route.pools import Pool
 from route.router import Router
 from route.stats import report_cells
 
@@ -164,3 +166,48 @@ def test_cli_benchmark_failed_dispatch_records_error_not_evidence(tmp_path, caps
     assert result["error"]
     assert result["total"] == 0
     assert bench_counts(JsonStorage()) == {}  # ROUTE_STATE_DIR is isolated
+
+
+def test_implicit_benchmark_skips_arms_without_shapes_or_commands(monkeypatch, capsys):
+    """The everything sweep only asks arms able to produce benchmark evidence."""
+    import json
+
+    from route import cli
+    from route.storage import JsonStorage
+
+    pools = {
+        "usable": Pool(
+            name="usable",
+            shapes=("batch:classify",),
+            probe="printf usable",
+        ),
+        "dispatch-only": Pool(
+            name="dispatch-only",
+            shapes=("batch:classify",),
+            dispatch="printf dispatch-only",
+        ),
+        "no-shapes": Pool(
+            name="no-shapes",
+            shapes=(),
+            probe="printf unavailable",
+        ),
+        "no-command": Pool(
+            name="no-command",
+            shapes=("batch:classify",),
+        ),
+        "neither": Pool(name="neither", shapes=()),
+    }
+    monkeypatch.setattr(cli, "load_pools", lambda: pools)
+
+    assert selectable_arms(pools) == ["usable", "dispatch-only"]
+    assert cli.main(["benchmark", "--suite", "instruct"]) == 0
+    output = json.loads(capsys.readouterr().out)
+    results = output["results"]
+
+    assert [result["arm"] for result in results] == ["usable", "dispatch-only"]
+    assert all(not result["error"] for result in results)
+    counts = bench_counts(JsonStorage())
+    assert set(counts["batch:classify:simple"]) == {"usable", "dispatch-only"}
+
+    assert cli.main(["benchmark", "--arm", "no-shapes", "--suite", "instruct"]) == 2
+    assert "cannot be benchmarked" in capsys.readouterr().err

@@ -153,6 +153,27 @@ _SUITE_CELL: dict[str, tuple[str, str]] = {
 # -- the default runner --------------------------------------------------------
 
 
+def selectable_arms(pools: dict[str, Pool]) -> list[str]:
+    """Arms the default runner can actually ask a question, in table order.
+
+    An arm with no declared shape, or with neither ``probe`` nor ``dispatch``,
+    is a placeholder: a registry entry for something this machine does not
+    have installed, kept so the shared table stays shared. ``shell_runner``
+    has nothing useful to exec for it and raises, which is right when it was
+    asked for by name and pure noise when it was only swept up by "benchmark
+    everything" — one error row per suite per run, forever, on an arm that can
+    never produce a number.
+
+    Callers pick their side of that: sweep over this, but still let an
+    explicit ``--arm``/``--compare`` fail loudly.
+    """
+    return [
+        name
+        for name, pool in pools.items()
+        if pool.shapes and (pool.probe or pool.dispatch)
+    ]
+
+
 def shell_runner(pools: dict[str, Pool], timeout: float = 120.0) -> Runner:
     """Shell out through the pool's dispatch template; stdout is the answer."""
 

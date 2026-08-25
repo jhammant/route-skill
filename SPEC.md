@@ -78,6 +78,32 @@ is **removed from eligibility**, not penalised. Quota gates *availability*; the 
 decides *quality* among what's available. Keeping these separate is what stops a
 cheap-but-bad pool winning just because it's idle.
 
+#### Headroom hooks
+
+quotamax knows the pools it knows. An arm behind a vendor with no quota API — or one
+whose harness is not installed on this machine at all — has no way to say it cannot
+take work, so the bandit keeps selecting it and every dispatch fails identically.
+
+Executables in `<config_dir>/headroom-hooks.d` fill that in. Each is run with `--json`
+and emits `parse_quota`-compatible output on stdout; the result is merged over
+quotamax's, and the existing `critical` removal does the rest. **No new logic in the
+gate** — a hook's only power is to report headroom for a pool, and what that means
+was already decided.
+
+Discovery mirrors `dispatch-hooks.d` exactly — sorted by name,
+`ROUTE_HEADROOM_HOOKS` (`os.pathsep`-separated) replaces the directory set, empty
+string disables — because two hook directories with two sets of rules is a thing to
+trip over for no gain. Name order is meaningful: a later hook wins on a pool an
+earlier one also reported, so `10-presence` can report what is installed at all and
+`50-vendor` can refine one of those pools with a real number.
+
+Hooks are consulted even when quotamax failed or is absent: they cover the pools it
+does not, and gating them on it would tie one arm's availability to an unrelated tool
+being installed. Fail-open per hook, as everywhere else in quota — missing,
+non-executable, slow, failing or emitting garbage contributes nothing and does not
+disturb the hooks around it. The safe direction is "no opinion", never "unavailable":
+a broken hook must not be able to make an arm ineligible.
+
 ### 5. Select — the bandit, and why there is no "switch to adaptive"
 
 `router.py` wraps `banditry`. **One bandit per context cell**, named
@@ -119,6 +145,135 @@ rank by the signal that is hardest to fake):
 **Escalation ladder, capped at one hop.** On failed verification, retry once on the
 next-stronger eligible arm. Escalating away from an arm records a *negative* outcome
 for it, so unreliable routes decay without anyone tuning weights.
+
+#### Dispatch hooks
+
+An opt-in seam for external trackers. Hooks are executable files in
+`<config_dir>/dispatch-hooks.d`, run in sorted order; `ROUTE_DISPATCH_HOOKS`
+(`os.pathsep`-separated) replaces that directory set entirely — set it to an
+empty string to disable all hooks outright (an *explicit* opt-out, distinct
+from leaving it unset). With neither set, behaviour is unchanged from before
+this seam existed: no subprocess is spawned, and the one cost paid either way
+is `discover_hooks()`'s single `is_dir()` stat on the hooks directory.
+
+Two events fire per decision, each a JSON object delivered whole on the
+hook's stdin — a single `json.dumps()` call with **no trailing newline**. A
+hook that reads line-oriented (`read line`, appending to a JSONL log) must
+add its own newline before writing the next line, or successive events will
+concatenate onto one line.
+
+- `decision` — fired once dispatch is *certain*: on the `stay` path (the task
+  belongs here), or once a `route` confirmation prompt is accepted. Never
+  fired when dispatch is declined. Payload: `{"event": "decision", "task":
+  str, "plan": dict}`.
+- `complete` — fired once dispatch is done, always after `decision` if
+  `decision` fired: normally when `_dispatch` returns, but also when it
+  raises — the exception still propagates unchanged afterwards. Carries the
+  real `exit_code` and `wall_clock_s` (on the `stay` path, where nothing is
+  actually dispatched, `wall_clock_s` is `0.0`). `exception` names the
+  exception type when one escaped `_dispatch`, and is `null` otherwise:
+  `KeyboardInterrupt` reports `exit_code` `130` (the shell's SIGINT
+  convention), anything else reports `1`. The two are kept distinct
+  deliberately — a consumer scoring arms must be able to tell a user's Ctrl-C
+  from a broken pool config (a malformed dispatch template raises `ValueError`
+  out of `shlex.split`), and `exception` names which. Each hook gets back
+  whatever it printed on `decision` as `hook_context`, so an integration can
+  thread its own record id through without inventing side-channel state keyed
+  on pid. Payload: `{"event": "complete", "task": str, "plan": dict,
+  "exit_code": int, "wall_clock_s": float, "hook_context": str, "exception":
+  str | null}`.
+
+Hooks are advisory: a missing, non-executable, slow (>15s), or non-zero-exit
+hook is reported on stderr and otherwise ignored — it can never change
+`_dispatch`'s return code or block a dispatch from happening. A hook's
+stdout is captured as `hook_context` up to a 4096-**character** cap and
+`.strip()`-ped; anything beyond that cap is silently dropped. The cap counts
+characters rather than bytes because the pipe is read as decoded text, so a
+multi-byte hook context is bounded at 4096 code points, not 4096 bytes.
+
+##### Offered context
+
+`decision` stdout has a second, opt-in form: a JSON **object** carrying a
+`prepend` key, `{"hook_context": str, "prepend": str}`. `prepend` is context
+the hook offers for the dispatched task — the arm's cold start is the gap it
+closes, and the tracker on the other side of the hook is usually what knows
+how to close it. `hook_context` keeps its existing meaning and defaults to
+`""`.
+
+The discriminator is the **presence of the `prepend` key**, not "parses as
+JSON". A hook that already emits a JSON object as its opaque context keeps
+meaning exactly that; only a hook asking for a prepend is read as asking.
+Anything that is not an object with that key — plain text, malformed JSON, a
+bare array — is the whole `hook_context`, as before. Each field is capped
+after parsing rather than at the pipe, so `decision` stdout is read up to a
+larger bound (`HOOK_DECISION_MAX_CHARS`): truncating at the context cap would
+cut a full-sized object mid-string, fail the parse, and silently demote a
+well-formed hook to the plain-text path.
+
+An offer is not an instruction. route applies it only when:
+
+- the plan's `data_class` is `open`. This gate lives in route, not in the
+  hook: the hook is handed `data_class` and can be well-behaved about it, but
+  a guarantee resting on every hook being well-behaved is not a guarantee.
+  On any other class the offer is dropped with one line on stderr.
+- something is actually being dispatched. On the `stay` path it is discarded
+  silently — a hook cannot know which branch it is on, and offering on every
+  decision is the right behaviour for it.
+
+Applied offers are placed ahead of the task, blank-line separated, in hook
+order; the **task goes last**, because an arm that reads a long preamble
+before its instruction is likelier to answer the preamble. Each is capped at
+4096 characters, a budget separate from `hook_context`'s because it is spent
+on the arm's context window rather than route's — an injected preamble that
+crowds out the task it exists to inform is worse than none. With no offers
+the dispatched string is the task itself, unchanged. One line on stdout names
+each hook that prepended and how much, so an injected preamble is never
+invisible.
+
+This is the only thing a hook can do that an arm can see, and it is bounded
+to exactly that: the injected text reaches the arm and nothing else. The
+recorded `Decision`, both hook payloads, and every federated artefact carry
+the task the user typed — otherwise a consumer would score arms on, and a
+fleet would learn from, text no user ever wrote. A hook still cannot block a
+dispatch, redirect it, or change its exit code.
+
+One caveat on Ctrl-C: `complete` fires *before* `KeyboardInterrupt`
+propagates, and it fires synchronously, so an interrupt can be delayed by up
+to the 15s hook timeout per configured hook before the process actually exits.
+That is the price of never leaving an external tracker's record open, and it
+is why the timeout is bounded.
+
+#### Reference integration — `contrib/beads`
+
+The seam above is vendor-neutral and stays that way; `contrib/beads/` is a
+worked example of what it is *for*, shipped because without some caller of
+`auto outcome` the outcome ladder above is unreachable in practice and every
+posterior decays back to its prior.
+
+Three properties are normative for any integration built on this seam, not
+just this one:
+
+- **One writer for the reward.** The hook records evidence (`exit_code`,
+  `wall_clock_s`, chosen arm) onto an external record. A separate reconciler
+  is the only thing that calls `auto outcome`. Two writers double-count, and
+  a double-counted Beta posterior is wrong in a way nothing downstream can
+  detect.
+- **The reward must come from outside route.** An integration that creates
+  its own tracking record and then reads it back is learning from itself. The
+  signal `contrib/beads` uses is a human closing the work item.
+- **Offered context is derived, never authored.** What an integration offers
+  as `prepend` must be something its tracker already holds — `contrib/beads`
+  offers `bd remember` notes a human wrote. A hook that composes instructions
+  of its own is steering the arm through a seam whose whole contract is that
+  it does not steer.
+- **`decision_ts` attributes the reward.** `auto outcome --decision-ts` binds
+  a late-arriving verdict to the decision that earned it rather than to the
+  most recent decision in that cell; without it, a task closed a week later
+  credits whichever arm happened to run most recently.
+
+The integration lives outside the package (`packages = ["src/route"]`), is
+gated at install time on the tracker's CLI being present, and is inert without
+it: an install with no `bd` on PATH is byte-identical to a stock one.
 
 ### Swarms — fan-out when the pool has headroom
 
@@ -235,6 +390,24 @@ first run or the data is worthless.
 `stats.py` records per decision: context cell, eligible arms, chosen arm, why (veto /
 prior / posterior), outcome events, wall-clock, tokens, escalations. Plus, for local
 runs, `(model, quant, context_length, hardware) → tok/s, items/s, load seconds, peak GB`.
+
+Cost is filled in from two different places, because two different things know it.
+route times its own dispatch and writes `wall_clock_s` when it completes — including
+when the arm is interrupted or crashes, since an arm that burns ten minutes and dies
+is exactly the observation worth keeping. It is **not** written on the `stay` path,
+where nothing was dispatched and a `0.0` would be a fabricated latency in the column
+arms are compared on.
+
+`tokens` route never sees at all: it shells out to arms that report their own
+accounting, or do not. So it arrives afterwards, via `auto outcome --tokens` (and
+`--wall-clock`, for a dispatch route did not time itself). Last write wins per field,
+so a reconciler with better numbers does not have to care whether it ran before or
+after the inline measurement.
+
+Everything that amends a logged decision — outcome events, cost — goes through one
+row-locator. Finding the right row is the subtle part (float tolerance on
+`decision_ts`, last match wins, a rotated log warns rather than failing), and a
+second copy of those rules is a second set to keep in step.
 
 ```
 route stats                    # per-cell: obs, success rate, prior vs posterior

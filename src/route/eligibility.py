@@ -19,7 +19,9 @@ import json
 import re
 import subprocess
 import urllib.request
-from dataclasses import dataclass, field
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+from dataclasses import dataclass, field, replace
 
 from .pools import Pool
 from .shapes import FALLBACK_SHAPE
@@ -138,12 +140,34 @@ def eligible_for(shape: str, pools: dict[str, Pool]) -> list[str]:
     return out
 
 
-def parse_quota(payload: dict) -> dict[str, str]:
+def parse_quota(payload: dict | list) -> dict[str, str]:
     """Normalise quotamax JSON to {pool: headroom}.
 
     Accepts {"codex": "ok"}, {"codex": {"headroom": "ok"}}, or either nested
     under a "pools" key. Headroom values: ok | low | critical.
     """
+    if isinstance(payload, list):
+        out = {}
+        for provider in payload:
+            if not isinstance(provider, dict) or not provider.get('ok'):
+                continue
+            percents = []
+            for limit in provider.get('limits', []):
+                reset = limit.get('resetsAt')
+                try:
+                    if reset and datetime.fromisoformat(reset.replace('Z', '+00:00')) <= datetime.now(timezone.utc):
+                        continue
+                except (ValueError, TypeError):
+                    continue
+                percent = limit.get('percent')
+                if isinstance(percent, (int, float)):
+                    percents.append(percent)
+            if percents and provider.get('id'):
+                used = max(percents)
+                out[provider['id']] = 'critical' if used >= 95 else 'low' if used >= 80 else 'ok'
+        return out
+    if isinstance(payload, dict) and 'headroom' in payload:
+        return {'claude': str(payload['headroom']).lower()} if payload.get('ok') else {}
     data = payload.get("pools", payload) if isinstance(payload, dict) else {}
     out: dict[str, str] = {}
     for pool, value in data.items():
@@ -155,12 +179,20 @@ def parse_quota(payload: dict) -> dict[str, str]:
 
 def fetch_quota(cmd: tuple[str, ...] = ("quotamax", "agent", "--json"), timeout: float = 5.0) -> dict[str, str]:
     """Live quota from quotamax. Fail-open: any error means no quota data."""
+    if cmd == ("quotamax", "agent", "--json"):
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            parts = list(pool.map(lambda c: _fetch_quota(c, timeout),
+                [cmd, ("quotamax", "providers", "--json")]))
+        return {key: value for part in parts for key, value in part.items()}
+    return _fetch_quota(cmd, timeout)
+
+
+def _fetch_quota(cmd: tuple[str, ...], timeout: float) -> dict[str, str]:
     try:
         proc = subprocess.run(list(cmd), capture_output=True, text=True, timeout=timeout)
     except (OSError, subprocess.TimeoutExpired):
         return {}
-    if proc.returncode != 0:
-        return {}
+    # quotamax intentionally exits nonzero for constrained/critical headroom.
     try:
         return parse_quota(json.loads(proc.stdout))
     except ValueError:
@@ -200,7 +232,7 @@ class GateResult:
 
 
 def sensitive_veto(
-    eligible: list[str], pools: dict[str, Pool]
+    eligible: list[str], pools: dict[str, Pool], *, host: str = VETO_TARGET
 ) -> tuple[list[str], list[str]]:
     """The sensitive-data gate, applied at the ELIGIBILITY stage.
 
@@ -209,7 +241,7 @@ def sensitive_veto(
     arms stay: they are the only arms where sensitive data is safe by
     construction, because it physically never leaves the machine.
     """
-    survivors = [a for a in eligible if a == VETO_TARGET or not pools[a].remote]
+    survivors = [a for a in eligible if a == host or not pools[a].remote]
     removed = [a for a in eligible if a not in survivors]
     return survivors, removed
 
@@ -226,6 +258,7 @@ def gate(
     no_acceptance: bool = False,
     needs_context: bool = False,
     cross_repo: bool = False,
+    host: str = VETO_TARGET,
 ) -> GateResult:
     """Steps 2-4 in order: veto, eligibility, quota.
 
@@ -235,6 +268,10 @@ def gate(
     and local arms are kept, so sensitive work can prefer the machine it is
     already on. If that leaves nothing, raise — never fall back to remote.
     """
+    if host not in pools:
+        raise ValueError(f"unknown host pool: {host}")
+    if pool_pin and pool_pin not in pools:
+        raise ValueError(f"unknown pinned pool: {pool_pin}")
     veto = detect_veto(
         text,
         shape=shape,
@@ -249,6 +286,8 @@ def gate(
         skip_private=sensitive,
     )
     if veto is not None:
+        if veto.name != "user-pin":
+            veto = replace(veto, target=host)
         return GateResult(
             veto=veto,
             eligible=[veto.target],
@@ -257,7 +296,7 @@ def gate(
     eligible = eligible_for(shape, pools)
     removed_sensitive: list[str] = []
     if sensitive:
-        eligible, removed_sensitive = sensitive_veto(eligible, pools)
+        eligible, removed_sensitive = sensitive_veto(eligible, pools, host=host)
     if quota:
         survivors = apply_quota(eligible, quota)
         removed = [a for a in eligible if a not in survivors]
@@ -274,7 +313,7 @@ def gate(
                 "the failure the sensitive flag exists to prevent."
             )
         # Nobody can take it — stay here rather than route into the void.
-        return GateResult(veto=Veto("no-survivors", "no eligible arm survived quota gating"), eligible=[VETO_TARGET])
+        return GateResult(veto=Veto("no-survivors", "no eligible arm survived quota gating", target=host), eligible=[host])
     return GateResult(
         veto=None,
         eligible=eligible,

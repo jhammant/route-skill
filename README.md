@@ -286,3 +286,39 @@ Tests are deterministic: no network, no real dispatch, no money spent.
 ## License
 
 MIT
+
+## Use from Codex
+
+The router supports both host agents. Pass `--host codex` or set
+`ROUTE_HOST=codex` inside Codex. Existing Claude installations keep the default
+`claude` host. Context-dependent work and exhausted-pool fallbacks stay with
+the current host; provider names and learned statistics remain unchanged.
+
+From a checkout installed into `.venv`:
+
+```bash
+./.venv/bin/route --host codex --pool claude "Write tests for src/parser.py"
+./.venv/bin/auto --host codex --pool claude "Write tests for src/parser.py"
+./.venv/bin/route --host codex --plan-only "Review the parser changes"
+mkdir -p "$HOME/.agents/skills"
+ln -s "$PWD/skill" "$HOME/.agents/skills/route"
+ln -s "$PWD/skill-auto" "$HOME/.agents/skills/auto"
+```
+
+Restart Codex and invoke `$route` or `$auto`. Keep the checkout in place and
+move aside existing skill directories before linking. On macOS, bare `route`
+may be `/sbin/route`, the network utility; use the installed package executable.
+
+`route` asks before dispatch; `auto` dispatches immediately. `--plan-only`
+does neither, but still records its routing decision. Claude delegation runs
+`claude --print --permission-mode auto` in the current directory and inherits
+Claude's configured model and authentication. No permission bypass is added.
+Give the delegate a self-contained task and verify its diff and tests afterward.
+Task text is passed as one argument without shell evaluation; child agents
+receive their own `ROUTE_HOST`.
+
+Quota reads now combine Claude agent advice and Codex/Kimi provider limits.
+Nonzero critical-quota exit codes retain their warning; expired windows are
+ignored. Provider usage at 95% is considered critical. Sensitive routing keeps
+the current host and local pools eligible, excluding other remote providers
+unless the user explicitly pins a pool (the existing pin policy).

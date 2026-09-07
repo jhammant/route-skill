@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shlex
 import subprocess
 import sys
@@ -40,7 +41,7 @@ from .federate import (
     push,
     status,
 )
-from .pools import load_pools
+from .pools import load_pools, pools_for_host
 from .router import Router, cell_name
 from .eligibility import probably_private
 from .sensitive import detect_sensitive
@@ -70,7 +71,8 @@ def decide(args: argparse.Namespace, *, auto: bool) -> int:
         print("route: empty task", file=sys.stderr)
         return 2
 
-    pools = load_pools()
+    host = args.host
+    pools = pools_for_host(load_pools(), host)
     shape = args.shape or classify_shape(text, use_llm=not args.no_llm)
     tier = args.tier or estimate_complexity(text)
     quota = fetch_quota() if not args.no_quota else {}
@@ -105,8 +107,9 @@ def decide(args: argparse.Namespace, *, auto: bool) -> int:
             no_acceptance=args.no_acceptance,
             needs_context=args.needs_context,
             cross_repo=args.cross_repo,
+            host=host,
         )
-    except SensitiveRoutingError as exc:
+    except (SensitiveRoutingError, ValueError) as exc:
         # Fail loudly — never silently fall back to a remote arm.
         print(f"route: {exc}", file=sys.stderr)
         return 1
@@ -128,6 +131,7 @@ def decide(args: argparse.Namespace, *, auto: bool) -> int:
             why += "(auto-detected)"
 
     plan = {
+        "host": host,
         "shape": shape,
         "tier": tier,
         "cell": cell_name(shape, tier),
@@ -148,7 +152,11 @@ def decide(args: argparse.Namespace, *, auto: bool) -> int:
         eligible=result.eligible, chosen=chosen, why=why,
     ))
 
-    if chosen == "claude":
+    if args.plan_only:
+        print("dispatch: plan only (nothing launched)")
+        return 0
+
+    if chosen == host:
         print("dispatch: stay (this task belongs here)")
         return 0
 
@@ -163,10 +171,10 @@ def decide(args: argparse.Namespace, *, auto: bool) -> int:
             print("not dispatched")
             return 0
 
-    return _dispatch(pool.dispatch, text)
+    return _dispatch(pool.dispatch, text, target=chosen)
 
 
-def _dispatch(template: str, task: str) -> int:
+def _dispatch(template: str, task: str, *, target: str | None = None) -> int:
     if not template:
         print("dispatch: no command configured for this pool", file=sys.stderr)
         return 1
@@ -175,7 +183,11 @@ def _dispatch(template: str, task: str) -> int:
         argv.append(task)
     started = time.monotonic()
     try:
-        proc = subprocess.run(argv)
+        # A delegated agent must see itself as host if it invokes route again.
+        env = dict(os.environ)
+        if target in ("claude", "codex"):
+            env["ROUTE_HOST"] = target
+        proc = subprocess.run(argv, env=env)
     except OSError as exc:
         print(f"dispatch failed: {exc}", file=sys.stderr)
         return 1
@@ -403,6 +415,10 @@ def _parser(prog: str) -> argparse.ArgumentParser:
 
 def _add_task_flags(p: argparse.ArgumentParser) -> None:
     p.add_argument("task", nargs="*")
+    p.add_argument("--host", choices=["claude", "codex"],
+                   default=os.environ.get("ROUTE_HOST", "claude"),
+                   help="current agent; context-dependent work stays here (default: ROUTE_HOST or claude)")
+    p.add_argument("--plan-only", action="store_true", help="show routing without prompting or dispatching")
     p.add_argument("--pool", help="pin a pool explicitly — beats inference")
     p.add_argument("--shape", help="override shape classification")
     p.add_argument("--tier", help="override complexity tier")

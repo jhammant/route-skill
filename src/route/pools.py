@@ -10,7 +10,7 @@ its cost class, and its pinned model identity (model + quant + version — a
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from .shapes import SHAPES
@@ -206,3 +206,15 @@ def load_pools(path: str | Path | None = None) -> dict[str, Pool]:
             parallel_limit=int(spec.get("parallel_limit", 1)),
         )
     return pools
+
+
+def pools_for_host(pools: dict[str, Pool], host: str) -> dict[str, Pool]:
+    """Keep provider identities and learned counts; change only the local host role."""
+    if host not in ("claude", "codex") or host not in pools:
+        raise ValueError(f"unsupported host: {host}")
+    result = dict(pools)
+    result[host] = replace(result[host], shapes=SHAPES, dispatch="", needs_repo=False)
+    if host == "codex" and "claude" in result and not result["claude"].dispatch:
+        result["claude"] = replace(result["claude"],
+            dispatch="claude --print --permission-mode auto {task}")
+    return result

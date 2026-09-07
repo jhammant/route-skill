@@ -5,6 +5,18 @@ description: Decide where a task should run — Claude, Codex, Kimi, a local mod
 
 # /route — decide and explain, wait for confirmation
 
+## Host and executable
+
+In Codex, pass `--host codex` on every task invocation; in Claude Code use
+`--host claude`. `ROUTE_HOST` is an alternative when explicitly set. The
+current host means "stay"; the other provider can receive a delegated task.
+Resolve the installed package executable (for a virtualenv installation,
+`<checkout>/.venv/bin/route` or `auto`). Do not use macOS `/sbin/route`.
+Use the resolved path wherever examples below say `route` or `auto`.
+Pass task text as a literal argument. Delegates do not inherit the parent
+conversation; supply scope and acceptance checks, then review their results.
+
+
 Run the routing engine on the user's task:
 
 ```sh
@@ -20,7 +32,7 @@ Then:
 1. **Explain the decision to the user in one short paragraph** — shape, tier,
    any veto that fired, which arms quota removed, and whether the choice came
    from the rule-table prior or from observed evidence.
-2. If the plan says `dispatch: stay` (chosen arm is `claude`): do the task
+2. If the plan says `dispatch: stay` (chosen arm matches the current host): do the task
    here. No confirmation needed — a veto means it cannot leave.
 3. Otherwise the CLI asks for confirmation before dispatching. Surface its
    prompt to the user; dispatch only on an explicit yes. The CLI shells out to
@@ -39,7 +51,7 @@ Then:
 Overrides: `--pool <name>` pins a pool (explicit beats inferred); `--private`,
 `--no-acceptance`, `--needs-context`, `--cross-repo` force the matching veto.
 `--sensitive` sets the dataClass to `sensitive`: remote third-party pools
-(`codex`, `kimi`, `free`) are vetoed at the eligibility stage, `claude` and
+(all providers other than the current host) are vetoed at the eligibility stage; the host and
 the local arms survive, and local is PREFERRED — sensitive work belongs on
 your own metal. A path allowlist in `~/.config/route/sensitive.toml`
 (`paths = ["~/dev/clients/*"]`) marks tasks naming those files sensitive
@@ -53,7 +65,7 @@ tiers at £0/month, rate-limited and REMOTE. It takes `batch:*` work plus
 `/healthz` answers. Several free tiers train on submitted prompts, so
 sensitive data NEVER routes to `free` — the sensitive gate vetoes it before
 quota or the bandit are consulted. The `--private` content regex still fires
-as an additional safety net (pinning the task to `claude`), but it must never
+as an additional safety net (pinning the task to the current host), but it must never
 be the only signal relied on: when in doubt, the user marks `--sensitive`.
 
 Privacy: routing and federation see shapes and counts only — never task text,

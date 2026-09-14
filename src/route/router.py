@@ -46,12 +46,39 @@ class Priors:
         self.schema = int(data.get("schema", 1))
         self.favoured = tuple(data.get("favoured", (8, 2)))
         self.unfavoured = tuple(data.get("unfavoured", (2, 8)))
-        self.rules: dict[str, tuple[str, ...]] = {
-            str(shape): tuple(arms) for shape, arms in (data.get("rules") or {}).items()
-        }
+        # A rule is either a list of favoured arms (all Beta(favoured)) or a
+        # table of explicit per-arm priors: {codex = [8, 2], claude = [5, 5]}
+        # — for cells where one arm should lead and another stay the clear
+        # fallback rather than dropping to Beta(unfavoured).
+        self.rules: dict[str, tuple[str, ...]] = {}
+        self.explicit: dict[str, dict[str, tuple[float, float]]] = {}
+        for key, rule in (data.get("rules") or {}).items():
+            key = str(key)
+            if isinstance(rule, dict):
+                self.explicit[key] = {
+                    str(arm): (float(ab[0]), float(ab[1])) for arm, ab in rule.items()
+                }
+                self.rules[key] = tuple(self.explicit[key])
+            else:
+                self.rules[key] = tuple(rule)
 
-    def favoured_arms(self, shape: str) -> tuple[str, ...]:
-        return self.rules.get(shape, ())
+    def _key(self, shape: str, tier: str | None) -> str | None:
+        """The rule key that governs a cell: ``shape:tier`` beats ``shape``."""
+        if tier is not None and f"{shape}:{tier}" in self.rules:
+            return f"{shape}:{tier}"
+        return shape if shape in self.rules else None
+
+    def favoured_arms(self, shape: str, tier: str | None = None) -> tuple[str, ...]:
+        """Favoured arms for a cell: a ``shape:tier`` rule beats the shape rule."""
+        key = self._key(shape, tier)
+        return self.rules[key] if key else ()
+
+    def prior(self, shape: str, tier: str | None, arm: str) -> tuple[float, float]:
+        """Beta(a, b) an arm starts from in a cell."""
+        key = self._key(shape, tier)
+        if key and arm in self.explicit.get(key, {}):
+            return self.explicit[key][arm]
+        return tuple(self.favoured) if arm in self.favoured_arms(shape, tier) else tuple(self.unfavoured)
 
 
 def load_priors(path: str | Path | None = None) -> Priors:
@@ -119,11 +146,9 @@ class Router:
         rule seed; they may be fractional (already discounted), so the seed
         counts stay fractional too.
         """
-        a, b = (
-            self.priors.favoured
-            if arm in self.priors.favoured_arms(shape)
-            else self.priors.unfavoured
-        )
+        parsed = parse_cell(cell)
+        tier = parsed[1] if parsed else None
+        a, b = self.priors.prior(shape, tier, arm)
         # Community counts are keyed by federation context ("{shape}:{tier}"),
         # without the "route:" storage prefix.
         context = cell.split(":", 1)[1] if cell.startswith("route:") else cell
@@ -144,6 +169,50 @@ class Router:
                 self.storage.incr(f"{cell}:{REWARD_EVENT}", arm, rewards)
             self.storage.incr(f"{cell}:{SEED_EVENT}", arm, imps)
             self.storage.incr(f"{cell}:{SEED_EVENT}", f"{arm}:rewards", rewards)
+
+    def reseed(
+        self, arms_for_shape: dict[str, Iterable[str]], *, apply: bool = True
+    ) -> list[dict]:
+        """Re-derive every live cell's seed pseudo-counts from the current rules.
+
+        Seeding happens once per cell, so a cell touched under an older rule
+        table keeps that table's priors forever — a new rule never reaches
+        the cells you actually use. This moves each arm's seed to what the
+        current table says, as a delta on the impression/reward counts, so
+        real observations are untouched (``observed_counts`` is identical
+        before and after). Arms the shape now accepts but that were never
+        seeded in the cell are seeded fresh. Returns one record per change.
+        """
+        changes: list[dict] = []
+        for key in self.storage.keys("route:"):
+            if not key.endswith(f":{SEED_EVENT}"):
+                continue
+            cell = key[: -len(SEED_EVENT) - 1]
+            parsed = parse_cell(cell)
+            if parsed is None:
+                continue
+            shape, tier = parsed
+            seeds = self.storage.counts(key)
+            arms = {a for a in seeds if not a.endswith(":rewards")}
+            arms |= set(arms_for_shape.get(shape, ()))
+            for arm in sorted(arms):
+                old_imps = seeds.get(arm, 0.0)
+                old_rewards = seeds.get(f"{arm}:rewards", 0.0)
+                new_imps, new_rewards = self._seed_prior_counts(shape, cell, arm)
+                if (old_imps, old_rewards) == (new_imps, new_rewards):
+                    continue
+                changes.append({
+                    "cell": f"{shape}:{tier}", "arm": arm,
+                    "from": f"Beta({old_rewards + 1:g},{old_imps - old_rewards + 1:g})",
+                    "to": f"Beta({new_rewards + 1:g},{new_imps - new_rewards + 1:g})",
+                })
+                if not apply:
+                    continue
+                self.storage.incr(f"{cell}:{IMPRESSION_EVENT}", arm, new_imps - old_imps)
+                self.storage.incr(f"{cell}:{REWARD_EVENT}", arm, new_rewards - old_rewards)
+                self.storage.incr(key, arm, new_imps - old_imps)
+                self.storage.incr(key, f"{arm}:rewards", new_rewards - old_rewards)
+        return changes
 
     # -- selection and rewards ---------------------------------------------
 
@@ -178,6 +247,19 @@ class Router:
     def record_impression(self, shape: str, tier: str, arm: str, by: float = 1) -> None:
         """An impression with no reward — the negative outcome of escalation."""
         self.storage.incr(f"{cell_name(shape, tier)}:{IMPRESSION_EVENT}", arm, by)
+
+    def observe(self, shape: str, tier: str, arm: str, arms: Iterable[str]) -> None:
+        """Record a trial the bandit did not choose (a user ``--pool`` pin).
+
+        A pinned dispatch is still evidence about that arm in that cell, but
+        ``select`` never ran, so nothing was seeded or counted. Seed the cell
+        for every arm that could take the shape (so the pinned arm's prior is
+        in place, not just a bare count) and record one impression; the
+        outcome recorded afterwards then lands on a properly seeded arm.
+        """
+        cell = cell_name(shape, tier)
+        self._ensure_seeded(shape, cell, set(arms) | {arm})
+        self.record_impression(shape, tier, arm)
 
     # -- introspection ------------------------------------------------------
 

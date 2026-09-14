@@ -9,8 +9,9 @@ its cost class, and its pinned model identity (model + quant + version — a
 
 from __future__ import annotations
 
+import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from .shapes import SHAPES
@@ -30,6 +31,34 @@ _BATCH = tuple(s for s in SHAPES if s.startswith("batch:"))
 #: free-llm-skill: a local OpenAI-compatible proxy pooling hosted free tiers.
 FREE_LLM_ENDPOINT = "http://127.0.0.1:8080/v1"
 FREE_LLM_HEALTH = "http://127.0.0.1:8080/healthz"
+
+#: What ``codex exec`` runs when ``~/.codex/config.toml`` does not say.
+#: GPT-6 Astra (released 2026-09-03) is the ChatGPT-subscription default
+#: and leads on long-horizon terminal work (Terminal-Bench 4.0: 57.7 vs
+#: Fable 5.1 at 55.8) while tying or trailing on single-shot coding.
+CODEX_DEFAULT_MODEL = "gpt-6-astra"
+
+
+def codex_model(config_path: str | Path | None = None) -> Model:
+    """The model ``codex exec`` will actually use — read, not assumed.
+
+    ``codex exec`` inherits ``model`` from ``$CODEX_HOME/config.toml``
+    (``~/.codex`` by default). The arm's pinned identity must match what
+    ran, or counts learned under one model silently merge into the next
+    (a ``gpt-5.6-sol`` posterior is not evidence about ``gpt-6-astra``).
+    Any read or parse failure falls back to ``CODEX_DEFAULT_MODEL``.
+    """
+    if config_path is None:
+        home = os.environ.get("CODEX_HOME") or (Path.home() / ".codex")
+        config_path = Path(home) / "config.toml"
+    try:
+        raw = tomllib.loads(Path(config_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return Model(name=CODEX_DEFAULT_MODEL)
+    name = raw.get("model")
+    if not isinstance(name, str) or not name.strip():
+        return Model(name=CODEX_DEFAULT_MODEL)
+    return Model(name=name.strip())
 
 
 @dataclass(frozen=True)
@@ -115,7 +144,7 @@ def _default_pools() -> dict[str, Pool]:
             strength=strength("codex"),
             dispatch="codex exec {task}",
             probe="codex exec {task}",
-            model=Model(name="gpt-5.6-sol"),
+            model=codex_model(),
             parallel_limit=4,
         ),
         "kimi": Pool(
@@ -206,3 +235,15 @@ def load_pools(path: str | Path | None = None) -> dict[str, Pool]:
             parallel_limit=int(spec.get("parallel_limit", 1)),
         )
     return pools
+
+
+def pools_for_host(pools: dict[str, Pool], host: str) -> dict[str, Pool]:
+    """Keep provider identities and learned counts; change only the local host role."""
+    if host not in ("claude", "codex") or host not in pools:
+        raise ValueError(f"unsupported host: {host}")
+    result = dict(pools)
+    result[host] = replace(result[host], shapes=SHAPES, dispatch="", needs_repo=False)
+    if host == "codex" and "claude" in result and not result["claude"].dispatch:
+        result["claude"] = replace(result["claude"],
+            dispatch="claude --print --permission-mode auto {task}")
+    return result

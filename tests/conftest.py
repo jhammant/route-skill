@@ -35,6 +35,9 @@ class MeanRNG:
 def isolated_env(tmp_path, monkeypatch):
     monkeypatch.setenv("ROUTE_STATE_DIR", str(tmp_path / "state"))
     monkeypatch.setenv("ROUTE_CONFIG_DIR", str(tmp_path / "config"))
+    # The codex arm reads its model from $CODEX_HOME/config.toml; never the
+    # developer's real one.
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex-home"))
     return tmp_path
 
 

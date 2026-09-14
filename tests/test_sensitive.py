@@ -1,9 +1,10 @@
 """SPEC-ship section 1: sensitive data PREFERS local, never falls back remote.
 
 Detection is explicit only — a flag, a task field, or the sensitive.toml
-path allowlist. Remote third-party arms (codex, kimi, free) are vetoed at
-the eligibility stage; claude and local-* survive; local is preferred at
-selection; and an empty survivor list raises instead of falling back.
+path allowlist. Remote third-party arms (codex, kimi, free, deepseek) are
+vetoed at the eligibility stage; claude and local-* survive; local is
+preferred at selection; and an empty survivor list raises instead of
+falling back.
 """
 
 from __future__ import annotations
@@ -24,7 +25,7 @@ def test_sensitive_vetoes_remote_arms_at_eligibility(pools):
     assert "free" not in result.eligible
     assert "claude" in result.eligible
     assert "local-agent" in result.eligible
-    assert sorted(result.removed_by_sensitivity) == ["codex", "kimi"]
+    assert sorted(result.removed_by_sensitivity) == ["codex", "deepseek", "kimi"]
 
 
 def test_sensitive_never_selects_remote_even_when_everything_exhausted(pools):

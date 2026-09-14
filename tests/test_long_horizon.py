@@ -66,18 +66,22 @@ def test_long_horizon_leaves_open_ended_alone():
 # -- tier-scoped priors ------------------------------------------------------
 
 def test_tier_scoped_rule_beats_shape_rule(priors):
-    assert priors.favoured_arms("coding:implement") == ("claude", "codex")
-    assert priors.favoured_arms("coding:implement", "moderate") == ("claude", "codex")
-    assert priors.favoured_arms("coding:implement", "hard") == ("codex", "claude")
-    assert priors.favoured_arms("coding:implement", "open-ended") == ("codex", "claude")
-    assert priors.favoured_arms("coding:test") == ("codex", "kimi")
-    assert priors.favoured_arms("coding:test", "hard") == ("codex", "claude")
+    assert priors.favoured_arms("coding:implement") == ("claude", "codex", "deepseek")
+    assert priors.favoured_arms("coding:implement", "moderate") == ("claude", "codex", "deepseek")
+    assert priors.favoured_arms("coding:implement", "hard") == ("codex", "claude", "deepseek")
+    assert priors.favoured_arms("coding:implement", "open-ended") == ("codex", "claude", "deepseek")
+    assert priors.favoured_arms("coding:test") == ("codex", "kimi", "deepseek")
+    assert priors.favoured_arms("coding:test", "hard") == ("codex", "claude", "deepseek")
 
 
 def test_explicit_priors_lead_and_fallback(priors):
     assert priors.prior("coding:implement", "hard", "codex") == (8.0, 2.0)
     assert priors.prior("coding:implement", "hard", "claude") == (5.0, 5.0)
     assert priors.prior("coding:implement", "hard", "kimi") == (2.0, 8.0)
+    # The backstop sits between the fallback and the unfavoured, in every
+    # coding cell, at every tier.
+    assert priors.prior("coding:implement", "hard", "deepseek") == (4.0, 6.0)
+    assert priors.prior("coding:implement", "moderate", "deepseek") == (4.0, 6.0)
     # List rules keep their all-or-nothing semantics.
     assert priors.prior("coding:implement", "moderate", "claude") == (8.0, 2.0)
     assert priors.prior("coding:implement", "moderate", "kimi") == (2.0, 8.0)

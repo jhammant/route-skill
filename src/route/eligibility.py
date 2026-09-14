@@ -6,11 +6,11 @@ pool reports ``critical`` headroom is REMOVED from eligibility, never merely
 penalised. The bandit decides quality among what survives.
 
 Sensitive data (SPEC-ship section 1) is also an eligibility-stage veto, but
-a different shape: remote third-party pools (``codex``, ``kimi``, ``free``)
-are removed, while ``claude`` AND the local arms survive — local is the only
-arm where sensitive data is safe by construction, and it is PREFERRED at
-selection. If nothing survives, ``gate`` raises rather than falling back to
-a remote arm.
+a different shape: remote third-party pools (``codex``, ``kimi``, ``free``,
+``deepseek``) are removed, while ``claude`` AND the local arms survive —
+local is the only arm where sensitive data is safe by construction, and it is
+PREFERRED at selection. If nothing survives, ``gate`` raises rather than
+falling back to a remote arm.
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from dataclasses import dataclass, field, replace
 
-from .pools import Pool
+from .pools import DEEPSEEK_SKILL, Pool
 from .shapes import FALLBACK_SHAPE
 
 #: The pool every veto short-circuits to.
@@ -172,6 +172,8 @@ def parse_quota(payload: dict | list) -> dict[str, str]:
     data = payload.get("pools", payload) if isinstance(payload, dict) else {}
     out: dict[str, str] = {}
     for pool, value in data.items():
+        if pool == "backstop":
+            continue  # a structured block, not a headroom string — see deepseek_headroom
         if isinstance(value, dict):
             value = value.get("headroom", value.get("status", "ok"))
         out[str(pool)] = str(value).lower()
@@ -184,13 +186,45 @@ def quotamax_available(cmd: tuple[str, ...] = ("quotamax", "agent", "--json")) -
 
 
 def fetch_quota(cmd: tuple[str, ...] = ("quotamax", "agent", "--json"), timeout: float = 5.0) -> dict[str, str]:
-    """Live quota from quotamax. Fail-open: any error means no quota data."""
+    """Live quota from quotamax. Fail-open: any error means no quota data.
+
+    The deepseek backstop is the exception to fail-open: it costs real money
+    on every call, so unless its balance is positively confirmed OK it is
+    gated out — see ``deepseek_headroom``.
+    """
     if cmd == ("quotamax", "agent", "--json"):
         with ThreadPoolExecutor(max_workers=2) as pool:
-            parts = list(pool.map(lambda c: _fetch_quota(c, timeout),
+            payloads = list(pool.map(lambda c: _run_json(c, timeout),
                 [cmd, ("quotamax", "providers", "--json")]))
-        return {key: value for part in parts for key, value in part.items()}
+        quota = {key: value for payload in payloads if payload is not None
+                 for key, value in parse_quota(payload).items()}
+        if "deepseek" not in quota:
+            quota["deepseek"] = deepseek_headroom(payloads[0], timeout=min(timeout, 2.0))
+        return quota
     return _fetch_quota(cmd, timeout)
+
+
+def deepseek_headroom(payload, *, timeout: float = 2.0, runner=subprocess.run) -> str:
+    """DeepSeek backstop headroom: 'ok' or 'critical' — never merely 'low'.
+
+    quotamax exposes ``backstop: {provider, available, balanceUsd, low}``;
+    unavailable credit or a balance below the floor means INELIGIBLE. When
+    quotamax predates the backstop field, fall back to the skill's own
+    ``balance --json``: exit 0 means eligible; below floor (3), error (1),
+    timeout, or a missing skill all mean not — the arm spends real money,
+    so an unconfirmable balance is a 'no'.
+    """
+    backstop = payload.get("backstop") if isinstance(payload, dict) else None
+    if isinstance(backstop, dict):
+        available = bool(backstop.get("available", True))
+        low = bool(backstop.get("low", False))
+        return "ok" if available and not low else "critical"
+    try:
+        proc = runner([DEEPSEEK_SKILL, "balance", "--json"],
+                      capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return "critical"
+    return "ok" if proc.returncode == 0 else "critical"
 
 
 def _run_json(cmd: tuple[str, ...], timeout: float):
@@ -212,7 +246,11 @@ def _fetch_quota(cmd: tuple[str, ...], timeout: float) -> dict[str, str]:
 
 
 #: arm -> quotamax provider id. Local arms have no quota and no entry.
-QUOTA_PROVIDER: dict[str, str] = {"claude": "claude", "codex": "codex", "kimi": "kimi"}
+#: ``deepseek`` is the pay-as-you-go backstop: its "quota" is the credit
+#: balance reported via quotamax's ``backstop`` block (or the skill's own
+#: ``balance --json`` when quotamax predates it), folded into a headroom
+#: value by ``deepseek_headroom``.
+QUOTA_PROVIDER: dict[str, str] = {"claude": "claude", "codex": "codex", "kimi": "kimi", "deepseek": "deepseek"}
 
 
 def parse_usage(agent, providers) -> dict[str, dict[str, float]]:
@@ -291,10 +329,10 @@ def sensitive_veto(
 ) -> tuple[list[str], list[str]]:
     """The sensitive-data gate, applied at the ELIGIBILITY stage.
 
-    Remote third-party pools (``codex``, ``kimi``, ``free``) are REMOVED — a
-    veto, not a score. ``claude`` stays (the task is already there) and local
-    arms stay: they are the only arms where sensitive data is safe by
-    construction, because it physically never leaves the machine.
+    Remote third-party pools (``codex``, ``kimi``, ``free``, ``deepseek``)
+    are REMOVED — a veto, not a score. ``claude`` stays (the task is already
+    there) and local arms stay: they are the only arms where sensitive data
+    is safe by construction, because it physically never leaves the machine.
     """
     survivors = [a for a in eligible if a == host or not pools[a].remote]
     removed = [a for a in eligible if a not in survivors]

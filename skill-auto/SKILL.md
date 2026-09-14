@@ -13,8 +13,15 @@ auto <task text>
 
 The command classifies the task (shape + complexity tier), applies vetoes and
 quota gating, lets the bandit pick among the surviving arms, prints the JSON
-plan, and dispatches straight away — to `codex`, `kimi`, or `local-llm` via
-their existing skills, or `stay` when the task belongs here.
+plan, and dispatches straight away — to `codex`, `kimi`, `deepseek`, or
+`local-llm` via their existing skills, or `stay` when the task belongs here.
+
+`deepseek` is the paid backstop: it never wins while an included pool is
+healthy, but when quota gating has removed `claude`/`codex`/`kimi` it is
+chosen ahead of failing, so work always has somewhere to go. It is gated by
+its credit balance (quotamax's `backstop` block, or the skill's
+`balance --json` as fallback) and vetoed by `--sensitive`/`--private` like
+any remote pool.
 
 Long-horizon tasks (`until all tests pass`, `every call site`, `whole
 codebase`, `overnight`) floor the tier at `hard` and favour `codex`, which

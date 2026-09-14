@@ -1,7 +1,7 @@
 """Arm registry — config-driven so a new model is a config entry, not code.
 
-Shipped arms: ``claude``, ``codex``, ``kimi``, ``local-batch``, ``local-agent``,
-``free``. Users override or extend via ``~/.config/route/pools.toml``; each arm
+Shipped arms: ``claude``, ``codex``, ``kimi``, ``deepseek``, ``local-batch``,
+``local-agent``, ``free``. Users override or extend via ``~/.config/route/pools.toml``; each arm
 declares the shapes it accepts, whether it needs a repo, whether it is remote,
 its cost class, and its pinned model identity (model + quant + version — a
 ``qwen3.6-27b`` at 4-bit and at bf16 must never merge into one arm).
@@ -23,7 +23,7 @@ except ImportError:  # Python 3.10
     import tomli as tomllib  # type: ignore[no-redef]
 
 #: Fallback order for escalation — later is stronger.
-STRENGTH_ORDER: tuple[str, ...] = ("free", "local-batch", "local-agent", "kimi", "codex", "claude")
+STRENGTH_ORDER: tuple[str, ...] = ("free", "local-batch", "local-agent", "kimi", "deepseek", "codex", "claude")
 
 _CODING = tuple(s for s in SHAPES if s.startswith("coding:"))
 _BATCH = tuple(s for s in SHAPES if s.startswith("batch:"))
@@ -37,6 +37,11 @@ FREE_LLM_HEALTH = "http://127.0.0.1:8080/healthz"
 #: and leads on long-horizon terminal work (Terminal-Bench 4.0: 57.7 vs
 #: Fable 5.1 at 55.8) while tying or trailing on single-shot coding.
 CODEX_DEFAULT_MODEL = "gpt-6-astra"
+
+#: The Claude Code skill wrapping DeepSeek's pay-as-you-go API — the
+#: backstop arm: when Claude/Codex/Kimi quota is gone, work still has
+#: somewhere to go, but it costs real money, so it never leads.
+DEEPSEEK_SKILL = str(Path.home() / ".claude" / "skills" / "deepseek" / "scripts" / "deepseek")
 
 
 def codex_model(config_path: str | Path | None = None) -> Model:
@@ -89,6 +94,10 @@ class Pool:
     cost: str = "included"  # included | paid | local | free
     strength: int = 0
     dispatch: str = ""  # command template for REAL work; {task} is substituted
+    #: Separate command for ``batch:*`` shapes when one tool splits by shape
+    #: family (deepseek: `code` for coding, `ask` for batch). The task goes
+    #: on STDIN, never argv — a batch prompt can be far too long for argv.
+    batch_dispatch: str = ""
     #: Single-prompt command used by `route benchmark`. Distinct from
     #: dispatch because real-work commands often take a file and a template
     #: (local-llm batch) and cannot answer a bare prompt. Empty means the
@@ -119,6 +128,17 @@ class Pool:
 
     def accepts(self, shape: str) -> bool:
         return shape in self.shapes
+
+    def dispatch_for(self, shape: str) -> tuple[str, bool]:
+        """(command template, task-on-stdin) for a shape.
+
+        Most arms have one command for everything; an arm with a
+        ``batch_dispatch`` uses it for ``batch:*`` shapes instead, with the
+        task piped on stdin rather than substituted into argv.
+        """
+        if shape.startswith("batch:") and self.batch_dispatch:
+            return self.batch_dispatch, True
+        return self.dispatch, False
 
 
 def _default_pools() -> dict[str, Pool]:
@@ -157,6 +177,20 @@ def _default_pools() -> dict[str, Pool]:
             probe="kimi -p {task}",
             model=Model(name="kimi"),
             parallel_limit=30,  # /usages parallel.limit, ADVANCED
+        ),
+        "deepseek": Pool(
+            name="deepseek",
+            # The backstop: pay-as-you-go, so it must never beat a healthy
+            # included pool — but when Claude/Codex/Kimi quota is gone, work
+            # still lands here instead of failing. Coding on v4-pro (strong
+            # reasoning/coding), batch on flash (fast and cheap).
+            shapes=_CODING + _BATCH,
+            remote=True,
+            cost="paid",
+            strength=strength("deepseek"),
+            dispatch=f"{DEEPSEEK_SKILL} code --dir . --model deepseek-v4-pro {{task}}",
+            batch_dispatch=f"{DEEPSEEK_SKILL} ask - --model deepseek-flash",
+            model=Model(name="deepseek", version="v4-pro+flash"),
         ),
         "local-batch": Pool(
             name="local-batch",
@@ -224,6 +258,7 @@ def load_pools(path: str | Path | None = None) -> dict[str, Pool]:
             cost=str(spec.get("cost", "included")),
             strength=int(spec.get("strength", 0)),
             dispatch=str(spec.get("dispatch", "")),
+            batch_dispatch=str(spec.get("batch_dispatch", "")),
             probe=str(spec.get("probe", "")),
             endpoint=str(spec.get("endpoint", "")),
             health_url=str(spec.get("health_url", "")),

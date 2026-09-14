@@ -179,8 +179,10 @@ def decide(args: argparse.Namespace, *, auto: bool) -> int:
         return 0
 
     pool = pools[chosen]
+    template, task_on_stdin = pool.dispatch_for(shape)
     if not auto:
-        rendered = pool.dispatch.replace("{task}", shlex.quote(text))
+        rendered = (f"{template}  # task on stdin" if task_on_stdin
+                    else template.replace("{task}", shlex.quote(text)))
         try:
             answer = input(f"dispatch to {chosen} via `{rendered}`? [y/N] ")
         except EOFError:
@@ -197,7 +199,7 @@ def decide(args: argparse.Namespace, *, auto: bool) -> int:
 
     usage_before = fetch_usage() if not args.no_quota else {}
     started = time.monotonic()
-    rc = _dispatch(pool.dispatch, text, target=chosen)
+    rc = _dispatch(template, text, target=chosen, stdin=task_on_stdin)
     wall_clock_s = round(time.monotonic() - started, 1)
     quota = _quota_cost(chosen, usage_before, fetch_usage() if usage_before else {})
     Stats().annotate_last(wall_clock_s=wall_clock_s, quota=quota)
@@ -253,20 +255,25 @@ def _auto_outcome(router: Router, shape: str, tier: str, arm: str, rc: int) -> N
         )
 
 
-def _dispatch(template: str, task: str, *, target: str | None = None) -> int:
+def _dispatch(template: str, task: str, *, target: str | None = None, stdin: bool = False) -> int:
     if not template:
         print("dispatch: no command configured for this pool", file=sys.stderr)
         return 1
-    argv = [task if tok == "{task}" else tok for tok in shlex.split(template)]
-    if "{task}" not in shlex.split(template):
-        argv.append(task)
+    tokens = shlex.split(template)
+    if stdin:
+        # The task travels on stdin, never argv (deepseek batch: `ask -`).
+        argv = tokens
+    else:
+        argv = [task if tok == "{task}" else tok for tok in tokens]
+        if "{task}" not in tokens:
+            argv.append(task)
     started = time.monotonic()
     try:
         # A delegated agent must see itself as host if it invokes route again.
         env = dict(os.environ)
         if target in ("claude", "codex"):
             env["ROUTE_HOST"] = target
-        proc = subprocess.run(argv, env=env)
+        proc = subprocess.run(argv, env=env, **({"input": task, "text": True} if stdin else {}))
     except OSError as exc:
         print(f"dispatch failed: {exc}", file=sys.stderr)
         return 1
@@ -550,7 +557,7 @@ def _add_task_flags(p: argparse.ArgumentParser) -> None:
     p.add_argument("--tier", help="override complexity tier")
     p.add_argument("--private", action="store_true", help="veto: data must not leave the machine")
     p.add_argument("--sensitive", action="store_true",
-                   help="dataClass sensitive: veto remote pools (codex/kimi/free), prefer local")
+                   help="dataClass sensitive: veto remote pools (codex/kimi/free/deepseek), prefer local")
     p.add_argument("--no-acceptance", action="store_true", help="veto: no clear acceptance check")
     p.add_argument("--needs-context", action="store_true", help="veto: needs this conversation")
     p.add_argument("--cross-repo", action="store_true", help="veto: cross-repo orchestration")

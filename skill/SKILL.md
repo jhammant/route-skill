@@ -1,6 +1,6 @@
 ---
 name: route
-description: Decide where a task should run — Claude, Codex, Kimi, a local model, or the free-llm proxy — from task shape, complexity, and live quota. Explains the decision and waits for confirmation before dispatching. Use when the user types /route or asks where a task should run.
+description: Decide where a task should run — Claude, Codex, Kimi, DeepSeek, a local model, or the free-llm proxy — from task shape, complexity, and live quota. Explains the decision and waits for confirmation before dispatching. Use when the user types /route or asks where a task should run.
 ---
 
 # /route — decide and explain, wait for confirmation
@@ -25,8 +25,8 @@ Then:
    here. No confirmation needed — a veto means it cannot leave.
 3. Otherwise the CLI asks for confirmation before dispatching. Surface its
    prompt to the user; dispatch only on an explicit yes. The CLI shells out to
-   the existing `/codex`, `/kimi`, `/local-llm`, or `/free-llm` skills — never
-   reimplement what they do.
+   the existing `/codex`, `/kimi`, `/deepseek`, `/local-llm`, or `/free-llm`
+   skills — never reimplement what they do.
 4. **The outcome loop closes itself from the exit code.** A dispatch that
    exits 0 records `completed`; a non-zero exit records `failed`. What only
    you can know is whether the diff was kept, so after verifying run:
@@ -47,12 +47,24 @@ Then:
 Overrides: `--pool <name>` pins a pool (explicit beats inferred); `--private`,
 `--no-acceptance`, `--needs-context`, `--cross-repo` force the matching veto.
 `--sensitive` sets the dataClass to `sensitive`: remote third-party pools
-(`codex`, `kimi`, `free`) are vetoed at the eligibility stage, `claude` and
-the local arms survive, and local is PREFERRED — sensitive work belongs on
-your own metal. A path allowlist in `~/.config/route/sensitive.toml`
+(`codex`, `kimi`, `free`, `deepseek`) are vetoed at the eligibility stage,
+`claude` and the local arms survive, and local is PREFERRED — sensitive work
+belongs on your own metal. A path allowlist in `~/.config/route/sensitive.toml`
 (`paths = ["~/dev/clients/*"]`) marks tasks naming those files sensitive
 without the flag. If nothing eligible survives, routing fails loudly — it
 never falls back to a remote arm.
+
+The `deepseek` arm is the **backstop**: pay-as-you-go real money via the
+`/deepseek` skill (`code --dir . --model deepseek-v4-pro` for coding shapes,
+`ask - --model deepseek-flash` with the task on stdin for batch). Its prior
+sits at Beta(4, 6) in coding cells — below every favoured arm and below
+Claude's hard-tier fallback, so it NEVER wins while an included pool is
+healthy, but above the unfavoured Beta(2, 8), so when quota gating has
+removed `claude`/`codex`/`kimi` the work lands on DeepSeek instead of
+failing. Quota gating is the credit balance: quotamax's `backstop` block
+(`available`/`low`), falling back to the skill's `balance --json` (exit 0 =
+eligible); `--no-quota` skips the check. Because it is remote, `--sensitive`
+and `--private` veto it exactly like codex/kimi/free.
 
 The `free` arm: a fourth cost class (`free`, alongside `included`/`paid`/`local`)
 that dispatches through the free-llm proxy on `127.0.0.1:8080` — hosted free

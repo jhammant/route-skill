@@ -31,7 +31,7 @@ $ route "audit the customer database credentials"
 {
   "chosen": "local-batch",
   "data_class": "sensitive",
-  "removed_by_sensitivity": ["codex", "kimi", "free"],
+  "removed_by_sensitivity": ["codex", "kimi", "free", "deepseek"],
   "why": "posterior+sensitive:local-preferred(auto-detected)"
 }
 ```
@@ -45,12 +45,13 @@ allowlist in `sensitive.toml`). The content match above is a **one-way safety
 net**: a hit escalates caution, a miss proves nothing. Do not rely on it —
 a heuristic that misses silently ships private data to a third party.
 
-## Five arms, four cost classes
+## Six arms, four cost classes
 
 | arm | cost class | for |
 |---|---|---|
 | `claude` | `included` | anything needing this conversation's context |
 | `codex`, `kimi` | `paid` | hard self-contained coding, separate quota pools — `codex` runs GPT-6 Astra and owns long-horizon work |
+| `deepseek` | `paid` | the backstop: pay-as-you-go coding and batch when subscription quota is gone |
 | `local-batch`, `local-agent` | `local` | volume + anything sensitive — memory-bound, free |
 | `free` | `free` | delay-tolerant batch via [`free-llm`](https://github.com/jhammant/free-llm-skill) — eleven pooled free tiers |
 
@@ -113,7 +114,7 @@ task text
    ├─▶ 3. ELIGIBLE   which arms can do this shape at all?
    ├─▶ 4. QUOTA      drop arms with no headroom (quotamax)
    ├─▶ 5. SELECT     bandit picks among survivors (banditry)
-   ├─▶ 6. DISPATCH   hand to /codex, /kimi, /local-llm, /free-llm, or stay
+   ├─▶ 6. DISPATCH   hand to /codex, /kimi, /deepseek, /local-llm, /free-llm, or stay
    └─▶ 7. OUTCOME    record reward, update posterior, maybe escalate
 ```
 
@@ -134,7 +135,10 @@ task text
    `local-batch`. Arms with a health endpoint (`free`) are eligible only while it
    answers — an unreachable proxy removes the arm, never an error.
 4. **Quota** — `quotamax agent --json`. An arm at `critical` headroom is **removed**,
-   not penalised. Quota gates availability; the bandit decides quality.
+   not penalised. Quota gates availability; the bandit decides quality. For the
+   `deepseek` backstop, "quota" is the credit balance: `backstop.low` or
+   `available: false` removes it, falling back to the skill's `balance --json`
+   when quotamax has no backstop field; `--no-quota` skips the check.
 5. **Select** — `router.py` wraps [banditry](https://github.com/jhammant/banditry):
    one Thompson-sampling bandit per `route:{shape}:{tier}` cell, Beta priors seeded
    from the static rule table (`data/priors.toml`): favoured pools start at
@@ -161,6 +165,19 @@ off against quality:
 
 - `included` — **claude**: subscription quota you have already paid for.
 - `paid` — **codex**, **kimi**: metered API spend.
+- `paid` — **deepseek**: the **backstop**, via the `deepseek` Claude Code
+  skill — pay-as-you-go credit Jon tops up. Coding shapes dispatch to
+  `deepseek code --dir . --model deepseek-v4-pro`; batch shapes to `deepseek
+  ask - --model deepseek-flash` with the task on stdin. Its prior sits at `Beta(4,6)` in coding cells —
+  below every favoured arm and below `claude`'s long-horizon fallback, so it
+  **never wins while an included pool is healthy** (it costs real money), but
+  above the unfavoured `Beta(2,8)`, so when quota gating has removed
+  `claude`/`codex`/`kimi` the work lands on DeepSeek **ahead of failing**.
+  Batch cells keep it unfavoured — `local-batch` is free and always available.
+  Gating is the credit balance, not a rate window: quotamax's `backstop`
+  block (`available`/`low`), falling back to the skill's `balance --json`
+  (exit 0 = eligible) when quotamax predates it. Fail-closed: an
+  unconfirmable balance means ineligible, because every call spends money.
 - `local` — **local-batch**, **local-agent**: memory-bound models on your own
   hardware via `local-llm`. With an optional `endpoint` in `pools.toml`, the
   same tool can back several arms (`local-batch-lmstudio` vs
@@ -182,7 +199,8 @@ off against quality:
 ## Sensitive data — prefer local, never fall back remote
 
 Every task carries a `dataClass`: `open` (default) or `sensitive`. When a task
-is sensitive, the remote third-party pools — `codex`, `kimi`, `free` — are
+is sensitive, the remote third-party pools — `codex`, `kimi`, `free`,
+`deepseek` — are
 removed at the **eligibility** stage (a veto, not a score). `claude` stays
 eligible, and so do `local-batch` / `local-agent` — the only arms where the
 data is safe *by construction*, because it physically never leaves the

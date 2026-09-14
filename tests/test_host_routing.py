@@ -45,7 +45,7 @@ def test_codex_to_claude_dispatch(monkeypatch, capsys):
     assert main_auto(['--host','codex','--pool','claude','--no-llm','--no-quota','write a test']) == 0
     assert calls[0][0].startswith('claude --print')
     assert calls[0][1] == 'write a test'
-    assert calls[0][2] == {'target':'claude'}
+    assert calls[0][2] == {'target':'claude','stdin':False}
 
 
 def test_codex_stays_without_recursive_dispatch(monkeypatch, capsys):

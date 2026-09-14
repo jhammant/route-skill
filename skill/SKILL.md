@@ -11,9 +11,10 @@ Run the routing engine on the user's task:
 route <task text>
 ```
 
-The command prints a JSON plan: `shape`, `tier`, `eligible` arms after veto and
-quota gating, the `chosen` arm, and `why` (`veto:<name>`, `prior`, or
-`posterior`).
+The command prints a JSON plan: `shape`, `tier`, `horizon` (`long` when the
+task reads as hours of many-step work), `eligible` arms after veto and quota
+gating, the `chosen` arm, and `why` (`veto:<name>`, `prior`, or `posterior`,
+with `+long-horizon` when the cue floored the tier at `hard`).
 
 Then:
 
@@ -26,15 +27,22 @@ Then:
    prompt to the user; dispatch only on an explicit yes. The CLI shells out to
    the existing `/codex`, `/kimi`, `/local-llm`, or `/free-llm` skills — never
    reimplement what they do.
-4. **Record the outcome afterwards** so the router learns:
+4. **The outcome loop closes itself from the exit code.** A dispatch that
+   exits 0 records `completed`; a non-zero exit records `failed`. What only
+   you can know is whether the diff was kept, so after verifying run:
 
    ```sh
-   route outcome --shape <shape> --tier <tier> --arm <arm> --outcome <accepted|verified|completed|failed>
+   route outcome --shape <shape> --tier <tier> --arm <arm> --outcome <accepted|verified|failed>
    ```
 
    `accepted` (diff kept, no escalation) is the real signal; `verified` means
-   tests passed; `completed` means it ran. On failed verification, retry once
-   on the next-stronger eligible arm — one hop only.
+   tests passed. Events already recorded for that decision are skipped, so
+   `accepted` after an automatic `completed` never double-counts. A `--pool`
+   pin is recorded as a trial too, so pinned runs teach the bandit. On failed
+   verification, retry once on the next-stronger eligible arm — one hop only.
+   Every dispatch is costed from quotamax snapshots either side of it;
+   `route stats --quota` shows quota spent per dispatch and per accepted
+   result for each arm.
 
 Overrides: `--pool <name>` pins a pool (explicit beats inferred); `--private`,
 `--no-acceptance`, `--needs-context`, `--cross-repo` force the matching veto.

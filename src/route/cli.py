@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shlex
 import subprocess
 import sys
@@ -27,7 +28,7 @@ from .benchmark import (
     run_benchmark,
     seed_priors,
 )
-from .complexity import estimate_complexity
+from .complexity import estimate_complexity, is_long_horizon
 from .eligibility import SensitiveRoutingError, fetch_quota, gate
 from .federate import (
     FederationState,
@@ -40,13 +41,13 @@ from .federate import (
     push,
     status,
 )
-from .pools import load_pools
+from .pools import load_pools, pools_for_host
 from .router import Router, cell_name
-from .eligibility import probably_private
+from .eligibility import QUOTA_PROVIDER, fetch_usage, probably_private, quotamax_available
 from .sensitive import detect_sensitive
-from .shapes import classify_shape
+from .shapes import SHAPES, classify_shape
 from .ship import RunResult, ShipAbort, build_pr_body, ship
-from .stats import Decision, Stats, report_arm, report_cells, report_throughput
+from .stats import report_quota, Decision, Stats, report_arm, report_cells, report_throughput
 from .storage import JsonStorage
 
 
@@ -70,10 +71,22 @@ def decide(args: argparse.Namespace, *, auto: bool) -> int:
         print("route: empty task", file=sys.stderr)
         return 2
 
-    pools = load_pools()
+    host = args.host
+    pools = pools_for_host(load_pools(), host)
     shape = args.shape or classify_shape(text, use_llm=not args.no_llm)
     tier = args.tier or estimate_complexity(text)
+    long_horizon = is_long_horizon(text)
     quota = fetch_quota() if not args.no_quota else {}
+    # Quota gating is fail-open by contract, but a silent no-op is how a
+    # 97%-used pool keeps getting picked. Say so in the plan.
+    if args.no_quota:
+        quota_status = "skipped"
+    elif quota:
+        quota_status = "live"
+    elif not quotamax_available():
+        quota_status = "unavailable: quotamax not on PATH — no arm removed"
+    else:
+        quota_status = "unavailable: quotamax returned no data — no arm removed"
 
     # dataClass: 'open' by default, 'sensitive' only on an explicit signal
     # (--sensitive, a sensitive:true task field, or the sensitive.toml path
@@ -105,8 +118,9 @@ def decide(args: argparse.Namespace, *, auto: bool) -> int:
             no_acceptance=args.no_acceptance,
             needs_context=args.needs_context,
             cross_repo=args.cross_repo,
+            host=host,
         )
-    except SensitiveRoutingError as exc:
+    except (SensitiveRoutingError, ValueError) as exc:
         # Fail loudly — never silently fall back to a remote arm.
         print(f"route: {exc}", file=sys.stderr)
         return 1
@@ -119,21 +133,29 @@ def decide(args: argparse.Namespace, *, auto: bool) -> int:
         # Sensitive work PREFERS local arms over claude: free, private, and
         # the data physically never leaves the machine.
         prefer = [a for a in result.eligible if not pools[a].remote] if sensitive else None
-        chosen = router.select(shape, tier, result.eligible, prefer=prefer)
+        # Read the evidence BEFORE selecting: select() records this decision's
+        # own impression, which would otherwise make every cold cell claim
+        # "posterior" with zero real outcomes behind it.
         observed = router.observed_counts(shape, tier)
+        chosen = router.select(shape, tier, result.eligible, prefer=prefer)
         why = "posterior" if any(sum(v) for v in observed.values()) else "prior"
+        if long_horizon and not args.tier:
+            why += "+long-horizon"
         if prefer and chosen in prefer:
             why += "+sensitive:local-preferred"
         if auto_sensitive:
             why += "(auto-detected)"
 
     plan = {
+        "host": host,
         "shape": shape,
         "tier": tier,
+        "horizon": "long" if long_horizon else "short",
         "cell": cell_name(shape, tier),
         "data_class": result.data_class,
         "eligible": result.eligible,
         "removed_by_quota": result.removed_by_quota,
+        "quota": quota_status,
         "chosen": chosen,
         "why": why,
     }
@@ -148,7 +170,11 @@ def decide(args: argparse.Namespace, *, auto: bool) -> int:
         eligible=result.eligible, chosen=chosen, why=why,
     ))
 
-    if chosen == "claude":
+    if args.plan_only:
+        print("dispatch: plan only (nothing launched)")
+        return 0
+
+    if chosen == host:
         print("dispatch: stay (this task belongs here)")
         return 0
 
@@ -163,10 +189,71 @@ def decide(args: argparse.Namespace, *, auto: bool) -> int:
             print("not dispatched")
             return 0
 
-    return _dispatch(pool.dispatch, text)
+    if result.veto is not None and result.veto.name == "user-pin":
+        # The bandit did not choose this arm, but the run is still a trial
+        # of it: give the cell its priors and count the impression so the
+        # outcome below is evidence rather than a reward with no trial.
+        router.observe(shape, tier, chosen, [a for a, p in pools.items() if p.accepts(shape)])
+
+    usage_before = fetch_usage() if not args.no_quota else {}
+    started = time.monotonic()
+    rc = _dispatch(pool.dispatch, text, target=chosen)
+    wall_clock_s = round(time.monotonic() - started, 1)
+    quota = _quota_cost(chosen, usage_before, fetch_usage() if usage_before else {})
+    Stats().annotate_last(wall_clock_s=wall_clock_s, quota=quota)
+    _auto_outcome(router, shape, tier, chosen, rc)
+    if quota:
+        moved = ", ".join(
+            f"{label} {quota['before'][label]:g}% -> {quota['after'][label]:g}% ({delta:+g})"
+            for label, delta in quota["delta"].items()
+        )
+        print(f"quota: {quota['provider']} {moved}")
+    elif not args.no_quota:
+        print(f"quota: not tracked for {chosen}" + ("" if chosen in QUOTA_PROVIDER else " (no quota pool)"))
+    return rc
 
 
-def _dispatch(template: str, task: str) -> int:
+def _quota_cost(arm: str, before: dict, after: dict) -> dict | None:
+    """Before/after usage for the arm's quota pool; None when not measurable."""
+    provider = QUOTA_PROVIDER.get(arm)
+    if not provider or provider not in before or provider not in after:
+        return None
+    b, a = before[provider], after[provider]
+    delta = {label: round(a[label] - b[label], 2) for label in b if label in a}
+    if not delta:
+        return None
+    return {"provider": provider, "before": b, "after": a, "delta": delta}
+
+
+def _auto_outcome(router: Router, shape: str, tier: str, arm: str, rc: int) -> None:
+    """Close the loop from the exit code; the caller only adds what it knows.
+
+    ``completed`` (ran without erroring) is exactly what an exit code says,
+    so record it here rather than hoping the caller remembers. ``accepted``
+    (diff kept) and ``verified`` (tests passed) are still the caller's to
+    report via ``route outcome`` — that call skips anything already on the
+    decision, so nothing double-counts.
+    """
+    from .outcomes import record_outcome
+
+    if rc == 0:
+        record_outcome(router, shape, tier, arm, "completed")
+        Stats().record_outcome_events(["completed"])
+        print(
+            "outcome: completed (recorded from exit code). When the diff is kept run\n"
+            f"  route outcome --shape {shape} --tier {tier} --arm {arm} --outcome accepted"
+        )
+    else:
+        # The impression is already counted with no reward — that IS the
+        # negative outcome. Mark the decision so stats can show it.
+        Stats().record_outcome_events(["failed"])
+        print(
+            f"outcome: failed (exit {rc}, recorded). Retry once on the next-stronger arm:\n"
+            f"  route outcome --shape {shape} --tier {tier} --arm {arm} --outcome failed"
+        )
+
+
+def _dispatch(template: str, task: str, *, target: str | None = None) -> int:
     if not template:
         print("dispatch: no command configured for this pool", file=sys.stderr)
         return 1
@@ -175,7 +262,11 @@ def _dispatch(template: str, task: str) -> int:
         argv.append(task)
     started = time.monotonic()
     try:
-        proc = subprocess.run(argv)
+        # A delegated agent must see itself as host if it invokes route again.
+        env = dict(os.environ)
+        if target in ("claude", "codex"):
+            env["ROUTE_HOST"] = target
+        proc = subprocess.run(argv, env=env)
     except OSError as exc:
         print(f"dispatch failed: {exc}", file=sys.stderr)
         return 1
@@ -187,6 +278,8 @@ def cmd_stats(args: argparse.Namespace) -> int:
     router = _build_router()
     if args.throughput:
         rows = report_throughput(Stats())
+    elif args.quota:
+        rows = report_quota(Stats())
     elif args.arm:
         rows = report_arm(router, args.arm)
     else:
@@ -196,13 +289,53 @@ def cmd_stats(args: argparse.Namespace) -> int:
 
 
 def cmd_outcome(args: argparse.Namespace) -> int:
-    from .outcomes import OUTCOME_EVENTS, record_outcome
+    from .outcomes import OUTCOME_EVENTS, record_failure
 
     router = _build_router()
-    record_outcome(router, args.shape, args.tier, args.arm, args.outcome)
-    Stats().record_outcome_events(list(OUTCOME_EVENTS[args.outcome]))
+    stats = Stats()
+    events = list(OUTCOME_EVENTS[args.outcome])
+    # Dispatch already recorded `completed` from the exit code. Only reward
+    # events not yet on this decision, or a later `accepted` would count
+    # `completed` twice.
+    already = _events_already_recorded(stats, args.shape, args.tier, args.arm)
+    new_events = [e for e in events if e not in already]
+    for event in new_events:
+        router.reward(args.shape, args.tier, args.arm, event)
+    if args.outcome == "failed" and not already:
+        # No dispatch recorded anything (a manual run): count the trial.
+        record_failure(router, args.shape, args.tier, args.arm)
+    stats.record_outcome_events(events or ["failed"])
     print(json.dumps({"recorded": args.outcome, "arm": args.arm,
-                      "cell": cell_name(args.shape, args.tier)}))
+                      "cell": cell_name(args.shape, args.tier),
+                      "events": new_events, "already": sorted(already)}))
+    return 0
+
+
+def _events_already_recorded(stats: Stats, shape: str, tier: str, arm: str) -> set[str]:
+    """Outcome events already on the latest decision for this cell and arm."""
+    rows = stats.decisions()
+    if not rows:
+        return set()
+    last = rows[-1]
+    if last.get("cell") != cell_name(shape, tier) or last.get("chosen") != arm:
+        return set()
+    return set(last.get("outcome_events", [])) - {"failed"}
+
+
+def cmd_reseed(args: argparse.Namespace) -> int:
+    """Move every live cell's seed to the current rule table; keep observations."""
+    router = _build_router()
+    pools = load_pools()
+    arms_for_shape = {
+        shape: [name for name, pool in pools.items() if pool.accepts(shape)]
+        for shape in SHAPES
+    }
+    changes = router.reseed(arms_for_shape, apply=not args.dry_run)
+    print(json.dumps({
+        "applied": not args.dry_run,
+        "changed": len(changes),
+        "changes": changes,
+    }, indent=2))
     return 0
 
 
@@ -354,6 +487,7 @@ def _parser(prog: str) -> argparse.ArgumentParser:
     s = sub.add_parser("stats")
     s.add_argument("--arm")
     s.add_argument("--throughput", action="store_true")
+    s.add_argument("--quota", action="store_true", help="per arm: quota cost per dispatch and per accepted result")
     s.set_defaults(func=cmd_stats)
 
     o = sub.add_parser("outcome", help="record what happened")
@@ -362,6 +496,10 @@ def _parser(prog: str) -> argparse.ArgumentParser:
     o.add_argument("--arm", required=True)
     o.add_argument("--outcome", required=True, choices=["accepted", "verified", "completed", "failed"])
     o.set_defaults(func=cmd_outcome)
+
+    r = sub.add_parser("reseed", help="move live cells' priors to the current rule table, keeping observations")
+    r.add_argument("--dry-run", action="store_true", help="show what would change without writing")
+    r.set_defaults(func=cmd_reseed)
 
     f = sub.add_parser("federate")
     f.add_argument("federate_cmd", choices=["export", "push", "pull", "status", "merge", "aggregate"])
@@ -403,6 +541,10 @@ def _parser(prog: str) -> argparse.ArgumentParser:
 
 def _add_task_flags(p: argparse.ArgumentParser) -> None:
     p.add_argument("task", nargs="*")
+    p.add_argument("--host", choices=["claude", "codex"],
+                   default=os.environ.get("ROUTE_HOST", "claude"),
+                   help="current agent; context-dependent work stays here (default: ROUTE_HOST or claude)")
+    p.add_argument("--plan-only", action="store_true", help="show routing without prompting or dispatching")
     p.add_argument("--pool", help="pin a pool explicitly — beats inference")
     p.add_argument("--shape", help="override shape classification")
     p.add_argument("--tier", help="override complexity tier")
@@ -416,7 +558,7 @@ def _add_task_flags(p: argparse.ArgumentParser) -> None:
     p.add_argument("--no-quota", action="store_true", help="skip quotamax")
 
 
-_SUBCOMMANDS = {"task", "stats", "outcome", "federate", "benchmark", "ship"}
+_SUBCOMMANDS = {"task", "stats", "outcome", "reseed", "federate", "benchmark", "ship"}
 
 
 def _run(argv: list[str] | None, *, auto: bool) -> int:

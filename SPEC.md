@@ -256,7 +256,7 @@ Leaves the machine (opt-in, off by default):
 
 ```json
 {"schema":1, "context":"coding:refactor:hard", "arm":"codex",
- "model":"gpt-5.6-sol", "alpha":14, "beta":3}
+ "model":"gpt-6-astra", "alpha":14, "beta":3}
 ```
 
 **Never** leaves: prompts, diffs, file paths, repo names, task titles, item content.

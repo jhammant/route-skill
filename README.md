@@ -50,7 +50,7 @@ a heuristic that misses silently ships private data to a third party.
 | arm | cost class | for |
 |---|---|---|
 | `claude` | `included` | anything needing this conversation's context |
-| `codex`, `kimi` | `paid` | hard self-contained coding, separate quota pools |
+| `codex`, `kimi` | `paid` | hard self-contained coding, separate quota pools — `codex` runs GPT-6 Astra and owns long-horizon work |
 | `local-batch`, `local-agent` | `local` | volume + anything sensitive — memory-bound, free |
 | `free` | `free` | delay-tolerant batch via [`free-llm`](https://github.com/jhammant/free-llm-skill) — eleven pooled free tiers |
 
@@ -70,6 +70,36 @@ flowchart LR
 There is deliberately **no "switch to adaptive" flag**. Each arm's Beta prior
 *is* the hand-written rule table, so a cold cell behaves exactly like the rules
 and evidence takes over on its own, per cell, as it accumulates.
+
+## Long-running work goes to Codex on GPT-6 Astra
+
+Duration is a different axis from difficulty. "Fix every failing test in the
+suite" is individually easy and takes hours. A long-horizon cue (`until all
+tests pass`, `every call site`, `whole codebase`, `overnight`) floors the tier
+at `hard`, and the `hard` / `open-ended` coding cells favour `codex` alone:
+GPT-6 Astra leads on Terminal-Bench 4.0 and keeps searchable notes across
+context windows, so it stays coherent where a rolling summary drifts. Rules
+are keyed by `shape` or `shape:tier` in `priors.toml`, so this is one config
+line per cell, not a new arm. On single-shot coding Astra ties or trails
+Fable, so the shape-level rules are unchanged.
+
+```text
+$ route --plan-only "keep going until every test in the whole repo passes"
+{
+  "shape": "coding:test",    "tier": "hard",   "horizon": "long",
+  "chosen": "codex",         "why": "prior+long-horizon",
+  "quota": "live"
+}
+```
+
+The `codex` arm's model identity is read from `$CODEX_HOME/config.toml`
+rather than assumed, because counts learned under `gpt-5.6-sol` are not
+evidence about `gpt-6-astra` and must never merge.
+
+Cells are seeded once, so a rule change never reaches a cell you have already
+used. `route reseed` moves every live cell's seed to the current table as a
+delta on the counts, leaving real observations exactly as they were;
+`--dry-run` shows the moves first.
 
 ## The decision, in order
 
@@ -114,9 +144,15 @@ task text
 6. **Dispatch** — hands to the existing skills or returns `stay` for Claude. Never
    reimplements them, never triggers paid provisioning.
 7. **Outcome** — reward events ranked by the signal hardest to fake: `accepted`
-   (diff kept) > `verified` (tests passed) > `completed` (ran). Escalation is capped
+   (diff kept) > `verified` (tests passed) > `completed` (ran). The dispatch exit
+   code records `completed` or `failed` by itself; `route outcome` adds what only
+   the caller knows, skipping events already on the decision. A `--pool` pin is
+   counted as a trial, so pinned runs are evidence too. Escalation is capped
    at one hop to the next-stronger eligible arm, and records a *negative* outcome
-   for the arm it leaves behind.
+   for the arm it leaves behind. Each dispatch is also costed: quotamax usage
+   is snapshotted either side of it and the delta stored on the decision, so
+   `route stats --quota` shows, per arm, quota spent per dispatch and per
+   accepted result next to the accept rate.
 
 ## The arms and their cost classes
 
@@ -257,7 +293,7 @@ machine (opt-in, off by default) is exactly:
 
 ```json
 {"schema":1, "context":"coding:refactor:hard", "arm":"codex",
- "model":"gpt-5.6-sol", "alpha":14, "beta":3}
+ "model":"gpt-6-astra", "alpha":14, "beta":3}
 ```
 
 **Never** leaves: prompts, diffs, file paths, repo names, task titles, item
@@ -286,3 +322,30 @@ Tests are deterministic: no network, no real dispatch, no money spent.
 ## License
 
 MIT
+# Calling from Codex
+
+The router supports both host agents. Pass `--host codex` (or set
+`ROUTE_HOST=codex`) when invoking it from Codex. The default remains Claude
+for existing installations. Context-dependent tasks and exhausted-pool
+fallbacks stay with the selected host. Sensitive routing keeps the current
+host and local pools eligible, excluding other remote providers unless the
+user explicitly pins a pool.
+
+```bash
+/Users/jhammant/dev/skills/route-skill/.venv/bin/route --host codex --pool claude "Write tests for src/parser.py"
+/Users/jhammant/dev/skills/route-skill/.venv/bin/auto --host codex --pool claude "Write tests for src/parser.py"
+/Users/jhammant/dev/skills/route-skill/.venv/bin/route --host codex --plan-only "Review the parser changes"
+```
+
+`route` asks before dispatch; `auto` dispatches immediately. `--plan-only`
+does neither. Claude delegation runs `claude --print --permission-mode auto`
+in the current directory and inherits its configured model and authentication.
+Task text is passed as one argument without shell evaluation. Child agents
+receive their own `ROUTE_HOST`. Parent agents should provide a self-contained
+task and verify the resulting diff and tests. No permission-bypass flag is added.
+
+Use the explicit executable path on macOS: bare `route` may resolve to the
+system network-routing utility. Provider identities and existing learned
+statistics remain unchanged when switching host. Quota reads combine Claude
+advice with Codex/Kimi provider limits; provider usage at 95% is considered
+critical, and expired windows are ignored.

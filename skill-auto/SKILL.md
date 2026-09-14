@@ -16,10 +16,16 @@ quota gating, lets the bandit pick among the surviving arms, prints the JSON
 plan, and dispatches straight away — to `codex`, `kimi`, or `local-llm` via
 their existing skills, or `stay` when the task belongs here.
 
-Afterwards, **record the outcome** so the router learns:
+Long-horizon tasks (`until all tests pass`, `every call site`, `whole
+codebase`, `overnight`) floor the tier at `hard` and favour `codex`, which
+runs GPT-6 Astra. Pass `--tier hard` when a task is plainly hours-long but
+the cue did not fire.
+
+The exit code records `completed` or `failed` on its own. Afterwards, **record
+whether the diff was kept** so the router learns the signal it cannot see:
 
 ```sh
-route outcome --shape <shape> --tier <tier> --arm <arm> --outcome <accepted|verified|completed|failed>
+route outcome --shape <shape> --tier <tier> --arm <arm> --outcome <accepted|verified|failed>
 ```
 
 Rules that still apply in auto mode:

@@ -36,6 +36,11 @@ class Decision:
     #: Per-unit accept/reject detail for a swarm dispatch. Counts only —
     #: the posterior sees one weighted observation, never this list.
     units: list[bool] | None = None
+    #: Quota cost of the dispatch, from quotamax snapshots either side of it:
+    #: {"provider", "before", "after", "delta"} with {limit_label: percent}.
+    #: Percentages are coarse and shared with whatever else ran meanwhile,
+    #: so a single delta is noisy; the per-arm mean in `stats --quota` is not.
+    quota: dict | None = None
 
 
 @dataclass
@@ -90,6 +95,16 @@ class Stats:
             "".join(json.dumps(r, sort_keys=True) + "\n" for r in rows), encoding="utf-8"
         )
 
+    def annotate_last(self, **fields) -> None:
+        """Set fields (wall clock, quota cost) on the most recent decision."""
+        rows = _read_jsonl(self.decisions_path)
+        if not rows:
+            return
+        rows[-1].update(fields)
+        self.decisions_path.write_text(
+            "".join(json.dumps(r, sort_keys=True) + "\n" for r in rows), encoding="utf-8"
+        )
+
     def record_throughput(self, sample: Throughput) -> None:
         _append_jsonl(self.throughput_path, asdict(sample))
 
@@ -100,12 +115,8 @@ class Stats:
         return _read_jsonl(self.throughput_path)
 
 
-def _prior_of(router: Router, shape: str, arm: str) -> tuple[float, float]:
-    a, b = (
-        router.priors.favoured
-        if arm in router.priors.favoured_arms(shape)
-        else router.priors.unfavoured
-    )
+def _prior_of(router: Router, shape: str, tier: str, arm: str) -> tuple[float, float]:
+    a, b = router.priors.prior(shape, tier, arm)
     return float(a), float(b)
 
 
@@ -151,7 +162,7 @@ def report_cells(router: Router) -> list[dict]:
         for arm in sorted(posterior):
             pa, pb = posterior[arm]
             oa, ob = observed.get(arm, (0, 0))
-            prior_a, prior_b = _prior_of(router, shape, arm)
+            prior_a, prior_b = _prior_of(router, shape, tier, arm)
             rows.append({
                 "cell": f"{shape}:{tier}",
                 "arm": arm,
@@ -174,3 +185,51 @@ def report_throughput(stats: Stats) -> list[dict]:
     """Local model performance table."""
     keys = ("model", "quant", "context_length", "hardware", "tok_s", "items_s", "load_s", "peak_gb")
     return [{k: row.get(k) for k in keys} for row in stats.throughput()]
+
+
+def report_quota(stats: Stats) -> list[dict]:
+    """Per arm: what dispatches cost in quota, and what came back.
+
+    Only decisions that actually dispatched (an outcome event or a quota
+    record) count; a plan-only run or a `stay` is not a dispatch.
+    """
+    per_arm: dict[str, dict] = {}
+    for row in stats.decisions():
+        events = set(row.get("outcome_events") or [])
+        quota = row.get("quota")
+        if not events and not quota:
+            continue
+        arm = row.get("chosen", "?")
+        agg = per_arm.setdefault(arm, {
+            "arm": arm, "dispatches": 0, "completed": 0, "accepted": 0, "failed": 0,
+            "quota_costed": 0, "quota_delta_total": {}, "wall_clock_s_total": 0.0, "wall_clock_n": 0,
+        })
+        agg["dispatches"] += 1
+        for event in ("completed", "accepted", "failed"):
+            agg[event] += event in events
+        if quota and isinstance(quota.get("delta"), dict):
+            agg["quota_costed"] += 1
+            for label, pct in quota["delta"].items():
+                agg["quota_delta_total"][label] = agg["quota_delta_total"].get(label, 0.0) + float(pct)
+        if isinstance(row.get("wall_clock_s"), (int, float)):
+            agg["wall_clock_s_total"] += float(row["wall_clock_s"])
+            agg["wall_clock_n"] += 1
+    rows = []
+    for agg in sorted(per_arm.values(), key=lambda a: a["arm"]):
+        n = agg["quota_costed"]
+        rows.append({
+            "arm": agg["arm"],
+            "dispatches": agg["dispatches"],
+            "completed": agg["completed"],
+            "accepted": agg["accepted"],
+            "failed": agg["failed"],
+            "accept_rate": round(agg["accepted"] / agg["dispatches"], 2) if agg["dispatches"] else None,
+            "quota_costed": n,
+            "quota_pct_total": {k: round(v, 1) for k, v in agg["quota_delta_total"].items()},
+            "quota_pct_per_dispatch": {k: round(v / n, 2) for k, v in agg["quota_delta_total"].items()} if n else {},
+            "quota_pct_per_accept": {
+                k: round(v / agg["accepted"], 2) for k, v in agg["quota_delta_total"].items()
+            } if agg["accepted"] and n else {},
+            "wall_clock_s_mean": round(agg["wall_clock_s_total"] / agg["wall_clock_n"], 1) if agg["wall_clock_n"] else None,
+        })
+    return rows

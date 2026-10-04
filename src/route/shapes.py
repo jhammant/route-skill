@@ -89,8 +89,23 @@ _LLM_PROMPT = (
 )
 
 
+# A feature build: a build verb plus at least two delivery cues. Summarise or
+# classify words inside such a spec ("digest", "summarising") describe the
+# feature, not the task, so this beats the batch rules.
+_BUILD_VERB_RE = re.compile(r"\b(implement|build|scaffold|develop)\b", re.I)
+_DELIVERY_CUE_RE = re.compile(
+    r"\b(migrations?|tests?|branch|typecheck|endpoints?|schema|commit|pull request)\b", re.I)
+
+
+def _is_feature_build(text: str) -> bool:
+    cues = {m.group(0).lower().rstrip("s") for m in _DELIVERY_CUE_RE.finditer(text)}
+    return bool(_BUILD_VERB_RE.search(text)) and len(cues) >= 2
+
+
 def _classify_deterministic(text: str) -> str | None:
     """First-match heuristic pass. Returns None when nothing matches."""
+    if _is_feature_build(text):
+        return "coding:implement"
     for shape, pattern in _RULES:
         if not pattern.search(text):
             continue

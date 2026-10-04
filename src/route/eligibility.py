@@ -15,6 +15,7 @@ falling back to a remote arm.
 
 from __future__ import annotations
 
+import functools
 import json
 import re
 import shutil
@@ -60,9 +61,20 @@ _CROSS_REPO_RE = re.compile(
     r"multiple (repos|repositories|directories)|several (repos|directories))\b",
     re.IGNORECASE,
 )
+# Only actual private material counts: key-shaped strings, private-key blocks,
+# `name=<value>` secret assignments, and named categories of personal data.
+# Design vocabulary ("a server secret", "no credentials in code", "password
+# policy") is not a signal — specs say those words without containing any.
 _PRIVATE_RE = re.compile(
-    r"\b(private data|secrets?|credentials?|passwords?|\.env\b|api keys?|"
-    r"personal data|pii|customer data|medical|financial records)\b",
+    r"\.env\b|\b(private data|personal data|pii|customer data|medical|financial records)\b|"
+    r"-----BEGIN [A-Z ]*PRIVATE KEY-----|"
+    r"\b(?:sk|pk|rk)-[A-Za-z0-9_-]{16,}|"
+    r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b|"
+    r"\bgh[pousr]_[A-Za-z0-9]{30,}|"
+    r"\bxox[abprs]-[A-Za-z0-9-]{10,}|"
+    r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,}|"
+    r"\b[\w-]*(?:password|passwd|secret|token|api[_-]?key|credential)s?"
+    r"(?:\s*=\s*[\"']?|\s*:\s*[\"'])(?=[^\s\"']{12,})(?=[^\s\"']*\d)[^\s\"']+",
     re.IGNORECASE,
 )
 _NO_ACCEPTANCE_RE = re.compile(
@@ -125,17 +137,34 @@ def probe_health(url: str, timeout: float = 1.0) -> bool:
         return False
 
 
+@functools.lru_cache(maxsize=None)
+def subcommand_available(spec: str) -> bool:
+    """True when ``<tool> --help`` lists ``<tool> <subcommand>`` (e.g. "local-llm agent").
+
+    Fail-safe: a missing tool or a help failure means unavailable.
+    """
+    tool = spec.split()[0]
+    try:
+        proc = subprocess.run([tool, "--help"], capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return spec in (proc.stdout + proc.stderr)
+
+
 def eligible_for(shape: str, pools: dict[str, Pool]) -> list[str]:
     """Step 3: arms that accept this shape at all, registry order.
 
     An arm with a ``health_url`` (the free-llm proxy) is eligible only while
-    the endpoint answers — an unreachable proxy simply removes the arm.
+    the endpoint answers — an unreachable proxy simply removes the arm. An arm
+    with ``requires_subcommand`` is removed while that subcommand is missing.
     """
     out = []
     for name, pool in pools.items():
         if not pool.accepts(shape):
             continue
         if pool.health_url and not probe_health(pool.health_url):
+            continue
+        if pool.requires_subcommand and not subcommand_available(pool.requires_subcommand):
             continue
         out.append(name)
     return out

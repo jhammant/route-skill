@@ -29,7 +29,7 @@ _LONG_HORIZON_RE = re.compile(
 )
 
 _HARD_RE = re.compile(
-    r"\b(distributed|migration|migrate|architecture|concurrency|concurrent|race|"
+    r"\b(distributed|migrations?|migrate|architecture|concurrency|concurrent|race|"
     r"security|auth(entication|orization)?|performance|optimi[sz]e|redesign|"
     r"from scratch|backwards?[- ]compat|database schema|deadlock)\b",
     re.IGNORECASE,

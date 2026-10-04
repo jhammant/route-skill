@@ -112,6 +112,9 @@ class Pool:
     #: /healthz). Empty means always considered; unreachable means simply
     #: not eligible, never an error.
     health_url: str = ""
+    #: ``"<tool> <subcommand>"`` that must appear in ``<tool> --help`` for the
+    #: arm to be eligible; a missing subcommand removes the arm.
+    requires_subcommand: str = ""
     model: Model = field(default_factory=lambda: Model(name="unknown"))
     #: Server-authoritative fan-out limit (Kimi's /usages parallel.limit is
     #: 30 on ADVANCED). A swarm is a property of DISPATCH, never a separate
@@ -210,6 +213,7 @@ def _default_pools() -> dict[str, Pool]:
             cost="local",
             strength=strength("local-agent"),
             dispatch="local-llm agent {task}",
+            requires_subcommand="local-llm agent",
             probe="local-llm ask {task}",
             model=Model(name="qwen3.6-27b", quant="4bit"),
             parallel_limit=2,
@@ -262,6 +266,7 @@ def load_pools(path: str | Path | None = None) -> dict[str, Pool]:
             probe=str(spec.get("probe", "")),
             endpoint=str(spec.get("endpoint", "")),
             health_url=str(spec.get("health_url", "")),
+            requires_subcommand=str(spec.get("requires_subcommand", "")),
             model=Model(
                 name=str(model_spec.get("name", "unknown")),
                 quant=str(model_spec.get("quant", "")),

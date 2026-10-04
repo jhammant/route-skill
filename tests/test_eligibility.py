@@ -49,7 +49,7 @@ def test_user_pin_beats_inference(pools):
 
 def test_veto_does_not_consult_quota(pools):
     """claude critical in quotamax cannot block a veto landing on claude."""
-    result = gate("rotate the credentials", "coding:debug", pools,
+    result = gate("rotate the credentials in our .env", "coding:debug", pools,
                   quota={"claude": "critical"})
     assert result.eligible == ["claude"]
 

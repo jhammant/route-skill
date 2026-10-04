@@ -38,6 +38,9 @@ def isolated_env(tmp_path, monkeypatch):
     # The codex arm reads its model from $CODEX_HOME/config.toml; never the
     # developer's real one.
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex-home"))
+    # Default: every subcommand an arm requires is present. Tests of the
+    # missing-subcommand path override this.
+    monkeypatch.setattr("route.eligibility.subcommand_available", lambda spec: True)
     return tmp_path
 
 

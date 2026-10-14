@@ -20,6 +20,7 @@ import json
 import re
 import shutil
 import subprocess
+import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -27,6 +28,7 @@ from dataclasses import dataclass, field, replace
 
 from .pools import DEEPSEEK_SKILL, Pool
 from .shapes import FALLBACK_SHAPE
+from .surplus import parse_weekly
 
 #: The pool every veto short-circuits to.
 VETO_TARGET = "claude"
@@ -214,7 +216,47 @@ def quotamax_available(cmd: tuple[str, ...] = ("quotamax", "agent", "--json")) -
     return shutil.which(cmd[0]) is not None
 
 
-def fetch_quota(cmd: tuple[str, ...] = ("quotamax", "agent", "--json"), timeout: float = 5.0) -> dict[str, str]:
+class QuotaSnapshot(dict):
+    """Headroom mapping, with weekly windows retained from the same probes."""
+
+    def __init__(self, headroom: dict[str, str], weekly: dict[str, dict]):
+        super().__init__(headroom)
+        self.weekly = weekly
+
+
+QUOTA_CACHE_SECONDS = 300
+
+
+def _cached_quota_payloads(timeout: float):
+    """quotamax payloads, cached for QUOTA_CACHE_SECONDS under the state dir.
+
+    `quotamax agent` rescans transcripts and can take well over 5 s; when the probe
+    timed out the router silently lost all quota awareness (no gating, no surplus or
+    pressure adjustment). A five-minute cache keeps routing fast and quota-aware.
+    Only successful probes are cached.
+    """
+    from .storage import state_dir
+
+    cache = state_dir() / "quota-cache.json"
+    try:
+        cached = json.loads(cache.read_text())
+        if time.time() - float(cached.get("at", 0)) < QUOTA_CACHE_SECONDS:
+            return cached["payloads"]
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        payloads = list(pool.map(lambda c: _run_json(c, timeout),
+            [("quotamax", "agent", "--json"), ("quotamax", "providers", "--json")]))
+    if payloads and payloads[0] is not None:
+        try:
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            cache.write_text(json.dumps({"at": time.time(), "payloads": payloads}))
+        except OSError:
+            pass
+    return payloads
+
+
+def fetch_quota(cmd: tuple[str, ...] = ("quotamax", "agent", "--json"), timeout: float = 15.0) -> dict[str, str]:
     """Live quota from quotamax. Fail-open: any error means no quota data.
 
     The deepseek backstop is the exception to fail-open: it costs real money
@@ -222,14 +264,12 @@ def fetch_quota(cmd: tuple[str, ...] = ("quotamax", "agent", "--json"), timeout:
     gated out — see ``deepseek_headroom``.
     """
     if cmd == ("quotamax", "agent", "--json"):
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            payloads = list(pool.map(lambda c: _run_json(c, timeout),
-                [cmd, ("quotamax", "providers", "--json")]))
+        payloads = _cached_quota_payloads(timeout)
         quota = {key: value for payload in payloads if payload is not None
                  for key, value in parse_quota(payload).items()}
         if "deepseek" not in quota:
             quota["deepseek"] = deepseek_headroom(payloads[0], timeout=min(timeout, 2.0))
-        return quota
+        return QuotaSnapshot(quota, parse_weekly(*payloads))
     return _fetch_quota(cmd, timeout)
 
 
@@ -351,6 +391,14 @@ class GateResult:
     removed_by_quota: list[str] = field(default_factory=list)
     data_class: str = DATA_OPEN
     removed_by_sensitivity: list[str] = field(default_factory=list)
+    removed_by_cost: list[str] = field(default_factory=list)
+
+
+def apply_backstop(eligible: list[str], pools: dict[str, Pool]) -> list[str]:
+    """Metered arms are a fallback only, after all other availability gates."""
+    if any(pools[arm].cost in ("included", "free", "local") for arm in eligible):
+        return [arm for arm in eligible if pools[arm].cost != "paid"]
+    return list(eligible)
 
 
 def sensitive_veto(
@@ -425,6 +473,9 @@ def gate(
         eligible = survivors
     else:
         removed = []
+    survivors = apply_backstop(eligible, pools)
+    removed_cost = [arm for arm in eligible if arm not in survivors]
+    eligible = survivors
     if not eligible:
         if sensitive:
             raise SensitiveRoutingError(
@@ -442,4 +493,5 @@ def gate(
         removed_by_quota=removed,
         data_class=DATA_SENSITIVE if sensitive else DATA_OPEN,
         removed_by_sensitivity=removed_sensitive,
+        removed_by_cost=removed_cost,
     )

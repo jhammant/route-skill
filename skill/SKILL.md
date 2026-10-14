@@ -27,22 +27,37 @@ Then:
    prompt to the user; dispatch only on an explicit yes. The CLI shells out to
    the existing `/codex`, `/kimi`, `/deepseek`, `/local-llm`, or `/free-llm`
    skills — never reimplement what they do.
-4. **The outcome loop closes itself from the exit code.** A dispatch that
-   exits 0 records `completed`; a non-zero exit records `failed`. What only
-   you can know is whether the diff was kept, so after verifying run:
+4. **Record a graded outcome; the router only learns what you tell it.** The
+   exit code records `completed`/`failed` on its own, but the real signal is how
+   much fixing the result needed. The plan prints a `decision_id`; after
+   verifying, run one of:
 
    ```sh
-   route outcome --shape <shape> --tier <tier> --arm <arm> --outcome <accepted|verified|failed>
+   route settle --decision <id> --fix-passes <N> --merged   # kept after N fix passes
+   route settle --decision <id> --abandoned                 # Claude had to rewrite it
+   route outcome --shape <s> --tier <t> --arm <a> --score 0.85   # any 0..1 verified score
    ```
 
-   `accepted` (diff kept, no escalation) is the real signal; `verified` means
-   tests passed. Events already recorded for that decision are skipped, so
-   `accepted` after an automatic `completed` never double-counts. A `--pool`
-   pin is recorded as a trial too, so pinned runs teach the bandit. On failed
-   verification, retry once on the next-stronger eligible arm — one hop only.
-   Every dispatch is costed from quotamax snapshots either side of it;
-   `route stats --quota` shows quota spent per dispatch and per accepted
-   result for each arm.
+   Fix passes map to a score: 0 → 1.0, 1 → 0.7, 2 → 0.4, 3 → 0.1, more → 0. The
+   score replaces that decision's earlier `completed` rather than adding a
+   second trial, so nothing double-counts. `--outcome accepted|verified|failed`
+   still works. On failed verification, retry once on the next-stronger eligible
+   arm (one hop only). `route stats --quota` shows quota spent per dispatch and
+   per accepted result for each arm.
+
+**What the plan JSON tells you** (mention anything unusual when you explain the decision):
+- `quota_adjustment`: a signed nudge per eligible arm. `+surplus:<arm>` means
+  its pool is on course to leave quota unused at reset; `-pressure:<arm>` means
+  it's on course to run out, or quotamax says `constrained`. Bounded at ±0.15;
+  it never overrides a veto or the quota gate. Quota is probed with a 15 s
+  timeout and cached for 5 minutes.
+- `neighbours`: similar past tasks (local memory, never federated; sensitive
+  tasks stored only as salted hashes) and how each arm scored on them. They
+  count for this decision only.
+- `shape_confidence: low` with a `suggest`: the classifier wasn't sure. Re-run
+  with the suggested `--shape/--tier`, or `--llm-shape`, before dispatching.
+- `removed_by_cost`: paid arms (deepseek) are only eligible when no included,
+  free or local arm survives. That's a hard rule, not a sampling preference.
 
 Overrides: `--pool <name>` pins a pool (explicit beats inferred); `--private`,
 `--no-acceptance`, `--needs-context`, `--cross-repo` force the matching veto.

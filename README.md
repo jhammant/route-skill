@@ -50,8 +50,8 @@ a heuristic that misses silently ships private data to a third party.
 | arm | cost class | for |
 |---|---|---|
 | `claude` | `included` | anything needing this conversation's context |
-| `codex`, `kimi` | `paid` | hard self-contained coding, separate quota pools — `codex` runs GPT-6 Astra and owns long-horizon work |
-| `deepseek` | `paid` | the backstop: pay-as-you-go coding and batch when subscription quota is gone |
+| `codex`, `kimi` | `included` | hard self-contained coding, separate subscription quota pools — `codex` runs GPT-6 Astra and owns long-horizon work |
+| `deepseek` | `paid` | pay-as-you-go backstop when no included, free or local arm survives |
 | `local-batch`, `local-agent` | `local` | volume + anything sensitive — memory-bound, free |
 | `free` | `free` | delay-tolerant batch via [`free-llm`](https://github.com/jhammant/free-llm-skill) — eleven pooled free tiers |
 
@@ -106,7 +106,7 @@ delta on the counts, leaving real observations exactly as they were;
 
 Routing is not a single score. It is a filter chain, then a bandit.
 
-```
+```text
 task text
    │
    ├─▶ 1. SHAPE      closed vocabulary — what kind of work is this?
@@ -158,22 +158,151 @@ task text
    `route stats --quota` shows, per arm, quota spent per dispatch and per
    accepted result next to the accept rate.
 
+## Graded feedback — count the rescue work
+
+Every plan prints a stable `decision_id`. Pass it back after checking the work:
+
+```bash
+route outcome --decision <id> --score 0.7
+route outcome --decision <id> --fix-passes 1
+route outcome --decision <id> --abandoned   # also --rewritten
+```
+
+A score must be finite and between 0 and 1. It contributes exactly one Beta
+trial: `alpha += score`, `beta += 1 - score`. Fix passes map to 0 → 1.0,
+1 → 0.7, 2 → 0.4, 3 → 0.1, and 4 or more → 0.0. Abandonment or a rewrite
+by the supervising agent earns 0.0 regardless of passes.
+
+Grading replaces that decision's previous reward. It reuses the dispatch's
+trial, supersedes plain `completed`, and repeated identical settlement does
+nothing to the counts. A corrected score applies only the difference. Explicit
+grades remain authoritative if a legacy `accepted` event arrives later.
+`--outcome accepted|verified|completed|failed` still records the same cumulative
+events, skipping events already recorded for the decision. Without an ID,
+`--shape`, `--tier`, and `--arm` address the latest matching decision; with no
+matching decision a manual grade creates a new trial each time.
+
+## `route settle` — one line for dispatch callers
+
+```bash
+route --host codex --plan-only "build the parser endpoint"
+# Keep decision_id from the plan; execute and verify the work, then:
+route settle --decision <id> --fix-passes 1 --merged
+route settle --decision <id> --abandoned
+```
+
+`--merged` marks the diff accepted without replacing its quality score with 1.
+`--merged` and `--abandoned` are mutually exclusive. Use the ID when several
+tasks are in flight: settlement attaches to that decision even after later
+plans or dispatches. Plans, declined dispatches, and `stay` decisions are pending;
+they contribute a trial only when dispatched or settled. This also lets a skill
+plan here, dispatch elsewhere, and report the result in one command. Existing
+historical counts are left intact.
+
+## Balance surplus quota and pressure
+
+Among eligible arms, the router adds a bonus to each Thompson draw based on the
+quota projected to remain unused at the end of its seven-day window, provided
+reset is at least two days away:
+
+```text
+elapsed = 1 - resetsInMinutes / 10080
+used = percentUsed / 100
+projected_end = used / elapsed
+surplus = clamp(1 - projected_end, 0, 1)
+overuse = clamp(projected_end - 1, 0, 1)
+if less than one day has elapsed:
+    surplus = max(max(0, elapsed - used), 0.5 * surplus)
+    overuse = max(max(0, used - elapsed), 0.5 * overuse)
+if headroom == "constrained":
+    overuse = max(overuse, 0.5)
+adjustment = -k * overuse if overuse > 0 else k * surplus
+```
+
+The first-day rule damps a noisy early projection; a just-reset window with no
+elapsed time earns zero. For example, 7% used with 6.2 days remaining projects
+61.25% used at reset, leaving 38.75% unused. After first-day damping, the default
+bonus is **0.0290625**, rather than roughly 0.0066 from the old pace delta.
+Conversely, 28% used after 0.7 days projects 280% usage at reset. Its capped,
+damped overuse earns **−0.075** pressure. `constrained` headroom also imposes at
+least `0.5 * k` pressure, even with missing weekly data or spare weekly quota:
+a session limit can be binding. Pressure takes precedence over a surplus bonus.
+
+`k` defaults to 0.15 and is capped at 0.15. Set it to 0 to disable, or lower it
+in `~/.config/route/config.toml` (`ROUTE_CONFIG_DIR` overrides this directory):
+
+```toml
+[surplus]
+k = 0.10
+```
+
+Both adjustments use the same quotamax snapshots as quota gating. Missing,
+invalid or expired windows give no projection; constrained headroom still
+supplies its minimum pressure. Surplus needs at least two days remaining;
+pressure applies until reset. `--no-quota` disables both. Vetoes, critical
+quota gates, the paid backstop rule and sensitive-local preference apply first.
+Pressure never removes an arm. Plans expose signed `quota_adjustment` values
+and append `+surplus:<arm>` or `-pressure:<arm>` to `why` for the chosen arm.
+`surplus_bonus` remains a **deprecated alias with the same signed values** for
+one release. Adjustments affect selection only, never learned counts.
+
+## Local memory of similar tasks
+
+The router also finds up to five settled tasks of the same shape, across tiers,
+using token Jaccard similarity ≥ 0.25. Only currently selectable arms contribute.
+Each neighbour adds `0.5 * similarity` of its graded success/failure to that
+arm's Beta **for this decision only**. Plans show
+`neighbours: [{arm, score, similarity}]`; the pseudo-counts never persist in the
+bandit and never federate. Legacy `accepted` and `failed` provide scores 1 and 0;
+`completed` and `verified` alone stay pending until final feedback.
+
+`task-memory.json` under `ROUTE_STATE_DIR` keeps at most 2,000 rows, oldest first
+to be dropped. Rows hold decision ID, normalised token hashes, shape, tier, arm
+and score (null while pending). **All tasks**, including `--sensitive` and
+`--private`, use HMAC-SHA256 tokens with a random per-install salt stored in
+`task-memory.salt`; raw text and raw tokens never persist. Hashes and salt are
+local state, not anonymised public data, and are never federation inputs.
+
+## Shape confidence and an optional local classifier
+
+Plans report `shape_confidence: "high"|"low"` and `shape_source`. A default
+fallback or weak cue produces `suggest: "pass --shape <shape> --tier <tier>"`.
+Confidence describes heuristic strength, not a calibrated probability. Feature
+delivery such as "build the trial SMS notices feature with a signed redirect
+route" classifies as `coding:implement`, even when the spec mentions digests.
+
+The same feature-build cue floors estimated complexity at **`moderate`** (the
+enum's medium tier). Three or more distinct component kinds — route, endpoint,
+migration, webhook, worker, test or flag — raise the floor to **`hard`**. Plurals
+and repeated mentions count once. Both the built-in estimator and taskgauge
+receive this floor; stronger estimates and explicit `--tier` overrides win.
+The SMS sentence above therefore plans as `coding:implement:moderate`.
+
+Classification is deterministic by default. `--llm-shape` enables the existing
+`local-llm ask --class reflex` path for low-confidence cases; `--no-llm` remains
+supported. Errors or off-enum LLM replies keep the deterministic result and low
+confidence. An explicit `--shape` wins over both paths. The shape vocabulary
+and federation schema are unchanged.
+
 ## The arms and their cost classes
 
-Each arm declares a **cost class**, which is what the bandit is really trading
-off against quality:
+Each arm declares a **cost class**. After shape, health, sensitivity and quota
+gates, paid arms are excluded whenever any `included`, `free` or `local` arm
+survives. Plans list these exclusions in `removed_by_cost`. This is a hard
+eligibility rule, independent of Thompson draws, priors or quota adjustments.
+An explicit `--pool` pin remains authoritative, and `--no-quota` does not
+disable this cost rule. Custom arms follow their configured cost class.
 
-- `included` — **claude**: subscription quota you have already paid for.
-- `paid` — **codex**, **kimi**: metered API spend.
+- `included` — **claude**, **codex**, **kimi**: subscription quota already paid
+  for. Codex and Kimi defaults now use this class; overrides explicitly marked
+  `cost = "paid"` are treated as metered backstops.
 - `paid` — **deepseek**: the **backstop**, via the `deepseek` Claude Code
   skill — pay-as-you-go credit Jon tops up. Coding shapes dispatch to
   `deepseek code --dir . --model deepseek-v4-pro`; batch shapes to `deepseek
-  ask - --model deepseek-flash` with the task on stdin. Its prior sits at `Beta(4,6)` in coding cells —
-  below every favoured arm and below `claude`'s long-horizon fallback, so it
-  **never wins while an included pool is healthy** (it costs real money), but
-  above the unfavoured `Beta(2,8)`, so when quota gating has removed
-  `claude`/`codex`/`kimi` the work lands on DeepSeek **ahead of failing**.
-  Batch cells keep it unfavoured — `local-batch` is free and always available.
+  ask - --model deepseek-flash` with the task on stdin. Its prior remains
+  `Beta(4,6)` in coding cells, but **eligibility**, not that prior, guarantees
+  it never wins while included, free or local capacity survives. Once those
+  alternatives are unavailable, DeepSeek is eligible ahead of failing.
   Gating is the credit balance, not a rate window: quotamax's `backstop`
   block (`available`/`low`), falling back to the skill's `balance --json`
   (exit 0 = eligible) when quotamax predates it. Fail-closed: an
@@ -315,7 +444,9 @@ machine (opt-in, off by default) is exactly:
 ```
 
 **Never** leaves: prompts, diffs, file paths, repo names, task titles, item
-content — enforced at assert level by `assert_payload_clean` (record keys are
+content, task-memory hashes, salt, decision IDs or neighbour pseudo-counts —
+the memory store is separate from federation. Routing record fields remain
+enforced at assert level by `assert_payload_clean` (record keys are
 fixed; contexts must be closed-enum cells; arm/model identifiers cannot contain
 whitespace or path separators). `route federate export` exists so you can see
 exactly what would leave before anything does.
@@ -331,8 +462,8 @@ and eventually dominate.
 ## Development
 
 ```sh
-python -m venv .venv && .venv/bin/pip install -e ".[dev]"
-.venv/bin/python -m pytest
+uv sync --extra dev
+uv run pytest -q -p no:cacheprovider
 ```
 
 Tests are deterministic: no network, no real dispatch, no money spent.

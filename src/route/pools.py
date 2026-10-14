@@ -163,7 +163,7 @@ def _default_pools() -> dict[str, Pool]:
             shapes=_CODING,
             needs_repo=True,
             remote=True,
-            cost="paid",
+            cost="included",  # subscription quota, not pay-as-you-go
             strength=strength("codex"),
             dispatch="codex exec {task}",
             probe="codex exec {task}",
@@ -174,7 +174,7 @@ def _default_pools() -> dict[str, Pool]:
             name="kimi",
             shapes=_CODING + ("research", "writing"),
             remote=True,
-            cost="paid",
+            cost="included",  # subscription quota, not pay-as-you-go
             strength=strength("kimi"),
             dispatch="kimi -p {task}",
             probe="kimi -p {task}",

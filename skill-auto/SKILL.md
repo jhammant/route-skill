@@ -16,8 +16,8 @@ quota gating, lets the bandit pick among the surviving arms, prints the JSON
 plan, and dispatches straight away — to `codex`, `kimi`, `deepseek`, or
 `local-llm` via their existing skills, or `stay` when the task belongs here.
 
-`deepseek` is the paid backstop: it never wins while an included pool is
-healthy, but when quota gating has removed `claude`/`codex`/`kimi` it is
+`deepseek` is the paid backstop: it is only eligible when no included, free or
+local arm survives (a hard rule), but when quota gating has removed `claude`/`codex`/`kimi` it is
 chosen ahead of failing, so work always has somewhere to go. It is gated by
 its credit balance (quotamax's `backstop` block, or the skill's
 `balance --json` as fallback) and vetoed by `--sensitive`/`--private` like
@@ -29,11 +29,16 @@ runs GPT-6 Astra. Pass `--tier hard` when a task is plainly hours-long but
 the cue did not fire.
 
 The exit code records `completed` or `failed` on its own. Afterwards, **record
-whether the diff was kept** so the router learns the signal it cannot see:
+how much fixing it needed**, using the `decision_id` from the plan, so the router
+learns the signal it cannot see:
 
 ```sh
-route outcome --shape <shape> --tier <tier> --arm <arm> --outcome <accepted|verified|failed>
+route settle --decision <id> --fix-passes <N> --merged    # or --abandoned
 ```
+
+The router also nudges toward pools with quota about to expire unused and away
+from pools on course to run out (`quota_adjustment` in the plan). A plan with
+`shape_confidence: low` should be re-run with its `suggest`ed `--shape/--tier`.
 
 Rules that still apply in auto mode:
 

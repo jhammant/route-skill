@@ -18,7 +18,7 @@ MIT, matching the rest of the stack.
 
 Routing is **not** a single score. It is a filter chain, then a bandit.
 
-```
+```text
 task text
    │
    ├─▶ 1. SHAPE      closed vocabulary — what kind of work is this?
@@ -40,16 +40,35 @@ cosmetic: the shape becomes the federation context key, and a free-text key woul
 leak task content. It also makes k-anonymity reachable — a bounded vocabulary
 accumulates contributors per cell instead of a long tail of singletons.
 
-```
+```text
 coding:implement  coding:refactor  coding:test  coding:debug  coding:review
 batch:classify    batch:summarize  batch:extract  batch:embed
 research          writing          orchestration
 ```
 
-Classify with deterministic heuristics first (verb + object + volume cues); fall back
-to a cheap local LLM call via `local-llm ask --class reflex` when ambiguous. Never
+Classify with deterministic heuristics first (verb + object + volume cues); with
+`--llm-shape`, fall back to a cheap local LLM call via `local-llm ask --class reflex`
+when ambiguous. Never
 invent a shape outside the enum — unknown maps to `orchestration`, which never routes
 away. Adding a shape is a **schema version bump**, not a config tweak.
+
+#### Shape confidence
+
+`classify_with_confidence` reports `shape`, `confidence` (`high` or `low`) and
+`source` (`deterministic`, `fallback` or `llm`). `classify_shape` retains the
+shape-only API. Unmatched text and weak noun cues (for example "parser coverage"
+or "daily digest for all teams") report low confidence. The plan includes
+`shape_confidence`, `shape_source`, and, when low,
+`suggest: "pass --shape <shape> --tier <tier>"`. This is heuristic confidence,
+not a probability. Explicit `--shape` reports high confidence with source
+`explicit` and bypasses classification.
+
+Deterministic classification is the default; `--no-llm` is retained. An opt-in
+LLM can resolve both defaults and weak matches. Failed or off-enum responses
+retain the low-confidence deterministic result. Feature-building intent takes
+precedence over incidental batch vocabulary: "build the trial SMS notices
+feature with a signed redirect route" is `coding:implement`, as is a digest
+feature build with volume words. Actual batch summaries remain `batch:summarize`.
 
 ### 2. Vetoes — hard gates, not scores
 
@@ -71,24 +90,47 @@ Vetoes are evaluated before anything else and short-circuit to `claude`.
 not a code change** (`~/.config/route/pools.toml`). Each arm declares the shapes it
 accepts, whether it needs a repo, whether it is remote, and its cost class.
 
-Shipped arms: `claude`, `codex`, `kimi`, `local-batch`, `local-agent`.
+Shipped arms: `claude`, `codex`, `kimi`, `deepseek`, `local-batch`, `local-agent`, `free`.
 
 Quota comes from `quotamax agent --json`. An arm whose pool reports `critical` headroom
 is **removed from eligibility**, not penalised. Quota gates *availability*; the bandit
 decides *quality* among what's available. Keeping these separate is what stops a
 cheap-but-bad pool winning just because it's idle.
 
+After shape/health, sensitivity and quota gating, apply the **paid backstop
+rule**: if any surviving arm has cost `included`, `free` or `local`, remove
+every `paid` arm. A lower Beta prior cannot enforce this rule because random
+Thompson draws overlap. `GateResult.removed_by_cost` and the plan's
+`removed_by_cost` list explain these removals separately from quota failures.
+Codex and Kimi defaults are `included` subscription pools alongside Claude;
+DeepSeek remains `paid` metered capacity. Configured arms follow their declared
+class. A surviving local/free pool also keeps paid capacity out after all
+subscriptions are exhausted; an unhealthy or wrong-shape pool does not.
+Explicit pool pins still short-circuit inference. `--no-quota` skips headroom
+checks but retains the paid backstop rule.
+
 ### 5. Select — the bandit, and why there is no "switch to adaptive"
 
 `router.py` wraps `banditry`. **One bandit per context cell**, named
 `route:{shape}:{tier}` — so `coding:refactor:hard` learns independently of
-`batch:classify:trivial`. Arms are the pools. `banditry`'s `select(eligible=[...])`
-takes the survivors of steps 2–4 directly.
+`batch:classify:trivial`. Arms are the pools. `Router.select` takes the survivors
+of steps 2–4 directly. Its enriched Thompson draw uses the same Beta counts as
+banditry, with the decision-local adjustments below.
 
 Complexity tier comes from [`taskgauge`](https://github.com/jhammant/taskgauge)
 (`estimateComplexity` → `trivial|simple|moderate|hard|open-ended`), shelled out via
 `node`. **Optional** — ship a built-in lexical fallback so the published tool works
 standalone.
+
+Apply feature-build floors after either estimator using the same cue as shape
+classification: at least `moderate` (the enum's medium tier), or `hard` when the
+text names at least three distinct component kinds from route, endpoint,
+migration, webhook, worker, test and flag. Normalise case and singular/plural
+forms before counting; repeated mentions are one component kind. Long-horizon
+work still floors at hard, stronger estimates including open-ended are never
+downgraded, and explicit CLI `--tier` overrides remain authoritative. The exact
+task "build the trial SMS notices feature with a signed redirect route" must
+be `coding:implement:moderate` without an override.
 
 Seed each arm's `Beta(alpha, beta)` prior from a static rule table: a pool the rules
 favour for that cell starts at `Beta(8,2)`, one they don't at `Beta(2,8)`. With
@@ -101,6 +143,90 @@ favour for that cell starts at `Beta(8,2)`, one they don't at `Beta(2,8)`. With
 
 There is deliberately **no flag, threshold, or phase-2 migration** for "become
 adaptive". That is the entire reason to use a bandit rather than bolt learning on later.
+
+#### Signed quota adjustment: surplus and pressure
+
+Retain weekly windows from the same `quotamax agent --json` and
+`quotamax providers --json` snapshots used by headroom gating. Agent windows use
+`weekly.percentUsed` and `resetsInMinutes`; provider limits use `percent` and
+`resetsInMinutes` or `resetsAt`. No additional quota probe is needed for selection.
+
+For a valid seven-day window with positive elapsed time and time until reset,
+project the fraction of total quota consumed by reset at the current pace.
+Surplus requires at least two days remaining; pressure applies until reset:
+
+```text
+elapsed_fraction = 1 - resetsInMinutes / 10080
+used_fraction = percentUsed / 100
+projected_end = used_fraction / elapsed_fraction
+surplus_fraction = clamp(1 - projected_end, 0, 1)
+overuse_fraction = clamp(projected_end - 1, 0, 1)
+if elapsed_minutes < 1440:
+    surplus_fraction = max(max(0, elapsed_fraction - used_fraction), 0.5 * surplus_fraction)
+    overuse_fraction = max(max(0, used_fraction - elapsed_fraction), 0.5 * overuse_fraction)
+if resetsInMinutes < 2880:
+    surplus_fraction = 0
+if headroom == "constrained":
+    overuse_fraction = max(overuse_fraction, 0.5)
+k = clamp(k, 0, 0.15)
+adjustment = -k * overuse_fraction if overuse_fraction > 0 else k * surplus_fraction
+selection_value = sampled_beta_value + adjustment
+```
+
+Before one full day has elapsed, use the larger of the old pace delta and half
+the projected surplus or overuse to damp early noise symmetrically. At exactly
+one elapsed day, use the full projection. Zero elapsed time returns zero
+projection rather than dividing by zero.
+With 7% used and 6.2 days remaining, projected end usage is 61.25%, unused quota
+is 38.75%, damped surplus is 19.375%, and the default bonus is 0.0290625.
+With 28% used after 0.7 days, projected end usage is 280%, overuse caps at 100%,
+first-day damping gives 50%, and the default pressure adjustment is −0.075.
+
+The pure `quota_adjustment` function uses no projection for missing, non-finite,
+out-of-range or expired data. Constrained headroom still imposes at least
+`0.5 * k` pressure: it may represent a binding session limit even if weekly
+quota is under-used. Pressure takes precedence over surplus. `[surplus] k =
+0.15` in `config.toml` still controls both directions; zero disables both.
+Adjustments are bounded to [−0.15, +0.15] and never remove an arm. Only surviving
+candidates may receive them.
+Vetoes short-circuit selection; sensitive-local preference narrows candidates
+before bonuses or memory. Neither can reintroduce a quota-removed arm.
+Plans report `quota_adjustment: {arm: signed_value}` including zeros, plus
+`+surplus:<chosen>` or `-pressure:<chosen>` in `why` when applicable.
+`surplus_bonus` is a deprecated alias containing the same signed map for one
+release; the old Router keyword is also retained as an alias, with the new
+keyword taking precedence if both are supplied. Adjustments are not observations.
+
+#### Nearest-neighbour task memory
+
+Keep a separate `task-memory.json` under `ROUTE_STATE_DIR`, bounded to 2,000
+decision rows including pending decisions, dropping the oldest on append.
+Each row stores `decision_id`, tokens, shape, tier, arm and final `score` (null
+while unresolved). A later grade updates that row in place, never appends a
+duplicate; settlement of an evicted decision does not resurrect its memory.
+Legacy accepted/failed events resolve to 1/0. Completed/verified alone do not
+claim a final quality score.
+
+Normalise with Unicode NFKC, case folding, word splitting, duplicate removal
+and a small fixed stop-word set. Persist HMAC-SHA256 hashes of these tokens for
+**every** task, including sensitive/private tasks, using a random 32-byte
+per-install salt in `task-memory.salt`. Memory and salt files are owner-only;
+task text and plaintext tokens are never saved. Equal tokens still compare
+within an installation; another installation has unrelated hashes.
+
+Find up to five highest-Jaccard neighbours of the same shape (tiers may differ),
+with similarity ≥ 0.25 and an eligible, selectable arm. Ignore pending rows.
+For each neighbour, temporarily add to its arm's posterior:
+
+```text
+weight = 0.5 * similarity
+alpha += weight * score
+beta  += weight * (1 - score)
+```
+
+Plan JSON exposes only `neighbours: [{arm, score, similarity}]`. These additions
+exist only for the current draw; persistent counts and federation never see
+them. Memory, salt and hashes are local private state, not anonymous public data.
 
 ### 6–7. Dispatch, outcome, escalation
 
@@ -115,6 +241,48 @@ rank by the signal that is hardest to fake):
 | `accepted` | diff kept, no escalation needed — **the real signal** |
 | `verified` | tests passed |
 | `completed` | ran without erroring |
+
+#### Graded outcomes and settlement
+
+`route outcome` accepts exactly one of `--outcome`, `--score`, `--fix-passes`,
+or standalone `--abandoned` (`--rewritten` alias). Abandonment may accompany
+fix passes but not an explicit score or legacy outcome. Validate finite scores
+in [0, 1], non-negative integer fix passes, closed-enum shapes and tiers.
+
+Graded quality is one fractional Beta observation: alpha gains `score`, beta
+gains `1 - score`. Fix passes use `max(0, 1 - 0.3 * N)`: 0/1/2/3/4+ passes
+give 1.0/0.7/0.4/0.1/0.0. Abandoned work or a supervising agent's rewrite scores
+0.0. Store `final_score` on the decision; repeated identical scores are no-ops.
+Corrections change the existing accepted reward by `new_score - old_score`.
+If the old feedback was ungraded accepted, its old reward is 1; otherwise 0.
+This replaces plain completed feedback without creating a second trial.
+
+Legacy cumulative events are retained and de-duplicated per decision. After a
+grade, a legacy accepted event can update metadata but cannot overwrite the
+grade or add reward. An exit-code failure and subsequent repeated failed reports
+likewise share the existing trial. No-ID manual legacy event calls remain
+supported; a manual grade with no matching decision creates one seeded trial.
+
+Every plan prints a UUID `decision_id`, saved in `decisions.jsonl`. Use:
+
+```bash
+route settle --decision <id> --fix-passes 1 --merged
+route settle --decision <id> --abandoned
+route outcome --decision <id> --score 0.7
+```
+
+`--merged` records accepted/verified/completed metadata while retaining the
+graded reward. It is mutually exclusive with `--abandoned`. Outcome commands
+can alternatively resolve the latest decision matching `--shape`, `--tier`
+and `--arm`; IDs are preferred for delayed or interleaved feedback. Unknown
+IDs and conflicting identity flags fail without updating counts. Pre-ID rows
+receive an ID when first settled; historical counts are not migrated.
+
+CLI plans, declined dispatches and `stay` decisions are pending rather than
+negative observations. A dispatch records one trial before launch; settlement
+of externally executed work records it if missing. Completed and verified
+events alone keep their legacy reward semantics. Settlement reports caller
+verification; it does not run tests, merge changes or dispatch agents itself.
 
 **Escalation ladder, capped at one hop.** On failed verification, retry once on the
 next-stronger eligible arm. Escalating away from an arm records a *negative* outcome
@@ -131,7 +299,7 @@ as its own arm: that would split the bandit's evidence about Kimi's *quality* ac
 arms that share one underlying model, and neither would learn properly. The bandit picks
 `kimi`; a separate concurrency planner then decides *how many*.
 
-```
+```text
 n = min(units, pool.parallel_limit, headroom_cap)
 ```
 
@@ -171,7 +339,7 @@ tasks you happen to have; and **a newly added model or pool starts on a guessed
 prior with no way to earn a better one except by being given real work and
 hoping**. `benchmark` closes all three by generating evidence on demand.
 
-```
+```text
 route benchmark                       # every eligible arm, standard suites
 route benchmark --arm local-agent     # one arm (e.g. a model just downloaded)
 route benchmark --suite instruct      # one suite
@@ -236,7 +404,7 @@ first run or the data is worthless.
 prior / posterior), outcome events, wall-clock, tokens, escalations. Plus, for local
 runs, `(model, quant, context_length, hardware) → tok/s, items/s, load seconds, peak GB`.
 
-```
+```text
 route stats                    # per-cell: obs, success rate, prior vs posterior
 route stats --arm codex        # how is one pool doing, by shape
 route stats --throughput       # local model performance table
@@ -259,7 +427,11 @@ Leaves the machine (opt-in, off by default):
  "model":"gpt-6-astra", "alpha":14, "beta":3}
 ```
 
-**Never** leaves: prompts, diffs, file paths, repo names, task titles, item content.
+**Never** leaves: prompts, diffs, file paths, repo names, task titles, item content,
+decision IDs, task-memory tokens/hashes, salt or neighbour pseudo-observations.
+Federation reads only persistent bandit counts, not the separate memory store.
+Record keys and the federation schema are unchanged; real graded alpha/beta
+counts may be fractional.
 
 Two datasets, deliberately separate because their sensitivity differs:
 
@@ -301,7 +473,7 @@ by CI from submitted counts. Zero infra, zero hosting cost, auditable, forkable,
 no central database of user behaviour to become a liability. Graduate to
 `claude-history-cloud` only if volume demands it.
 
-```
+```text
 route federate export        # what WOULD be shared — print it, share nothing
 route federate push          # opt-in contribute
 route federate pull          # refresh community priors
@@ -313,13 +485,15 @@ would leave their machine before anything does.**
 
 ## Module layout
 
-```
+```text
 src/route/
   shapes.py       closed-vocabulary shape classification
   complexity.py   taskgauge bridge + built-in fallback scorer
   pools.py        arm registry (config-driven)
   eligibility.py  vetoes + quota gating
   router.py       banditry wrapper, one bandit per context cell
+  surplus.py      bounded signed quota adjustments + quota-window extraction
+  memory.py       bounded local hashed-token nearest-neighbour memory
   outcomes.py     outcome -> reward events, escalation ladder
   stats.py        local stats + reporting
   federate.py     export / push / pull / status

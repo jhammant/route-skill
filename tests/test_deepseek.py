@@ -1,10 +1,8 @@
 """The 'deepseek' arm: the paid backstop.
 
-DeepSeek is pay-as-you-go real money, so the rule-table prior never lets it
-beat a healthy included pool — but when quota gating has removed claude,
-codex and kimi, work must still have somewhere to go: deepseek is chosen
-ahead of failing. Deterministic: MeanRNG picks the best posterior mean;
-balance probes are scripted fakes — no network, no money.
+DeepSeek is pay-as-you-go real money, so eligibility excludes it whenever
+included/free/local capacity survives. It becomes available only when those
+arms are unavailable. Balance probes are scripted fakes — no network, no money.
 """
 
 from __future__ import annotations
@@ -118,10 +116,11 @@ def test_critical_backstop_removes_deepseek(pools):
     assert "deepseek" in result.removed_by_quota
 
 
-def test_no_quota_data_leaves_deepseek_eligible(pools):
-    """--no-quota passes an empty dict: gating is skipped entirely."""
+def test_no_quota_data_still_enforces_the_backstop_rule(pools):
+    """--no-quota skips headroom checks, not the cost-class rule."""
     result = gate("implement a handler", "coding:implement", pools, quota={})
-    assert "deepseek" in result.eligible
+    assert "deepseek" not in result.eligible
+    assert result.removed_by_cost == ["deepseek"]
 
 
 def test_parse_quota_ignores_the_backstop_block():
@@ -150,26 +149,28 @@ def test_fetch_quota_uses_the_balance_fallback_without_a_backstop_field(monkeypa
 # -- the backstop rule ----------------------------------------------------------
 
 
-def test_all_healthy_means_deepseek_is_eligible_but_never_chosen(router, pools):
+def test_all_healthy_means_deepseek_is_ineligible(router, pools):
     result = gate("refactor the parser into smaller functions", "coding:refactor", pools,
                   quota={"claude": "ok", "codex": "ok", "kimi": "ok", "deepseek": "ok"})
-    assert "deepseek" in result.eligible
+    assert "deepseek" not in result.eligible
+    assert result.removed_by_cost == ["deepseek"]
     chosen = router.select("coding:refactor", "moderate", result.eligible)
     assert chosen in ("claude", "codex")  # the favoured, already-paid-for pools
     assert chosen != "deepseek"
 
 
-def test_backstop_chosen_when_quota_removes_every_other_remote_pool(router, pools):
-    """claude critical, codex removed, kimi removed -> deepseek, not failure."""
+def test_local_arm_keeps_backstop_out_after_subscriptions_are_exhausted(router, pools):
     result = gate("refactor the parser into smaller functions", "coding:refactor", pools,
                   quota=ALL_CRITICAL)
     assert sorted(result.removed_by_quota) == ["claude", "codex", "kimi"]
-    assert result.eligible == ["deepseek", "local-agent"]  # registry order
-    assert router.select("coding:refactor", "moderate", result.eligible) == "deepseek"
+    assert result.eligible == ["local-agent"]
+    assert result.removed_by_cost == ["deepseek"]
+    assert router.select("coding:refactor", "moderate", result.eligible) == "local-agent"
 
 
-def test_backstop_also_covers_long_horizon_cells(router, pools):
+def test_backstop_also_covers_long_horizon_cells(router, pools, monkeypatch):
     """hard/open-ended cells: codex leads, claude falls back, deepseek last."""
+    monkeypatch.setattr("route.eligibility.subcommand_available", lambda spec: False)
     result = gate("refactor the parser into smaller functions", "coding:refactor", pools,
                   quota=ALL_CRITICAL)
     assert router.select("coding:refactor", "hard", result.eligible) == "deepseek"
@@ -184,6 +185,7 @@ def test_cli_plan_lands_on_the_backstop(monkeypatch, capsys):
     from tests.conftest import MeanRNG
 
     monkeypatch.setattr("route.cli._build_router", lambda: Router(rng=MeanRNG()))
+    monkeypatch.setattr("route.eligibility.subcommand_available", lambda spec: False)
     monkeypatch.setattr("route.cli.fetch_quota", lambda *a, **k: dict(ALL_CRITICAL))
     rc = main(["--no-llm", "--plan-only", "--shape", "coding:refactor", "--tier", "moderate",
                "refactor the parser into smaller functions"])

@@ -6,7 +6,7 @@ Deterministic: scripted runners, no network, no real dispatch, no money.
 from __future__ import annotations
 
 import pytest
-from conftest import MeanRNG
+from tests.conftest import MeanRNG
 
 from route.benchmark import (
     BENCHMARK_DISCOUNT,

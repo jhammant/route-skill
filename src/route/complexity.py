@@ -10,7 +10,12 @@ from __future__ import annotations
 import re
 import subprocess
 
+from .shapes import _is_feature_build
+
 TIERS: tuple[str, ...] = ("trivial", "simple", "moderate", "hard", "open-ended")
+
+# Count distinct component kinds, not repeated mentions or plural variants.
+_COMPONENT_RE = re.compile(r"\b(route|endpoint|migration|webhook|worker|test|flag)s?\b", re.I)
 
 #: Long-horizon cues: the task is many steps over a long wall-clock, not one
 #: thing. This is a separate axis from difficulty — "fix every failing test
@@ -103,16 +108,20 @@ def _estimate_lexical(text: str) -> str:
 def estimate_complexity(text: str, *, use_taskgauge: bool = True) -> str:
     """Best-available tier for ``text``; always a member of ``TIERS``.
 
-    A long-horizon cue floors the tier at ``hard`` whichever estimator
-    produced it: taskgauge scores difficulty, not duration, and a cheap
-    but hours-long job must still land in the cells that favour arms
-    built for it. ``open-ended`` is left alone — it is already above.
+    Feature builds floor at ``moderate`` (the enum's medium tier), or ``hard``
+    when at least three distinct component kinds are named. Long-horizon
+    tasks also floor at ``hard``. Floors apply to either estimator without
+    downgrading a stronger estimate, including ``open-ended``.
     """
     tier = None
     if use_taskgauge:
         tier = _estimate_taskgauge(text)
     if tier is None:
         tier = _estimate_lexical(text)
-    if tier != "open-ended" and is_long_horizon(text):
-        return "hard"
-    return tier
+    floor = "trivial"
+    if _is_feature_build(text):
+        components = {match.group(1).lower() for match in _COMPONENT_RE.finditer(text)}
+        floor = "hard" if len(components) >= 3 else "moderate"
+    if is_long_horizon(text):
+        floor = "hard"
+    return max((tier, floor), key=TIERS.index)

@@ -13,11 +13,12 @@ from __future__ import annotations
 
 import json
 import time
+import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from .router import REWARD_EVENT, Router, parse_cell
-from .storage import state_dir
+from .storage import atomic_write, state_dir
 
 
 @dataclass
@@ -41,6 +42,9 @@ class Decision:
     #: Percentages are coarse and shared with whatever else ran meanwhile,
     #: so a single delta is noisy; the per-arm mean in `stats --quota` is not.
     quota: dict | None = None
+    decision_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    impression_recorded: bool = False
+    final_score: float | None = None
 
 
 @dataclass
@@ -85,25 +89,46 @@ class Stats:
     def record_decision(self, decision: Decision) -> None:
         _append_jsonl(self.decisions_path, asdict(decision))
 
-    def record_outcome_events(self, events: list[str]) -> None:
-        """Attach outcome events to the most recent decision."""
-        rows = _read_jsonl(self.decisions_path)
+    def decision(self, decision_id: str) -> dict:
+        for row in self.decisions():
+            if row.get("decision_id") == decision_id:
+                return row
+        raise ValueError(f"unknown decision: {decision_id}")
+
+    def identify(self, decision: dict) -> dict:
+        """Assign an ID when settling a pre-ID log row, retaining its position."""
+        if decision.get("decision_id"):
+            return decision
+        rows = self.decisions()
+        for row in reversed(rows):
+            if row == decision:
+                row["decision_id"] = uuid.uuid4().hex
+                atomic_write(self.decisions_path, "".join(json.dumps(r, sort_keys=True) + "\n" for r in rows))
+                return row
+        raise ValueError("decision no longer exists")
+
+    def record_outcome_events(self, events: list[str], *, decision_id: str | None = None) -> None:
+        """Attach events to a specific decision, or the most recent for legacy callers."""
+        self.annotate(decision_id, events=events)
+
+    def annotate(self, decision_id: str | None, *, events: list[str] = (), **fields) -> None:
+        rows = self.decisions()
         if not rows:
+            if decision_id is not None:
+                raise ValueError(f"unknown decision: {decision_id}")
             return
-        rows[-1]["outcome_events"] = sorted(set(rows[-1].get("outcome_events", [])) | set(events))
-        self.decisions_path.write_text(
-            "".join(json.dumps(r, sort_keys=True) + "\n" for r in rows), encoding="utf-8"
-        )
+        target = rows[-1] if decision_id is None else next(
+            (r for r in rows if r.get("decision_id") == decision_id), None)
+        if target is None:
+            raise ValueError(f"unknown decision: {decision_id}")
+        target.update(fields)
+        if events:
+            target["outcome_events"] = sorted(set(target.get("outcome_events", [])) | set(events))
+        atomic_write(self.decisions_path, "".join(json.dumps(r, sort_keys=True) + "\n" for r in rows))
 
     def annotate_last(self, **fields) -> None:
         """Set fields (wall clock, quota cost) on the most recent decision."""
-        rows = _read_jsonl(self.decisions_path)
-        if not rows:
-            return
-        rows[-1].update(fields)
-        self.decisions_path.write_text(
-            "".join(json.dumps(r, sort_keys=True) + "\n" for r in rows), encoding="utf-8"
-        )
+        self.annotate(None, **fields)
 
     def record_throughput(self, sample: Throughput) -> None:
         _append_jsonl(self.throughput_path, asdict(sample))

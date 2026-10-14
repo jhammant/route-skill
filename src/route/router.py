@@ -19,12 +19,15 @@ observations.
 from __future__ import annotations
 
 from importlib import resources
+import random
 from pathlib import Path
 from typing import Iterable
 
 from banditry import Bandit
 
 from .storage import JsonStorage, config_dir
+from .shapes import SHAPES
+from .complexity import TIERS
 
 try:
     import tomllib
@@ -98,10 +101,15 @@ def cell_name(shape: str, tier: str) -> str:
 
 def parse_cell(key: str) -> tuple[str, str] | None:
     """'route:coding:refactor:hard[:event]' -> ('coding:refactor', 'hard')."""
-    parts = key.split(":")
-    if len(parts) < 4 or parts[0] != "route":
+    if not key.startswith("route:"):
         return None
-    return f"{parts[1]}:{parts[2]}", parts[3]
+    rest = key[len("route:"):]
+    for shape in SHAPES:
+        if rest.startswith(f"{shape}:"):
+            tier = rest[len(shape) + 1:].split(":", 1)[0]
+            if tier in TIERS:
+                return shape, tier
+    return None
 
 
 class Router:
@@ -120,7 +128,7 @@ class Router:
         # Discounted community/team counts, used as extra prior strength:
         # {cell: {arm: (alpha, beta)}}. Local observations grow past it.
         self.community = community or {}
-        self._rng = rng
+        self._rng = rng if rng is not None else random.Random()
 
     # -- bandit construction ----------------------------------------------
 
@@ -224,6 +232,9 @@ class Router:
         *,
         record_impression: bool = True,
         prefer: Iterable[str] | None = None,
+        neighbours: list[dict] | None = None,
+        quota_adjustment: dict[str, float] | None = None,
+        surplus_bonus: dict[str, float] | None = None,
     ) -> str:
         eligible = list(eligible)
         if prefer:
@@ -236,7 +247,32 @@ class Router:
             if preferred:
                 eligible = preferred
         cell = cell_name(shape, tier)
+        if not eligible:
+            raise ValueError("selection needs at least one eligible arm")
         self._ensure_seeded(shape, cell, eligible)
+        # Keep the old keyword as an alias for one release. The new name wins
+        # if both are supplied; adjustments are now signed.
+        adjustments = quota_adjustment if quota_adjustment is not None else surplus_bonus or {}
+        if neighbours or adjustments:
+            # These are decision-local adjustments, never stored or federated.
+            posterior = self.posterior(shape, tier)
+            for neighbour in neighbours or []:
+                arm = neighbour["arm"]
+                if arm not in eligible:
+                    continue
+                weight = 0.5 * neighbour["similarity"]
+                score = neighbour["score"]
+                a, b = posterior[arm]
+                posterior[arm] = (a + weight * score, b + weight * (1 - score))
+
+            def sample(arm: str) -> float:
+                adjustment = adjustments.get(arm, 0.0)
+                return self._rng.betavariate(*posterior[arm]) + min(0.15, max(-0.15, adjustment))
+
+            chosen = max(eligible, key=sample)
+            if record_impression:
+                self.record_impression(shape, tier, chosen)
+            return chosen
         bandit = self._bandit(cell, eligible)
         return bandit.select(eligible=eligible, record_impression=record_impression)
 

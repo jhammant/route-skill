@@ -6,6 +6,12 @@
 # crossover to adaptive is automatic and per-cell. There is deliberately no
 # flag or threshold for "become adaptive".
 #
+# Rules are keyed by shape, or by "shape:tier" to override one tier of a
+# shape. Tier-scoped rules win for that cell; every other tier falls back
+# to the shape rule. A rule is a list of favoured arms, or a table of
+# explicit per-arm Beta priors when one arm should lead and another stay
+# the fallback.
+#
 # Changing the shape vocabulary is a SCHEMA BUMP, not a config tweak.
 
 schema = 1
@@ -13,11 +19,17 @@ favoured = [8, 2]
 unfavoured = [2, 8]
 
 [rules]
-"coding:implement" = ["claude", "codex"]
-"coding:refactor"  = ["claude", "codex"]
-"coding:test"      = ["codex", "kimi"]
-"coding:debug"     = ["claude", "codex"]
-"coding:review"    = ["kimi", "claude"]
+# deepseek is the BACKSTOP and costs real money, so in coding cells it sits
+# at Beta(4, 6): below every favoured arm (it never beats a healthy included
+# pool) and below claude's hard-tier fallback, but above the unfavoured
+# Beta(2, 8) — when quota gating has removed claude/codex/kimi, work lands
+# on deepseek ahead of the local model or failing outright. Batch cells keep
+# it unfavoured: local-batch is free and always available.
+"coding:implement" = { claude = [8, 2], codex = [8, 2], deepseek = [4, 6] }
+"coding:refactor"  = { claude = [8, 2], codex = [8, 2], deepseek = [4, 6] }
+"coding:test"      = { codex = [8, 2], kimi = [8, 2], deepseek = [4, 6] }
+"coding:debug"     = { claude = [8, 2], codex = [8, 2], deepseek = [4, 6] }
+"coding:review"    = { kimi = [8, 2], claude = [8, 2], deepseek = [4, 6] }
 "batch:classify"   = ["local-batch"]
 "batch:summarize"  = ["local-batch"]
 "batch:extract"    = ["local-batch"]
@@ -25,3 +37,22 @@ unfavoured = [2, 8]
 "research"         = ["kimi", "claude"]
 "writing"          = ["claude", "kimi"]
 "orchestration"    = ["claude"]
+
+# Long-horizon coding favours Codex on GPT-6 Astra (2026-09): it leads on
+# Terminal-Bench 4.0 (57.7 vs Fable 5.1 at 55.8) and keeps searchable notes
+# across context windows, so it stays coherent over hours-long jobs. On
+# single-shot coding it ties or trails, so the shape rules above are
+# unchanged. `hard` is also where the long-horizon cue floors a task.
+#
+# These are explicit per-arm priors: codex leads at Beta(8, 2); claude sits
+# at Beta(5, 5) — the clear fallback when codex is out of quota, still ahead
+# of deepseek's Beta(4, 6) backstop and of kimi and the local model at
+# Beta(2, 8), and easy for evidence to move.
+"coding:implement:hard"       = { codex = [8, 2], claude = [5, 5], deepseek = [4, 6] }
+"coding:implement:open-ended" = { codex = [8, 2], claude = [5, 5], deepseek = [4, 6] }
+"coding:refactor:hard"        = { codex = [8, 2], claude = [5, 5], deepseek = [4, 6] }
+"coding:refactor:open-ended"  = { codex = [8, 2], claude = [5, 5], deepseek = [4, 6] }
+"coding:debug:hard"           = { codex = [8, 2], claude = [5, 5], deepseek = [4, 6] }
+"coding:debug:open-ended"     = { codex = [8, 2], claude = [5, 5], deepseek = [4, 6] }
+"coding:test:hard"            = { codex = [8, 2], claude = [5, 5], deepseek = [4, 6] }
+"coding:test:open-ended"      = { codex = [8, 2], claude = [5, 5], deepseek = [4, 6] }

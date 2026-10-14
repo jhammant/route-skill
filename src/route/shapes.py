@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import re
 import subprocess
+from dataclasses import dataclass
 
 SCHEMA_VERSION = 1
 
@@ -89,8 +90,24 @@ _LLM_PROMPT = (
 )
 
 
+# A feature build: a build verb plus at least two delivery cues. Summarise or
+# classify words inside such a spec ("digest", "summarising") describe the
+# feature, not the task, so this beats the batch rules.
+_BUILD_VERB_RE = re.compile(r"\b(implement|build|scaffold|develop)\b", re.I)
+_FEATURE_RE = re.compile(r"\b(feature|endpoint|signed redirect route)\b", re.I)
+_DELIVERY_CUE_RE = re.compile(
+    r"\b(migrations?|tests?|branch|typecheck|endpoints?|schema|commit|pull request)\b", re.I)
+
+
+def _is_feature_build(text: str) -> bool:
+    cues = {m.group(0).lower().rstrip("s") for m in _DELIVERY_CUE_RE.finditer(text)}
+    return bool(_BUILD_VERB_RE.search(text)) and (len(cues) >= 2 or bool(_FEATURE_RE.search(text)))
+
+
 def _classify_deterministic(text: str) -> str | None:
     """First-match heuristic pass. Returns None when nothing matches."""
+    if _is_feature_build(text):
+        return "coding:implement"
     for shape, pattern in _RULES:
         if not pattern.search(text):
             continue
@@ -123,20 +140,44 @@ def _classify_llm(text: str, timeout: float = 15.0) -> str | None:
     return answer if answer in SHAPES else None
 
 
-def classify_shape(text: str, *, use_llm: bool = False) -> str:
-    """Map task text onto the closed shape enum.
+@dataclass(frozen=True)
+class ShapeClassification:
+    shape: str
+    confidence: str
+    source: str
 
-    Deterministic heuristics first; an optional cheap local-LLM call breaks
-    ties; anything still unknown maps to ``orchestration`` (which never
-    routes away). The return value is ALWAYS a member of ``SHAPES``.
+
+_STRONG_CUE = {
+    "coding:debug": re.compile(r"\b(debug|fix|why)\b", re.I),
+    "coding:test": re.compile(r"\b(write|add|create|run|test)\b", re.I),
+    "batch:summarize": re.compile(r"\b(summari[sz]\w*|condense\w*|tldr)\b", re.I),
+    "batch:embed": re.compile(r"\b(embed|vectori[sz]\w*)\b", re.I),
+    "batch:classify": re.compile(r"\b(classif\w*|categori[sz]\w*)\b", re.I),
+}
+
+
+def classify_with_confidence(text: str, *, use_llm: bool = False) -> ShapeClassification:
+    """Closed-enum classification with heuristic confidence, not a probability.
+
+    Defaults and ambiguous noun cues are low confidence. When requested, the
+    existing local LLM may resolve either; failed/off-enum replies keep the
+    deterministic result and its low confidence.
     """
     text = (text or "").strip()
     shape = _classify_deterministic(text) if text else None
-    if shape is None and use_llm:
-        shape = _classify_llm(text)
-    if shape not in SHAPES:
-        shape = FALLBACK_SHAPE
-    return shape
+    strong_cue = _STRONG_CUE.get(shape)
+    low = shape is None or (strong_cue is not None and not strong_cue.search(text))
+    if low and use_llm:
+        llm_shape = _classify_llm(text)
+        if llm_shape in SHAPES:
+            return ShapeClassification(llm_shape, "high", "llm")
+    return ShapeClassification(shape or FALLBACK_SHAPE, "low" if low else "high",
+                               "deterministic" if shape else "fallback")
+
+
+def classify_shape(text: str, *, use_llm: bool = False) -> str:
+    """Backward-compatible shape-only interface; always a member of SHAPES."""
+    return classify_with_confidence(text, use_llm=use_llm).shape
 
 
 def is_valid_shape(shape: str) -> bool:

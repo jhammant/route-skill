@@ -16,6 +16,19 @@ from pathlib import Path
 APP_NAME = "route"
 
 
+def atomic_write(path: Path, text: str) -> None:
+    """Replace a local state file atomically, with owner-only permissions."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+
+
 def state_dir() -> Path:
     """Where counts, decision logs and federation state live."""
     override = os.environ.get("ROUTE_STATE_DIR")

@@ -6,25 +6,29 @@ pool reports ``critical`` headroom is REMOVED from eligibility, never merely
 penalised. The bandit decides quality among what survives.
 
 Sensitive data (SPEC-ship section 1) is also an eligibility-stage veto, but
-a different shape: remote third-party pools (``codex``, ``kimi``, ``free``)
-are removed, while ``claude`` AND the local arms survive — local is the only
-arm where sensitive data is safe by construction, and it is PREFERRED at
-selection. If nothing survives, ``gate`` raises rather than falling back to
-a remote arm.
+a different shape: remote third-party pools (``codex``, ``kimi``, ``free``,
+``deepseek``) are removed, while ``claude`` AND the local arms survive —
+local is the only arm where sensitive data is safe by construction, and it is
+PREFERRED at selection. If nothing survives, ``gate`` raises rather than
+falling back to a remote arm.
 """
 
 from __future__ import annotations
 
+import functools
 import json
 import re
+import shutil
 import subprocess
+import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from dataclasses import dataclass, field, replace
 
-from .pools import Pool
+from .pools import DEEPSEEK_SKILL, Pool
 from .shapes import FALLBACK_SHAPE
+from .surplus import parse_weekly
 
 #: The pool every veto short-circuits to.
 VETO_TARGET = "claude"
@@ -59,9 +63,20 @@ _CROSS_REPO_RE = re.compile(
     r"multiple (repos|repositories|directories)|several (repos|directories))\b",
     re.IGNORECASE,
 )
+# Only actual private material counts: key-shaped strings, private-key blocks,
+# `name=<value>` secret assignments, and named categories of personal data.
+# Design vocabulary ("a server secret", "no credentials in code", "password
+# policy") is not a signal — specs say those words without containing any.
 _PRIVATE_RE = re.compile(
-    r"\b(private data|secrets?|credentials?|passwords?|\.env\b|api keys?|"
-    r"personal data|pii|customer data|medical|financial records)\b",
+    r"\.env\b|\b(private data|personal data|pii|customer data|medical|financial records)\b|"
+    r"-----BEGIN [A-Z ]*PRIVATE KEY-----|"
+    r"\b(?:sk|pk|rk)-[A-Za-z0-9_-]{16,}|"
+    r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b|"
+    r"\bgh[pousr]_[A-Za-z0-9]{30,}|"
+    r"\bxox[abprs]-[A-Za-z0-9-]{10,}|"
+    r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,}|"
+    r"\b[\w-]*(?:password|passwd|secret|token|api[_-]?key|credential)s?"
+    r"(?:\s*=\s*[\"']?|\s*:\s*[\"'])(?=[^\s\"']{12,})(?=[^\s\"']*\d)[^\s\"']+",
     re.IGNORECASE,
 )
 _NO_ACCEPTANCE_RE = re.compile(
@@ -124,17 +139,34 @@ def probe_health(url: str, timeout: float = 1.0) -> bool:
         return False
 
 
+@functools.lru_cache(maxsize=None)
+def subcommand_available(spec: str) -> bool:
+    """True when ``<tool> --help`` lists ``<tool> <subcommand>`` (e.g. "local-llm agent").
+
+    Fail-safe: a missing tool or a help failure means unavailable.
+    """
+    tool = spec.split()[0]
+    try:
+        proc = subprocess.run([tool, "--help"], capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return spec in (proc.stdout + proc.stderr)
+
+
 def eligible_for(shape: str, pools: dict[str, Pool]) -> list[str]:
     """Step 3: arms that accept this shape at all, registry order.
 
     An arm with a ``health_url`` (the free-llm proxy) is eligible only while
-    the endpoint answers — an unreachable proxy simply removes the arm.
+    the endpoint answers — an unreachable proxy simply removes the arm. An arm
+    with ``requires_subcommand`` is removed while that subcommand is missing.
     """
     out = []
     for name, pool in pools.items():
         if not pool.accepts(shape):
             continue
         if pool.health_url and not probe_health(pool.health_url):
+            continue
+        if pool.requires_subcommand and not subcommand_available(pool.requires_subcommand):
             continue
         out.append(name)
     return out
@@ -171,32 +203,162 @@ def parse_quota(payload: dict | list) -> dict[str, str]:
     data = payload.get("pools", payload) if isinstance(payload, dict) else {}
     out: dict[str, str] = {}
     for pool, value in data.items():
+        if pool == "backstop":
+            continue  # a structured block, not a headroom string — see deepseek_headroom
         if isinstance(value, dict):
             value = value.get("headroom", value.get("status", "ok"))
         out[str(pool)] = str(value).lower()
     return out
 
 
-def fetch_quota(cmd: tuple[str, ...] = ("quotamax", "agent", "--json"), timeout: float = 5.0) -> dict[str, str]:
-    """Live quota from quotamax. Fail-open: any error means no quota data."""
+def quotamax_available(cmd: tuple[str, ...] = ("quotamax", "agent", "--json")) -> bool:
+    """Can the quota probe run at all? Fail-open is allowed, silent is not."""
+    return shutil.which(cmd[0]) is not None
+
+
+class QuotaSnapshot(dict):
+    """Headroom mapping, with weekly windows retained from the same probes."""
+
+    def __init__(self, headroom: dict[str, str], weekly: dict[str, dict]):
+        super().__init__(headroom)
+        self.weekly = weekly
+
+
+QUOTA_CACHE_SECONDS = 300
+
+
+def _cached_quota_payloads(timeout: float):
+    """quotamax payloads, cached for QUOTA_CACHE_SECONDS under the state dir.
+
+    `quotamax agent` rescans transcripts and can take well over 5 s; when the probe
+    timed out the router silently lost all quota awareness (no gating, no surplus or
+    pressure adjustment). A five-minute cache keeps routing fast and quota-aware.
+    Only successful probes are cached.
+    """
+    from .storage import state_dir
+
+    cache = state_dir() / "quota-cache.json"
+    try:
+        cached = json.loads(cache.read_text())
+        if time.time() - float(cached.get("at", 0)) < QUOTA_CACHE_SECONDS:
+            return cached["payloads"]
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        payloads = list(pool.map(lambda c: _run_json(c, timeout),
+            [("quotamax", "agent", "--json"), ("quotamax", "providers", "--json")]))
+    if payloads and payloads[0] is not None:
+        try:
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            cache.write_text(json.dumps({"at": time.time(), "payloads": payloads}))
+        except OSError:
+            pass
+    return payloads
+
+
+def fetch_quota(cmd: tuple[str, ...] = ("quotamax", "agent", "--json"), timeout: float = 15.0) -> dict[str, str]:
+    """Live quota from quotamax. Fail-open: any error means no quota data.
+
+    The deepseek backstop is the exception to fail-open: it costs real money
+    on every call, so unless its balance is positively confirmed OK it is
+    gated out — see ``deepseek_headroom``.
+    """
     if cmd == ("quotamax", "agent", "--json"):
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            parts = list(pool.map(lambda c: _fetch_quota(c, timeout),
-                [cmd, ("quotamax", "providers", "--json")]))
-        return {key: value for part in parts for key, value in part.items()}
+        payloads = _cached_quota_payloads(timeout)
+        quota = {key: value for payload in payloads if payload is not None
+                 for key, value in parse_quota(payload).items()}
+        if "deepseek" not in quota:
+            quota["deepseek"] = deepseek_headroom(payloads[0], timeout=min(timeout, 2.0))
+        return QuotaSnapshot(quota, parse_weekly(*payloads))
     return _fetch_quota(cmd, timeout)
 
 
-def _fetch_quota(cmd: tuple[str, ...], timeout: float) -> dict[str, str]:
+def deepseek_headroom(payload, *, timeout: float = 2.0, runner=subprocess.run) -> str:
+    """DeepSeek backstop headroom: 'ok' or 'critical' — never merely 'low'.
+
+    quotamax exposes ``backstop: {provider, available, balanceUsd, low}``;
+    unavailable credit or a balance below the floor means INELIGIBLE. When
+    quotamax predates the backstop field, fall back to the skill's own
+    ``balance --json``: exit 0 means eligible; below floor (3), error (1),
+    timeout, or a missing skill all mean not — the arm spends real money,
+    so an unconfirmable balance is a 'no'.
+    """
+    backstop = payload.get("backstop") if isinstance(payload, dict) else None
+    if isinstance(backstop, dict):
+        available = bool(backstop.get("available", True))
+        low = bool(backstop.get("low", False))
+        return "ok" if available and not low else "critical"
+    try:
+        proc = runner([DEEPSEEK_SKILL, "balance", "--json"],
+                      capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return "critical"
+    return "ok" if proc.returncode == 0 else "critical"
+
+
+def _run_json(cmd: tuple[str, ...], timeout: float):
+    """Run a command and parse its stdout as JSON; None on any failure."""
     try:
         proc = subprocess.run(list(cmd), capture_output=True, text=True, timeout=timeout)
     except (OSError, subprocess.TimeoutExpired):
-        return {}
+        return None
     # quotamax intentionally exits nonzero for constrained/critical headroom.
     try:
-        return parse_quota(json.loads(proc.stdout))
+        return json.loads(proc.stdout)
     except ValueError:
-        return {}
+        return None
+
+
+def _fetch_quota(cmd: tuple[str, ...], timeout: float) -> dict[str, str]:
+    payload = _run_json(cmd, timeout)
+    return parse_quota(payload) if payload is not None else {}
+
+
+#: arm -> quotamax provider id. Local arms have no quota and no entry.
+#: ``deepseek`` is the pay-as-you-go backstop: its "quota" is the credit
+#: balance reported via quotamax's ``backstop`` block (or the skill's own
+#: ``balance --json`` when quotamax predates it), folded into a headroom
+#: value by ``deepseek_headroom``.
+QUOTA_PROVIDER: dict[str, str] = {"claude": "claude", "codex": "codex", "kimi": "kimi", "deepseek": "deepseek"}
+
+
+def parse_usage(agent, providers) -> dict[str, dict[str, float]]:
+    """Raw percentages, {provider: {limit_label: percent}}, from both quotamax views.
+
+    ``parse_quota`` buckets usage into ok/low/critical for gating; this keeps
+    the numbers so a dispatch can be costed as before/after deltas.
+    """
+    out: dict[str, dict[str, float]] = {}
+    if isinstance(agent, dict) and agent.get("ok"):
+        claude = {}
+        for label in ("session", "weekly"):
+            window = agent.get(label)
+            if isinstance(window, dict) and isinstance(window.get("percentUsed"), (int, float)):
+                claude[label] = float(window["percentUsed"])
+        if claude:
+            out["claude"] = claude
+    if isinstance(providers, list):
+        for provider in providers:
+            if not isinstance(provider, dict) or not provider.get("ok") or not provider.get("id"):
+                continue
+            limits = {
+                str(limit.get("label", "limit")): float(limit["percent"])
+                for limit in provider.get("limits", [])
+                if isinstance(limit, dict) and isinstance(limit.get("percent"), (int, float))
+            }
+            if limits:
+                out[str(provider["id"])] = limits
+    return out
+
+
+def fetch_usage(timeout: float = 5.0) -> dict[str, dict[str, float]]:
+    """Live usage percentages from quotamax. Fail-open: {} when unavailable."""
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        agent, providers = pool.map(
+            lambda c: _run_json(c, timeout),
+            [("quotamax", "agent", "--json"), ("quotamax", "providers", "--json")],
+        )
+    return parse_usage(agent, providers)
 
 
 def apply_quota(
@@ -210,7 +372,7 @@ def apply_quota(
     ``quota_pool`` maps arm -> quotamax pool name; arms mapped to None (local
     models) have no quota and always survive.
     """
-    mapping = quota_pool or {"claude": "claude", "codex": "codex", "kimi": "kimi"}
+    mapping = quota_pool or QUOTA_PROVIDER
     out = []
     for arm in eligible:
         pool_name = mapping.get(arm)
@@ -229,6 +391,14 @@ class GateResult:
     removed_by_quota: list[str] = field(default_factory=list)
     data_class: str = DATA_OPEN
     removed_by_sensitivity: list[str] = field(default_factory=list)
+    removed_by_cost: list[str] = field(default_factory=list)
+
+
+def apply_backstop(eligible: list[str], pools: dict[str, Pool]) -> list[str]:
+    """Metered arms are a fallback only, after all other availability gates."""
+    if any(pools[arm].cost in ("included", "free", "local") for arm in eligible):
+        return [arm for arm in eligible if pools[arm].cost != "paid"]
+    return list(eligible)
 
 
 def sensitive_veto(
@@ -236,10 +406,10 @@ def sensitive_veto(
 ) -> tuple[list[str], list[str]]:
     """The sensitive-data gate, applied at the ELIGIBILITY stage.
 
-    Remote third-party pools (``codex``, ``kimi``, ``free``) are REMOVED — a
-    veto, not a score. ``claude`` stays (the task is already there) and local
-    arms stay: they are the only arms where sensitive data is safe by
-    construction, because it physically never leaves the machine.
+    Remote third-party pools (``codex``, ``kimi``, ``free``, ``deepseek``)
+    are REMOVED — a veto, not a score. ``claude`` stays (the task is already
+    there) and local arms stay: they are the only arms where sensitive data
+    is safe by construction, because it physically never leaves the machine.
     """
     survivors = [a for a in eligible if a == host or not pools[a].remote]
     removed = [a for a in eligible if a not in survivors]
@@ -303,6 +473,9 @@ def gate(
         eligible = survivors
     else:
         removed = []
+    survivors = apply_backstop(eligible, pools)
+    removed_cost = [arm for arm in eligible if arm not in survivors]
+    eligible = survivors
     if not eligible:
         if sensitive:
             raise SensitiveRoutingError(
@@ -320,4 +493,5 @@ def gate(
         removed_by_quota=removed,
         data_class=DATA_SENSITIVE if sensitive else DATA_OPEN,
         removed_by_sensitivity=removed_sensitive,
+        removed_by_cost=removed_cost,
     )

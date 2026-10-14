@@ -28,7 +28,7 @@ from .benchmark import (
     run_benchmark,
     seed_priors,
 )
-from .complexity import estimate_complexity
+from .complexity import TIERS, estimate_complexity, is_long_horizon
 from .eligibility import SensitiveRoutingError, fetch_quota, gate
 from .federate import (
     FederationState,
@@ -42,13 +42,16 @@ from .federate import (
     status,
 )
 from .pools import load_pools, pools_for_host
+from .memory import TaskMemory
+from .outcomes import OUTCOME_EVENTS, record_failure, record_score, score_from_fix_passes, validate_score
 from .router import Router, cell_name
-from .eligibility import probably_private
+from .eligibility import QUOTA_PROVIDER, fetch_usage, probably_private, quotamax_available
 from .sensitive import detect_sensitive
-from .shapes import classify_shape
+from .shapes import SHAPES, ShapeClassification, classify_with_confidence
 from .ship import RunResult, ShipAbort, build_pr_body, ship
-from .stats import Decision, Stats, report_arm, report_cells, report_throughput
+from .stats import report_quota, Decision, Stats, report_arm, report_cells, report_throughput
 from .storage import JsonStorage
+from .surplus import load_surplus_k, quota_adjustment
 
 
 def _build_router() -> Router:
@@ -73,9 +76,22 @@ def decide(args: argparse.Namespace, *, auto: bool) -> int:
 
     host = args.host
     pools = pools_for_host(load_pools(), host)
-    shape = args.shape or classify_shape(text, use_llm=not args.no_llm)
+    classification = (ShapeClassification(args.shape, "high", "explicit") if args.shape else
+                      classify_with_confidence(text, use_llm=args.llm_shape))
+    shape = classification.shape
     tier = args.tier or estimate_complexity(text)
+    long_horizon = is_long_horizon(text)
     quota = fetch_quota() if not args.no_quota else {}
+    # Quota gating is fail-open by contract, but a silent no-op is how a
+    # 97%-used pool keeps getting picked. Say so in the plan.
+    if args.no_quota:
+        quota_status = "skipped"
+    elif quota:
+        quota_status = "live"
+    elif not quotamax_available():
+        quota_status = "unavailable: quotamax not on PATH — no arm removed"
+    else:
+        quota_status = "unavailable: quotamax returned no data — no arm removed"
 
     # dataClass: 'open' by default, 'sensitive' only on an explicit signal
     # (--sensitive, a sensitive:true task field, or the sensitive.toml path
@@ -115,6 +131,9 @@ def decide(args: argparse.Namespace, *, auto: bool) -> int:
         return 1
 
     router = _build_router()
+    memory = TaskMemory()
+    adjustments = {arm: 0.0 for arm in result.eligible}
+    neighbours = []
     if result.veto is not None:
         chosen = result.veto.target
         why = f"veto:{result.veto.name}"
@@ -122,35 +141,64 @@ def decide(args: argparse.Namespace, *, auto: bool) -> int:
         # Sensitive work PREFERS local arms over claude: free, private, and
         # the data physically never leaves the machine.
         prefer = [a for a in result.eligible if not pools[a].remote] if sensitive else None
-        chosen = router.select(shape, tier, result.eligible, prefer=prefer)
+        # A plan is not execution evidence: dispatch or settlement owns the trial.
         observed = router.observed_counts(shape, tier)
+        candidates = prefer or result.eligible
+        weekly = getattr(quota, "weekly", {})
+        k = load_surplus_k()
+        for arm in candidates:
+            provider = QUOTA_PROVIDER.get(arm)
+            window = weekly.get(provider, {})
+            adjustments[arm] = quota_adjustment(
+                window.get("percentUsed"), window.get("resetsInMinutes"), k,
+                headroom=quota.get(provider))
+        neighbours = memory.neighbours(text, shape, candidates)
+        chosen = router.select(shape, tier, result.eligible, prefer=prefer,
+                               record_impression=False, neighbours=neighbours, quota_adjustment=adjustments)
         why = "posterior" if any(sum(v) for v in observed.values()) else "prior"
+        if long_horizon and not args.tier:
+            why += "+long-horizon"
         if prefer and chosen in prefer:
             why += "+sensitive:local-preferred"
         if auto_sensitive:
             why += "(auto-detected)"
+        if adjustments[chosen] > 0:
+            why += f"+surplus:{chosen}"
+        elif adjustments[chosen] < 0:
+            why += f"-pressure:{chosen}"
+
+    decision = Decision(cell=cell_name(shape, tier), shape=shape, tier=tier,
+                        eligible=result.eligible, chosen=chosen, why=why)
+    Stats().record_decision(decision)
+    memory.remember(decision.decision_id, text, shape, tier, chosen)
 
     plan = {
+        "decision_id": decision.decision_id,
         "host": host,
         "shape": shape,
         "tier": tier,
+        "horizon": "long" if long_horizon else "short",
         "cell": cell_name(shape, tier),
         "data_class": result.data_class,
         "eligible": result.eligible,
         "removed_by_quota": result.removed_by_quota,
+        "removed_by_cost": result.removed_by_cost,
+        "quota": quota_status,
         "chosen": chosen,
         "why": why,
+        "shape_confidence": classification.confidence,
+        "shape_source": classification.source,
+        "quota_adjustment": adjustments,
+        "surplus_bonus": adjustments,  # deprecated signed alias for one release
+        "neighbours": neighbours,
     }
+    if classification.confidence == "low":
+        plan["suggest"] = "pass --shape <shape> --tier <tier>"
     if result.removed_by_sensitivity:
         plan["removed_by_sensitivity"] = result.removed_by_sensitivity
     if result.veto is not None:
         plan["veto"] = {"name": result.veto.name, "reason": result.veto.reason}
-    print(json.dumps(plan, indent=2, sort_keys=True))
-
-    Stats().record_decision(Decision(
-        cell=plan["cell"], shape=shape, tier=tier,
-        eligible=result.eligible, chosen=chosen, why=why,
-    ))
+    print(json.dumps(plan, indent=2, sort_keys=True), flush=True)
 
     if args.plan_only:
         print("dispatch: plan only (nothing launched)")
@@ -161,8 +209,10 @@ def decide(args: argparse.Namespace, *, auto: bool) -> int:
         return 0
 
     pool = pools[chosen]
+    template, task_on_stdin = pool.dispatch_for(shape)
     if not auto:
-        rendered = pool.dispatch.replace("{task}", shlex.quote(text))
+        rendered = (f"{template}  # task on stdin" if task_on_stdin
+                    else template.replace("{task}", shlex.quote(text)))
         try:
             answer = input(f"dispatch to {chosen} via `{rendered}`? [y/N] ")
         except EOFError:
@@ -171,23 +221,94 @@ def decide(args: argparse.Namespace, *, auto: bool) -> int:
             print("not dispatched")
             return 0
 
-    return _dispatch(pool.dispatch, text, target=chosen)
+    router.observe(shape, tier, chosen, [a for a, p in pools.items() if p.accepts(shape)])
+    Stats().annotate(decision.decision_id, impression_recorded=True)
+
+    usage_before = fetch_usage() if not args.no_quota else {}
+    started = time.monotonic()
+    rc = _dispatch(template, text, target=chosen, stdin=task_on_stdin)
+    wall_clock_s = round(time.monotonic() - started, 1)
+    quota = _quota_cost(chosen, usage_before, fetch_usage() if usage_before else {})
+    Stats().annotate(decision.decision_id, wall_clock_s=wall_clock_s, quota=quota)
+    # Other route calls may have learned while this subprocess was running.
+    # Reopen counts so its completion cannot overwrite their newer evidence.
+    _auto_outcome(_build_router(), shape, tier, chosen, rc, decision_id=decision.decision_id)
+    if quota:
+        moved = ", ".join(
+            f"{label} {quota['before'][label]:g}% -> {quota['after'][label]:g}% ({delta:+g})"
+            for label, delta in quota["delta"].items()
+        )
+        print(f"quota: {quota['provider']} {moved}")
+    elif not args.no_quota:
+        print(f"quota: not tracked for {chosen}" + ("" if chosen in QUOTA_PROVIDER else " (no quota pool)"))
+    return rc
 
 
-def _dispatch(template: str, task: str, *, target: str | None = None) -> int:
+def _quota_cost(arm: str, before: dict, after: dict) -> dict | None:
+    """Before/after usage for the arm's quota pool; None when not measurable."""
+    provider = QUOTA_PROVIDER.get(arm)
+    if not provider or provider not in before or provider not in after:
+        return None
+    b, a = before[provider], after[provider]
+    delta = {label: round(a[label] - b[label], 2) for label in b if label in a}
+    if not delta:
+        return None
+    return {"provider": provider, "before": b, "after": a, "delta": delta}
+
+
+def _auto_outcome(router: Router, shape: str, tier: str, arm: str, rc: int, *,
+                  decision_id: str | None = None) -> None:
+    """Close the loop from the exit code; the caller only adds what it knows.
+
+    ``completed`` (ran without erroring) is exactly what an exit code says,
+    so record it here rather than hoping the caller remembers. ``accepted``
+    (diff kept) and ``verified`` (tests passed) are still the caller's to
+    report via ``route outcome`` — that call skips anything already on the
+    decision, so nothing double-counts.
+    """
+    decision = Stats().decision(decision_id) if decision_id else {}
+    already = set(decision.get("outcome_events", []))
+    if rc == 0:
+        if "completed" not in already:
+            router.reward(shape, tier, arm, "completed")
+        Stats().record_outcome_events(["completed"], decision_id=decision_id)
+        print(
+            "outcome: completed (recorded from exit code). When the diff is kept run\n"
+            f"  route outcome --shape {shape} --tier {tier} --arm {arm} --outcome accepted"
+        )
+    else:
+        # The impression is already counted with no reward — that IS the
+        # negative outcome. Mark the decision so stats can show it.
+        Stats().record_outcome_events(["failed"], decision_id=decision_id)
+        if decision_id and decision.get("final_score") is None and "accepted" not in already:
+            TaskMemory().settle(decision_id, 0.0)
+        print(
+            f"outcome: failed (exit {rc}, recorded). Retry once on the next-stronger arm:\n"
+            f"  route outcome --shape {shape} --tier {tier} --arm {arm} --outcome failed"
+        )
+    if decision_id:
+        print(f"settle: route settle --decision {decision_id} --fix-passes N [--merged|--abandoned]")
+
+
+def _dispatch(template: str, task: str, *, target: str | None = None, stdin: bool = False) -> int:
     if not template:
         print("dispatch: no command configured for this pool", file=sys.stderr)
         return 1
-    argv = [task if tok == "{task}" else tok for tok in shlex.split(template)]
-    if "{task}" not in shlex.split(template):
-        argv.append(task)
+    tokens = shlex.split(template)
+    if stdin:
+        # The task travels on stdin, never argv (deepseek batch: `ask -`).
+        argv = tokens
+    else:
+        argv = [task if tok == "{task}" else tok for tok in tokens]
+        if "{task}" not in tokens:
+            argv.append(task)
     started = time.monotonic()
     try:
         # A delegated agent must see itself as host if it invokes route again.
         env = dict(os.environ)
         if target in ("claude", "codex"):
             env["ROUTE_HOST"] = target
-        proc = subprocess.run(argv, env=env)
+        proc = subprocess.run(argv, env=env, **({"input": task, "text": True} if stdin else {}))
     except OSError as exc:
         print(f"dispatch failed: {exc}", file=sys.stderr)
         return 1
@@ -199,6 +320,8 @@ def cmd_stats(args: argparse.Namespace) -> int:
     router = _build_router()
     if args.throughput:
         rows = report_throughput(Stats())
+    elif args.quota:
+        rows = report_quota(Stats())
     elif args.arm:
         rows = report_arm(router, args.arm)
     else:
@@ -208,13 +331,105 @@ def cmd_stats(args: argparse.Namespace) -> int:
 
 
 def cmd_outcome(args: argparse.Namespace) -> int:
-    from .outcomes import OUTCOME_EVENTS, record_outcome
-
     router = _build_router()
-    record_outcome(router, args.shape, args.tier, args.arm, args.outcome)
-    Stats().record_outcome_events(list(OUTCOME_EVENTS[args.outcome]))
-    print(json.dumps({"recorded": args.outcome, "arm": args.arm,
-                      "cell": cell_name(args.shape, args.tier)}))
+    stats = Stats()
+    decision = _outcome_decision(args, stats)
+    decision_id = decision.get("decision_id") if decision else None
+    shape, tier, arm = args.shape, args.tier, args.arm
+    already = set(decision.get("outcome_events", [])) if decision else set()
+
+    if args.score is not None or args.fix_passes is not None or args.abandoned:
+        score = (args.score if args.score is not None else
+                 score_from_fix_passes(args.fix_passes or 0, abandoned=args.abandoned))
+        previous = decision.get("final_score") if decision else None
+        if previous is None:
+            previous = 1.0 if "accepted" in already else 0.0
+        record_score(router, shape, tier, arm, score, previous_score=previous,
+                     impression_recorded=_has_trial(decision))
+        events = ["graded"]
+        if args.abandoned:
+            events.append("failed")
+        if getattr(args, "merged", False):
+            # Merge is acceptance metadata; its reward is already in score.
+            for event in OUTCOME_EVENTS["accepted"]:
+                if event not in already and event != "accepted":
+                    router.reward(shape, tier, arm, event)
+            events.extend(OUTCOME_EVENTS["accepted"])
+        if decision:
+            stats.annotate(decision_id, events=events, final_score=score, impression_recorded=True,
+                           fix_passes=args.fix_passes, abandoned=args.abandoned,
+                           merged=getattr(args, "merged", False) or decision.get("merged", False))
+            if decision_id:
+                TaskMemory().settle(decision_id, score)
+        print(json.dumps({"recorded": "graded", "decision_id": decision_id,
+                          "arm": arm, "cell": cell_name(shape, tier), "score": score}))
+        return 0
+
+    events = list(OUTCOME_EVENTS[args.outcome])
+    new_events = [e for e in events if e not in already]
+    if decision and not _has_trial(decision):
+        router.observe(shape, tier, arm, [arm])
+    for event in new_events:
+        # Explicit graded feedback remains authoritative even if a caller
+        # later sends a legacy accepted event for bookkeeping.
+        if event != "accepted" or not decision or decision.get("final_score") is None:
+            router.reward(shape, tier, arm, event)
+    if args.outcome == "failed" and decision is None:
+        record_failure(router, shape, tier, arm)
+    if decision:
+        stats.annotate(decision_id, events=events or ["failed"], impression_recorded=True)
+        if decision_id and decision.get("final_score") is None:
+            if "accepted" in already or args.outcome == "accepted":
+                TaskMemory().settle(decision_id, 1.0)
+            elif args.outcome == "failed":
+                TaskMemory().settle(decision_id, 0.0)
+    print(json.dumps({"recorded": args.outcome, "arm": arm,
+                      "cell": cell_name(shape, tier), "decision_id": decision_id,
+                      "events": new_events, "already": sorted(already - {"failed"})}))
+    return 0
+
+
+def _has_trial(decision: dict | None) -> bool:
+    if decision is None:
+        return False
+    if "impression_recorded" in decision:
+        return decision["impression_recorded"]
+    # Pre-ID logs counted every bandit selection, plus dispatched user pins.
+    return not decision.get("why", "").startswith("veto:") or bool(decision.get("outcome_events"))
+
+
+def _outcome_decision(args: argparse.Namespace, stats: Stats) -> dict | None:
+    if args.decision:
+        decision = stats.decision(args.decision)
+        for name, field in (("shape", "shape"), ("tier", "tier"), ("arm", "chosen")):
+            value = getattr(args, name)
+            if value is not None and value != decision[field]:
+                raise ValueError(f"--{name} does not match decision {args.decision}")
+            setattr(args, name, decision[field])
+        return decision
+    if not all((args.shape, args.tier, args.arm)):
+        raise ValueError("outcome needs --decision or all of --shape, --tier and --arm")
+    if args.arm not in load_pools():
+        raise ValueError(f"unknown arm: {args.arm}")
+    decision = next((row for row in reversed(stats.decisions())
+                     if row.get("cell") == cell_name(args.shape, args.tier) and row.get("chosen") == args.arm), None)
+    return stats.identify(decision) if decision is not None else None
+
+
+def cmd_reseed(args: argparse.Namespace) -> int:
+    """Move every live cell's seed to the current rule table; keep observations."""
+    router = _build_router()
+    pools = load_pools()
+    arms_for_shape = {
+        shape: [name for name, pool in pools.items() if pool.accepts(shape)]
+        for shape in SHAPES
+    }
+    changes = router.reseed(arms_for_shape, apply=not args.dry_run)
+    print(json.dumps({
+        "applied": not args.dry_run,
+        "changed": len(changes),
+        "changes": changes,
+    }, indent=2))
     return 0
 
 
@@ -366,14 +581,32 @@ def _parser(prog: str) -> argparse.ArgumentParser:
     s = sub.add_parser("stats")
     s.add_argument("--arm")
     s.add_argument("--throughput", action="store_true")
+    s.add_argument("--quota", action="store_true", help="per arm: quota cost per dispatch and per accepted result")
     s.set_defaults(func=cmd_stats)
 
     o = sub.add_parser("outcome", help="record what happened")
-    o.add_argument("--shape", required=True)
-    o.add_argument("--tier", required=True)
-    o.add_argument("--arm", required=True)
-    o.add_argument("--outcome", required=True, choices=["accepted", "verified", "completed", "failed"])
+    o.add_argument("--decision", help="stable decision id from the plan")
+    o.add_argument("--shape", choices=SHAPES)
+    o.add_argument("--tier", choices=TIERS)
+    o.add_argument("--arm")
+    feedback = o.add_mutually_exclusive_group()
+    feedback.add_argument("--outcome", choices=list(OUTCOME_EVENTS))
+    feedback.add_argument("--score", type=_score_arg, help="execution-verified quality in [0, 1]")
+    feedback.add_argument("--fix-passes", type=_fix_passes_arg)
+    o.add_argument("--abandoned", "--rewritten", action="store_true", help="abandoned or rewritten: score 0")
     o.set_defaults(func=cmd_outcome)
+
+    settle = sub.add_parser("settle", help="settle a decision with execution-grounded feedback")
+    settle.add_argument("--decision", required=True)
+    settle.add_argument("--fix-passes", type=_fix_passes_arg)
+    state = settle.add_mutually_exclusive_group()
+    state.add_argument("--merged", action="store_true", help="record that the diff was accepted")
+    state.add_argument("--abandoned", "--rewritten", action="store_true", help="abandoned or rewritten: score 0")
+    settle.set_defaults(func=cmd_outcome, shape=None, tier=None, arm=None, score=None, outcome=None)
+
+    r = sub.add_parser("reseed", help="move live cells' priors to the current rule table, keeping observations")
+    r.add_argument("--dry-run", action="store_true", help="show what would change without writing")
+    r.set_defaults(func=cmd_reseed)
 
     f = sub.add_parser("federate")
     f.add_argument("federate_cmd", choices=["export", "push", "pull", "status", "merge", "aggregate"])
@@ -420,19 +653,37 @@ def _add_task_flags(p: argparse.ArgumentParser) -> None:
                    help="current agent; context-dependent work stays here (default: ROUTE_HOST or claude)")
     p.add_argument("--plan-only", action="store_true", help="show routing without prompting or dispatching")
     p.add_argument("--pool", help="pin a pool explicitly — beats inference")
-    p.add_argument("--shape", help="override shape classification")
-    p.add_argument("--tier", help="override complexity tier")
+    p.add_argument("--shape", choices=SHAPES, help="override shape classification")
+    p.add_argument("--tier", choices=TIERS, help="override complexity tier")
     p.add_argument("--private", action="store_true", help="veto: data must not leave the machine")
     p.add_argument("--sensitive", action="store_true",
-                   help="dataClass sensitive: veto remote pools (codex/kimi/free), prefer local")
+                   help="dataClass sensitive: veto remote pools (codex/kimi/free/deepseek), prefer local")
     p.add_argument("--no-acceptance", action="store_true", help="veto: no clear acceptance check")
     p.add_argument("--needs-context", action="store_true", help="veto: needs this conversation")
     p.add_argument("--cross-repo", action="store_true", help="veto: cross-repo orchestration")
-    p.add_argument("--no-llm", action="store_true", help="skip the local-LLM shape tiebreak")
+    llm = p.add_mutually_exclusive_group()
+    llm.add_argument("--llm-shape", action="store_true", help="resolve low-confidence shapes with the local LLM")
+    llm.add_argument("--no-llm", action="store_true", help="skip the local-LLM shape tiebreak (default)")
     p.add_argument("--no-quota", action="store_true", help="skip quotamax")
 
 
-_SUBCOMMANDS = {"task", "stats", "outcome", "federate", "benchmark", "ship"}
+def _score_arg(text: str) -> float:
+    try:
+        return validate_score(float(text))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
+def _fix_passes_arg(text: str) -> int:
+    try:
+        value = int(text)
+        score_from_fix_passes(value)
+        return value
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("fix passes must be a non-negative integer") from exc
+
+
+_SUBCOMMANDS = {"task", "stats", "outcome", "settle", "reseed", "federate", "benchmark", "ship"}
 
 
 def _run(argv: list[str] | None, *, auto: bool) -> int:
@@ -444,9 +695,18 @@ def _run(argv: list[str] | None, *, auto: bool) -> int:
         argv = ["task"]
     parser = _parser("auto" if auto else "route")
     args = parser.parse_args(argv)
-    if getattr(args, "func", None):
-        return args.func(args)
-    return decide(args, auto=auto)
+    if args.command in ("outcome", "settle"):
+        if args.outcome is None and args.score is None and args.fix_passes is None and not args.abandoned:
+            parser.error("give --outcome, --score, --fix-passes or --abandoned")
+        if args.abandoned and (args.outcome is not None or args.score is not None):
+            parser.error("--abandoned cannot be combined with --outcome or --score")
+    try:
+        if getattr(args, "func", None):
+            return args.func(args)
+        return decide(args, auto=auto)
+    except ValueError as exc:
+        print(f"route: {exc}", file=sys.stderr)
+        return 2
 
 
 def main(argv: list[str] | None = None) -> int:

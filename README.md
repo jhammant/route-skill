@@ -110,7 +110,7 @@ Routing is not a single score. It is a filter chain, then a bandit.
 task text
    │
    ├─▶ 1. SHAPE      closed vocabulary — what kind of work is this?
-   ├─▶ 2. VETO       hard gates: must this stay here?            → claude, done
+   ├─▶ 2. VETO       hard gates: must this stay here?            → host, done
    ├─▶ 3. ELIGIBLE   which arms can do this shape at all?
    ├─▶ 4. QUOTA      drop arms with no headroom (quotamax)
    ├─▶ 5. SELECT     bandit picks among survivors (banditry)
@@ -125,14 +125,16 @@ task text
    which never routes away.
 2. **Veto** — hard gates, not scores. Needs this conversation's context, cross-repo
    orchestration, private data, no clear acceptance check, or an explicit `--pool`
-   pin: any of these short-circuits to `claude` regardless of quota or complexity.
+   pin: these short-circuit to the current host (default `claude`), or to the
+   explicitly pinned pool, regardless of quota or complexity.
    The private-data gate is a *safety net* only (see **Sensitive data** below):
    several hosted free tiers (Gemini, Mistral) train on submitted prompts, so a
    task carrying private data can **never** land on the `free` arm.
 3. **Eligibility** — `pools.py` is a config-driven arm registry
    (`~/.config/route/pools.toml`); a new model is a config entry, not a code change.
-   A `batch:*` shape never yields `codex`/`kimi`; a `coding:*` shape never yields
-   `local-batch`. Arms with a health endpoint (`free`) are eligible only while it
+   Delegated `codex`/`kimi` arms do not accept `batch:*`; the current host can
+   handle any shape. A `coding:*` shape never yields `local-batch`.
+   Arms with a health endpoint (`free`) are eligible only while it
    answers — an unreachable proxy removes the arm, never an error.
 4. **Quota** — `quotamax agent --json`. An arm at `critical` headroom is **removed**,
    not penalised. Quota gates availability; the bandit decides quality. For the
@@ -145,8 +147,9 @@ task text
    `Beta(8,2)`, the rest at `Beta(2,8)`. Cold start behaves exactly like the rules;
    evidence swamps the prior automatically, per cell. **There is no "switch to
    adaptive" flag — that is the entire reason to use a bandit.**
-6. **Dispatch** — hands to the existing skills or returns `stay` for Claude. Never
-   reimplements them, never triggers paid provisioning.
+6. **Dispatch** — uses each arm's configured command or returns `stay` for the
+   current host. Codex can delegate to Claude as described below. Dispatch
+   never triggers paid provisioning.
 7. **Outcome** — reward events ranked by the signal hardest to fake: `accepted`
    (diff kept) > `verified` (tests passed) > `completed` (ran). The dispatch exit
    code records `completed` or `failed` by itself; `route outcome` adds what only
@@ -328,12 +331,11 @@ disable this cost rule. Custom arms follow their configured cost class.
 ## Sensitive data — prefer local, never fall back remote
 
 Every task carries a `dataClass`: `open` (default) or `sensitive`. When a task
-is sensitive, the remote third-party pools — `codex`, `kimi`, `free`,
-`deepseek` — are
-removed at the **eligibility** stage (a veto, not a score). `claude` stays
-eligible, and so do `local-batch` / `local-agent` — the only arms where the
-data is safe *by construction*, because it physically never leaves the
-machine. Among the survivors, local arms are **preferred** over `claude`:
+is sensitive, remote providers other than the current host are removed at the
+**eligibility** stage (a veto, not a score, subject to explicit pool pins).
+The host stays eligible, and so do `local-batch` / `local-agent` — the only
+arms where the data physically never leaves the machine. Among the survivors,
+local arms are **preferred** over the host:
 sensitive work is exactly what an idle local machine is for — free, private,
 and already paid for. If sensitivity leaves **no** eligible arm, routing fails
 loudly with the reason; it never silently falls back to a remote arm, because
@@ -351,11 +353,11 @@ Sensitivity is detected from **explicit signals only**:
 
    A task naming a file under one of those paths is sensitive.
 
-The old content-matching regex (`--private`, matching "secrets", ".env",
-"credentials", …) still fires as an **additional safety net** — it
-conservatively pins the task to `claude`. But it must never be the only
-signal you rely on: a false negative silently sends private data to a third
-party, and no regex is worth that risk. When unsure, mark it yourself.
+Content matching for private material is an **additional safety net**: a hit
+treats the task as sensitive and prefers local arms. Explicit `--private`
+pins to the current host. Content matching must never be the only signal you
+rely on: a false negative can send private data to a third party. When unsure,
+mark the task sensitive yourself.
 
 ```text
 $ route --sensitive "rotate the API credentials in the production .env file"
@@ -471,30 +473,40 @@ Tests are deterministic: no network, no real dispatch, no money spent.
 ## License
 
 MIT
-# Calling from Codex
 
-The router supports both host agents. Pass `--host codex` (or set
-`ROUTE_HOST=codex`) when invoking it from Codex. The default remains Claude
-for existing installations. Context-dependent tasks and exhausted-pool
-fallbacks stay with the selected host. Sensitive routing keeps the current
-host and local pools eligible, excluding other remote providers unless the
-user explicitly pins a pool.
+## Use from Codex
+
+The router supports both host agents. Pass `--host codex` or set
+`ROUTE_HOST=codex` inside Codex. Existing Claude installations keep the default
+`claude` host. Context-dependent work and exhausted-pool fallbacks stay with
+the current host; provider names and learned statistics remain unchanged.
+
+From a checkout installed into `.venv`:
 
 ```bash
-/Users/jhammant/dev/skills/route-skill/.venv/bin/route --host codex --pool claude "Write tests for src/parser.py"
-/Users/jhammant/dev/skills/route-skill/.venv/bin/auto --host codex --pool claude "Write tests for src/parser.py"
-/Users/jhammant/dev/skills/route-skill/.venv/bin/route --host codex --plan-only "Review the parser changes"
+./.venv/bin/route --host codex --pool claude "Write tests for src/parser.py"
+./.venv/bin/auto --host codex --pool claude "Write tests for src/parser.py"
+./.venv/bin/route --host codex --plan-only "Review the parser changes"
+mkdir -p "$HOME/.agents/skills"
+ln -s "$PWD/skill" "$HOME/.agents/skills/route"
+ln -s "$PWD/skill-auto" "$HOME/.agents/skills/auto"
 ```
 
-`route` asks before dispatch; `auto` dispatches immediately. `--plan-only`
-does neither. Claude delegation runs `claude --print --permission-mode auto`
-in the current directory and inherits its configured model and authentication.
-Task text is passed as one argument without shell evaluation. Child agents
-receive their own `ROUTE_HOST`. Parent agents should provide a self-contained
-task and verify the resulting diff and tests. No permission-bypass flag is added.
+Restart Codex and invoke `$route` or `$auto`. Keep the checkout in place and
+move aside existing skill directories before linking. On macOS, bare `route`
+may be `/sbin/route`, the network utility; use the installed package executable.
 
-Use the explicit executable path on macOS: bare `route` may resolve to the
-system network-routing utility. Provider identities and existing learned
-statistics remain unchanged when switching host. Quota reads combine Claude
-advice with Codex/Kimi provider limits; provider usage at 95% is considered
-critical, and expired windows are ignored.
+`route` asks before dispatch; `auto` dispatches immediately. `--plan-only`
+does neither, but still records its routing decision. Claude delegation runs
+`claude --print --permission-mode auto` in the current directory and inherits
+Claude's configured model and authentication. No permission bypass is added.
+Give the delegate a self-contained task and verify its diff and tests afterward.
+Task text is passed as one argument without shell evaluation; child agents
+receive their own `ROUTE_HOST`.
+
+Quota reads combine Claude agent advice and Codex/Kimi provider limits, using
+a 15-second probe timeout and a five-minute cache under `ROUTE_STATE_DIR`.
+Nonzero critical-quota exit codes retain their quota data; expired windows are
+ignored. Provider usage at 95% is considered critical. Sensitive routing keeps
+the current host and local pools eligible, excluding other remote providers
+unless the user explicitly pins a pool (the existing pin policy).

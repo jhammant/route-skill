@@ -25,23 +25,28 @@ def json_output(proc):
     return json.JSONDecoder().raw_decode(proc.stdout[start:])[0]
 
 
-def test_dispatch_settle_reroute_and_export_across_processes(tmp_path):
+@pytest.mark.parametrize("host,delegate", [("claude", "codex"), ("codex", "claude")])
+def test_dispatch_settle_reroute_and_export_across_processes(tmp_path, host, delegate):
     # Arrange: no provider can run or read real configuration.
     helper = tmp_path / "fake-agent.py"
-    helper.write_text("import sys\nassert sys.argv[1] == 'build parser endpoint'\nprint('fake execution complete')\n")
+    helper.write_text(
+        "import os, sys\nassert sys.argv[1] == 'build parser endpoint'\n"
+        f"assert os.environ['ROUTE_HOST'] == {delegate!r}\n"
+        "print('fake execution complete')\n"
+    )
     command = f'"{sys.executable}" "{helper}" {{task}}'
     config_dir().mkdir(parents=True)
     (config_dir() / "pools.toml").write_text(
-        '[pools.codex]\nshapes = ["coding:implement"]\n'
+        f'[pools.{delegate}]\nshapes = ["coding:implement"]\n'
         f'dispatch = {json.dumps(command)}\nremote = true\n'
-        '[pools.codex.model]\nname = "fake-agent"\n'
+        f'[pools.{delegate}.model]\nname = "fake-agent"\n'
     )
-    common = ["--host", "claude", "--no-quota", "--no-llm",
+    common = ["--host", host, "--no-quota", "--no-llm",
               "--shape", "coding:implement", "--tier", "moderate"]
 
     # Act: execute, resolve an older decision after another plan, then route again.
-    dispatched = json_output(cli(*common, "--pool", "codex", "build parser endpoint", auto=True))
-    pending = json_output(cli(*common, "--pool", "claude", "--plan-only", "build parser endpoint"))
+    dispatched = json_output(cli(*common, "--pool", delegate, "build parser endpoint", auto=True))
+    pending = json_output(cli(*common, "--pool", host, "--plan-only", "build parser endpoint"))
     settled = json_output(cli("settle", "--decision", dispatched["decision_id"], "--fix-passes", "1", "--merged"))
     repeated = json_output(cli("settle", "--decision", dispatched["decision_id"], "--fix-passes", "1", "--merged"))
     # Disable optional health/subcommand probes in the next process via config.
@@ -54,9 +59,10 @@ def test_dispatch_settle_reroute_and_export_across_processes(tmp_path):
     # Assert: stable ID, exactly one weighted trial, no pending neighbour, no memory export.
     assert settled == repeated and settled["score"] == 0.7
     assert dispatched["decision_id"] != pending["decision_id"]
-    assert rerouted["neighbours"] == [{"arm": "codex", "score": 0.7, "similarity": 1.0}]
+    assert dispatched["host"] == pending["host"] == rerouted["host"] == host
+    assert rerouted["neighbours"] == [{"arm": delegate, "score": 0.7, "similarity": 1.0}]
     assert stats.returncode == 0
-    observed = [r for r in json.loads(stats.stdout) if r["arm"] == "codex"]
+    observed = [r for r in json.loads(stats.stdout) if r["arm"] == delegate]
     assert len(observed) == 1 and observed[0]["obs"] == 1
     assert observed[0]["success_rate"] == 0.7
     assert "parser" not in json.dumps(exported) and "neighbours" not in json.dumps(exported)

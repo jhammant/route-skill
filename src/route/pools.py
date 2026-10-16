@@ -165,7 +165,7 @@ def _default_pools() -> dict[str, Pool]:
             remote=True,
             cost="included",  # subscription quota, not pay-as-you-go
             strength=strength("codex"),
-            dispatch="codex exec {task}",
+            dispatch="codex exec --sandbox workspace-write {task}",
             probe="codex exec {task}",
             model=codex_model(),
             parallel_limit=4,

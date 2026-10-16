@@ -97,6 +97,9 @@ def decide(args: argparse.Namespace, *, auto: bool) -> int:
     # (--sensitive, a sensitive:true task field, or the sensitive.toml path
     # allowlist). Never inferred from content heuristics.
     sensitive = detect_sensitive(text, flag=args.sensitive)
+    if getattr(args, "allow_network", False) and sensitive:
+        print("route: --allow-network cannot be combined with a sensitive task", file=sys.stderr)
+        return 2
     # The content regex is a one-way safety net: it may only ever move a task
     # toward MORE caution, never less. If it thinks this might be private, the
     # safest destination is the machine the data cannot leave — not Claude,
@@ -198,6 +201,8 @@ def decide(args: argparse.Namespace, *, auto: bool) -> int:
         plan["removed_by_sensitivity"] = result.removed_by_sensitivity
     if result.veto is not None:
         plan["veto"] = {"name": result.veto.name, "reason": result.veto.reason}
+    if getattr(args, "allow_network", False):
+        plan["allow_network"] = True  # on the record: this run may reach the network
     print(json.dumps(plan, indent=2, sort_keys=True), flush=True)
 
     if args.plan_only:
@@ -210,6 +215,12 @@ def decide(args: argparse.Namespace, *, auto: bool) -> int:
 
     pool = pools[chosen]
     template, task_on_stdin = pool.dispatch_for(shape)
+    if getattr(args, "allow_network", False):
+        if chosen == "codex":
+            template = with_network(template)
+            print("dispatch: network allowed for this codex run (--allow-network)")
+        else:
+            print(f"dispatch: --allow-network only applies to codex; {chosen} runs as configured")
     if not auto:
         rendered = (f"{template}  # task on stdin" if task_on_stdin
                     else template.replace("{task}", shlex.quote(text)))
@@ -288,6 +299,18 @@ def _auto_outcome(router: Router, shape: str, tier: str, arm: str, rc: int, *,
         )
     if decision_id:
         print(f"settle: route settle --decision {decision_id} --fix-passes N [--merged|--abandoned]")
+
+
+# Codex's workspace-write sandbox has no network, so a job that opens even a local test
+# socket fails there. This turns it on for one run, never in ~/.codex/config.toml.
+CODEX_NETWORK = "-c sandbox_workspace_write.network_access=true"
+
+
+def with_network(template: str) -> str:
+    """The codex dispatch template with network access for this run only."""
+    if "codex exec" not in template or CODEX_NETWORK in template:
+        return template
+    return template.replace("codex exec", f"codex exec {CODEX_NETWORK}", 1)
 
 
 def _dispatch(template: str, task: str, *, target: str | None = None, stdin: bool = False) -> int:
@@ -658,6 +681,9 @@ def _add_task_flags(p: argparse.ArgumentParser) -> None:
     p.add_argument("--private", action="store_true", help="veto: data must not leave the machine")
     p.add_argument("--sensitive", action="store_true",
                    help="dataClass sensitive: veto remote pools (codex/kimi/free/deepseek), prefer local")
+    p.add_argument("--allow-network", action="store_true",
+                   help="codex only, this run only: let the sandbox use the network, including local "
+                        "test sockets (workspace-write has it off). Refused with --sensitive")
     p.add_argument("--no-acceptance", action="store_true", help="veto: no clear acceptance check")
     p.add_argument("--needs-context", action="store_true", help="veto: needs this conversation")
     p.add_argument("--cross-repo", action="store_true", help="veto: cross-repo orchestration")

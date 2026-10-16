@@ -58,6 +58,13 @@ three distinct component kinds (route, endpoint, migration, webhook, worker,
 test, flag). Similar settled tasks appear in `neighbours`; their evidence is
 temporary, and the local hashed-token memory never federates.
 
+Codex runs in a `workspace-write` sandbox with the network off, local sockets
+included, so a job whose tests open a port fails there. Pass `--allow-network` to
+turn the network on for that one Codex run (`-c sandbox_workspace_write.network_access=true`;
+`~/.codex/config.toml` is never changed). Use it only when the brief needs sockets
+and touches nothing sensitive. It is refused with `--sensitive`, other pools ignore
+it, and the plan records `allow_network: true`. Run the final test pass yourself either way.
+
 Rules that still apply in auto mode:
 
 - Vetoes are hard gates. If a veto fires (needs this conversation's context,

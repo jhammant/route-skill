@@ -227,7 +227,7 @@ class QuotaSnapshot(dict):
 QUOTA_CACHE_SECONDS = 300
 
 
-def _cached_quota_payloads(timeout: float):
+def _cached_quota_payloads(timeout: float, *, cache_result: bool = True):
     """quotamax payloads, cached for QUOTA_CACHE_SECONDS under the state dir.
 
     `quotamax agent` rescans transcripts and can take well over 5 s; when the probe
@@ -247,7 +247,7 @@ def _cached_quota_payloads(timeout: float):
     with ThreadPoolExecutor(max_workers=2) as pool:
         payloads = list(pool.map(lambda c: _run_json(c, timeout),
             [("quotamax", "agent", "--json"), ("quotamax", "providers", "--json")]))
-    if payloads and payloads[0] is not None:
+    if cache_result and payloads and payloads[0] is not None:
         try:
             cache.parent.mkdir(parents=True, exist_ok=True)
             cache.write_text(json.dumps({"at": time.time(), "payloads": payloads}))
@@ -256,7 +256,8 @@ def _cached_quota_payloads(timeout: float):
     return payloads
 
 
-def fetch_quota(cmd: tuple[str, ...] = ("quotamax", "agent", "--json"), timeout: float = 15.0) -> dict[str, str]:
+def fetch_quota(cmd: tuple[str, ...] = ("quotamax", "agent", "--json"), timeout: float = 15.0,
+                *, cache_result: bool = True) -> dict[str, str]:
     """Live quota from quotamax. Fail-open: any error means no quota data.
 
     The deepseek backstop is the exception to fail-open: it costs real money
@@ -264,7 +265,8 @@ def fetch_quota(cmd: tuple[str, ...] = ("quotamax", "agent", "--json"), timeout:
     gated out — see ``deepseek_headroom``.
     """
     if cmd == ("quotamax", "agent", "--json"):
-        payloads = _cached_quota_payloads(timeout)
+        payloads = (_cached_quota_payloads(timeout) if cache_result else
+                    _cached_quota_payloads(timeout, cache_result=False))
         quota = {key: value for payload in payloads if payload is not None
                  for key, value in parse_quota(payload).items()}
         if "deepseek" not in quota:

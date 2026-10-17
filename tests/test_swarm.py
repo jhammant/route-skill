@@ -14,6 +14,12 @@ def test_plan_swarm_is_min_of_units_limit_and_headroom_cap():
     assert plan_swarm(5, 2, "abundant") == 2       # small pool limit binds
 
 
+def test_plan_swarm_understands_provider_pool_headroom():
+    assert plan_swarm(3, 4, "ok") == 3    # codex/kimi under 80% used
+    assert plan_swarm(3, 4, "low") == 1   # 80-95% used: no swarm
+    assert plan_swarm(3, 4, "critical") == 0
+
+
 def test_plan_swarm_no_swarm_when_constrained_or_single_unit():
     assert plan_swarm(12, 30, "constrained") == 1  # no swarm
     assert plan_swarm(1, 30, "abundant") == 1      # one unit never fans out

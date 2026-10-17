@@ -20,6 +20,7 @@ from contextlib import ExitStack
 from copy import copy
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Callable
 
 from . import __version__
 from .benchmark import (
@@ -371,7 +372,7 @@ def with_network(template: str) -> str:
 def _dispatch(template: str | list[str], task: str, *, target: str | None = None,
               stdin: bool = False, cwd: str | Path | None = None,
               env: dict[str, str] | None = None, log: str | Path | None = None,
-              timeout: float | None = None) -> int:
+              timeout: float | None = None, on_start: Callable[[int], None] | None = None) -> int:
     if not template:
         print("dispatch: no command configured for this pool", file=sys.stderr)
         return 1
@@ -399,7 +400,21 @@ def _dispatch(template: str | list[str], task: str, *, target: str | None = None
             if log is not None:
                 kwargs["stdout"] = stack.enter_context(Path(log).open("w", encoding="utf-8"))
                 kwargs["stderr"] = subprocess.STDOUT
-            proc = subprocess.run(argv, env=child_env, **kwargs)
+            if on_start is None:
+                proc = subprocess.run(argv, env=child_env, **kwargs)
+            else:
+                input_text = kwargs.pop("input", None)
+                wait_timeout = kwargs.pop("timeout", None)
+                if stdin:
+                    kwargs["stdin"] = subprocess.PIPE
+                with subprocess.Popen(argv, env=child_env, **kwargs) as proc:
+                    try:
+                        on_start(proc.pid)
+                        proc.communicate(input=input_text, timeout=wait_timeout)
+                    except BaseException:
+                        proc.kill()
+                        proc.communicate()
+                        raise
     except subprocess.TimeoutExpired:
         print(f"dispatch: timed out after {timeout}s", file=sys.stderr)
         return 124
@@ -691,6 +706,9 @@ def _parser(prog: str) -> argparse.ArgumentParser:
     swarm.add_argument("--no-quota", action="store_true")
     swarm_log = sub.add_parser("swarm-log", help="read a swarm's hub channel log")
     swarm_log.add_argument("swarm_id")
+    swarms = sub.add_parser("swarms", help="list recent swarm status")
+    swarms.add_argument("--json", action="store_true", help="print raw status records")
+    swarms.add_argument("--all", action="store_true", help="include swarms older than 24 hours")
 
     s = sub.add_parser("stats")
     s.add_argument("--arm")
@@ -823,7 +841,7 @@ def _ttl_arg(text: str) -> int:
 
 
 _SUBCOMMANDS = {"task", "stats", "outcome", "settle", "reseed", "federate", "benchmark", "ship",
-                "swarm", "swarm-log"}
+                "swarm", "swarm-log", "swarms"}
 
 
 def _run(argv: list[str] | None, *, auto: bool) -> int:
@@ -847,6 +865,9 @@ def _run(argv: list[str] | None, *, auto: bool) -> int:
         if args.command == "swarm-log":
             from .swarm_dispatch import swarm_log
             return swarm_log(args.swarm_id)
+        if args.command == "swarms":
+            from .swarm_status import list_swarms
+            return list_swarms(include_all=args.all, json_output=args.json)
         if getattr(args, "func", None):
             return args.func(args)
         return decide(args, auto=auto)

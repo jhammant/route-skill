@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shlex
 import subprocess
@@ -26,6 +27,7 @@ from .stats import Stats
 from .storage import atomic_write, state_dir
 from .swarm import plan_swarm, record_swarm_outcome
 from .swarm_channel import Channel, ChannelError, HubPoller, Worker, amail_binary, mcp_runtime, open_channel
+from .swarm_status import SwarmStatus, utc_now
 
 UNIT_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
 
@@ -159,10 +161,15 @@ def assign_units(manifest: dict, args: argparse.Namespace, quota: dict) -> tuple
     return assignments, held
 
 
+def branch_name(manifest: dict, unit_id: str) -> str:
+    """Per-run branch: the swarm ID keeps reruns of one manifest from colliding."""
+    return f"swarm/{manifest.get('swarm_id') or manifest['slug']}/{unit_id}"
+
+
 def render_brief(manifest: dict, assignment: Assignment, assignments: list[Assignment], *,
                  channel: Channel | None = None, placeholders: bool = False) -> str:
     unit = assignment.unit
-    branch = f"swarm/{manifest['slug']}/{unit['id']}"
+    branch = branch_name(manifest, unit["id"])
     text = (f"{manifest['shared']}\n\n## Your unit: {unit['id']}\n{unit['task']}\n\n"
             f"Acceptance check: `{unit['check']}`. It must pass before you finish. "
             f"Work only in this directory, on branch {branch}. Commit your work when the check passes; "
@@ -242,7 +249,7 @@ def _print_assignments(assignments: list[Assignment], held: list[dict]) -> None:
 
 def _run_unit(a: Assignment, manifest: dict, directory: Path, args: argparse.Namespace,
               semaphore: threading.Semaphore, brief: str, argv: list[str], env: dict,
-              address: str | None, cancelled: threading.Event) -> dict:
+              address: str | None, cancelled: threading.Event, live_status: SwarmStatus) -> dict:
     identity = a.unit["id"]
     worktree, log = directory / "wt" / identity, directory / "logs" / f"{identity}.log"
     with semaphore:
@@ -250,8 +257,17 @@ def _run_unit(a: Assignment, manifest: dict, directory: Path, args: argparse.Nam
             return {}
         print(f"swarm: {identity} starts on {a.arm}", flush=True)
         started = time.monotonic()
-        agent_rc = cli._dispatch(argv, brief, target=a.arm, stdin=a.ctx.task_on_stdin,
-                                 cwd=worktree, env=env, log=log, timeout=args.unit_timeout)
+        try:
+            agent_rc = cli._dispatch(argv, brief, target=a.arm, stdin=a.ctx.task_on_stdin,
+                                     cwd=worktree, env=env, log=log, timeout=args.unit_timeout,
+                                     on_start=lambda pid: live_status.unit(
+                                         identity, state="running", pid=pid, started_at=utc_now()))
+        except BaseException as exc:
+            live_status.unit(identity, state="failed", pid=None,
+                             agent_rc=130 if isinstance(exc, KeyboardInterrupt) else 1,
+                             wall_clock_s=round(time.monotonic() - started, 2), finished_at=utc_now())
+            raise
+        live_status.unit(identity, state="checking", pid=None, agent_rc=agent_rc)
         with log.open("a", encoding="utf-8") as output:
             output.write(f"\nAcceptance check: {a.unit['check']}\n")
             output.flush()
@@ -289,12 +305,14 @@ def _run_unit(a: Assignment, manifest: dict, directory: Path, args: argparse.Nam
             commit_error = "git could not record the result"
         result = {"id": identity, "decision_id": a.plan["decision_id"], "arm": a.arm,
                   "why": a.plan["why"], "shape": a.plan["shape"], "tier": a.plan["tier"],
-                  "address": address, "branch": f"swarm/{manifest['slug']}/{identity}",
+                  "address": address, "branch": branch_name(manifest, identity),
                   "worktree": str(worktree), "agent_rc": agent_rc, "accepted": accepted,
                   "wall_clock_s": round(time.monotonic() - started, 2), "log": str(log),
                   "committed": committed}
         if commit_error:
             result["commit_error"] = commit_error
+        live_status.unit(identity, state="accepted" if accepted else "failed", pid=None,
+                         agent_rc=agent_rc, wall_clock_s=result["wall_clock_s"], finished_at=utc_now())
         print(f"swarm: {identity} finishes on {a.arm}: {'accepted' if accepted else 'failed'} "
               f"(agent exit {agent_rc})" + (f"; {commit_error}" if commit_error else ""), flush=True)
         return result
@@ -326,6 +344,7 @@ def _settle(assignments: list[Assignment], results: list[dict], swarm_id: str) -
 
 def run_swarm(args: argparse.Namespace, *, auto: bool) -> int:
     manifest = load_manifest(args.manifest)
+    manifest["swarm_id"] = f"{manifest['slug']}-{datetime.now(timezone.utc):%Y%m%d%H%M%S}"
     quota = ({} if args.no_quota else cli.fetch_quota(cache_result=False) if args.plan_only
              else cli.fetch_quota())
     assignments, held = assign_units(manifest, args, quota)
@@ -337,18 +356,28 @@ def run_swarm(args: argparse.Namespace, *, auto: bool) -> int:
     if assignments and not auto and not cli._confirm("dispatch this swarm?"):
         print("not dispatched")
         return 0
-    swarm_id = f"{manifest['slug']}-{datetime.now(timezone.utc):%Y%m%d%H%M%S}"
+    swarm_id = manifest["swarm_id"]
     directory = (state_dir() / "swarms" / swarm_id).resolve()
     channel = poller = None
+    live_status = None
+    final_state, exit_code = "failed", 1
     try:
         directory.mkdir(parents=True, mode=0o700)  # Refuse same-second ID collisions.
+        live_status = SwarmStatus(directory, name=manifest["name"], host=args.host,
+            repo=manifest["repo"], route_pid=os.getpid(), held=held, units=[{
+                "id": a.unit["id"], "arm": a.arm, "why": a.plan["why"],
+                "shape": a.plan["shape"], "tier": a.plan["tier"],
+                "branch": branch_name(manifest, a.unit["id"]),
+                "worktree": str(directory / "wt" / a.unit["id"]),
+                "log": str(directory / "logs" / f"{a.unit['id']}.log"),
+            } for a in assignments])
         for name in ("briefs", "logs", "amail", "mcp", "wt"):
             (directory / name).mkdir(mode=0o700)
         repo = Path(manifest["repo"])
         if assignments and _git(repo, "status", "--porcelain").stdout.strip():
             print("swarm: warning: uncommitted changes are NOT included in the worktrees", file=sys.stderr)
         for a in assignments:
-            result = _git(repo, "worktree", "add", "-b", f"swarm/{manifest['slug']}/{a.unit['id']}",
+            result = _git(repo, "worktree", "add", "-b", branch_name(manifest, a.unit["id"]),
                           str(directory / "wt" / a.unit["id"]), manifest["base"])
             if result.returncode:
                 raise RuntimeError(f"worktree setup failed for {a.unit['id']}: {result.stderr.strip()}")
@@ -358,8 +387,10 @@ def run_swarm(args: argparse.Namespace, *, auto: bool) -> int:
                 print("swarm: warning: amail is missing; continuing without a channel", file=sys.stderr)
             else:
                 channel = open_channel(manifest["slug"], members, args.ttl, directory / "amail")
+                live_status.connect(channel.hub.address, channel.group_id)
                 print(f"channel: hub: {channel.hub.address}", flush=True)
                 for name, worker in channel.workers.items():
+                    live_status.unit(name, address=worker.address)
                     print(f"channel: {name}: {worker.address}", flush=True)
         prepared = []
         for a in assignments:
@@ -377,14 +408,14 @@ def run_swarm(args: argparse.Namespace, *, auto: bool) -> int:
             counts[a.arm], a.ctx.pools[a.arm].parallel_limit,
             quota.get(QUOTA_PROVIDER.get(a.arm)) or "comfortable"))) for a in assignments}
         if channel:
-            poller = HubPoller(channel, directory / "channel.jsonl")
+            poller = HubPoller(channel, directory / "channel.jsonl", on_message=live_status.channel)
             poller.start()
         results_by_id = {}
         executor = ThreadPoolExecutor(max_workers=args.max_parallel)
         cancelled = threading.Event()
         try:
             futures = [executor.submit(_run_unit, a, manifest, directory, args, semaphores[a.arm],
-                                       *prepared_unit, cancelled)
+                                       *prepared_unit, cancelled, live_status)
                        for a, prepared_unit in zip(assignments, prepared)]
             for future in as_completed(futures):
                 result = future.result()
@@ -412,18 +443,34 @@ def run_swarm(args: argparse.Namespace, *, auto: bool) -> int:
             next_arm = next((arm for arm in stronger if arm in a.plan["eligible"]), None)
             print(f"swarm: {a.unit['id']}: " + (f"consider {next_arm} next" if next_arm else
                   "no stronger eligible arm") + " (no automatic retry)")
-        return 0 if all(row["accepted"] for row in results) else 1
+        exit_code = 0 if all(row["accepted"] for row in results) else 1
+        final_state = "done" if exit_code == 0 else "failed"
     except KeyboardInterrupt:
+        final_state, exit_code = "interrupted", 130
         print("swarm: interrupted", file=sys.stderr)
-        return 130
     except (OSError, RuntimeError) as exc:
         print(f"swarm: {exc}", file=sys.stderr)
-        return 1
     finally:
-        if poller:
-            poller.stop()
-        if channel:
-            channel.close()
+        try:
+            try:
+                if poller:
+                    poller.stop()
+            finally:
+                if channel:
+                    channel.close()
+        except KeyboardInterrupt:
+            final_state, exit_code = "interrupted", 130
+            print("swarm: interrupted", file=sys.stderr)
+        except (OSError, RuntimeError) as exc:
+            final_state, exit_code = "failed", 1
+            print(f"swarm: {exc}", file=sys.stderr)
+        except BaseException:
+            final_state, exit_code = "failed", 1
+            raise
+        finally:
+            if live_status:
+                live_status.finish(final_state, exit_code)
+    return exit_code
 
 
 def swarm_log(swarm_id: str) -> int:

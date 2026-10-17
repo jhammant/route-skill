@@ -203,15 +203,30 @@ class HubPoller:
             return
         # Reading acks the whole batch, so one odd item must never cost the rest.
         for item in items:
+            # a-mail's inbox contract (docs/swarm-contracts.md): kinds are message, task, system and
+            # room_key. Only agent messages are swarm traffic; notices and key material are not.
             if not isinstance(item, dict) or item.get("kind") != "message":
                 continue
             try:
                 message = item["message"]
+                if message.get("sender_kind") == "system":
+                    continue  # group housekeeping (member joined/left), not a worker post
+                if message.get("status") in ("undecryptable", "not_for_device"):
+                    self._warn(f"skipped a hub message a-mail marked {message['status']}")
+                    continue
                 address = message["from"]
-                text = message["parts"][0]["text"]
-                if not isinstance(address, str) or not isinstance(text, str):
-                    raise TypeError("non-text message")
-            except (KeyError, IndexError, TypeError, AttributeError) as exc:
+                parts = message["parts"]
+                if not isinstance(address, str) or not isinstance(parts, list):
+                    raise TypeError("unexpected message shape")
+                # Text can sit in any part; older servers omit `type` on text parts.
+                texts = [part["text"] for part in parts if isinstance(part, dict)
+                         and part.get("type", "text") == "text" and isinstance(part.get("text"), str)]
+                if not texts:
+                    kinds = sorted({str(part.get("type")) for part in parts if isinstance(part, dict)}) or ["none"]
+                    self._warn(f"skipped a hub post with no text part ({', '.join(kinds)})")
+                    continue
+                text = "\n".join(texts)
+            except (KeyError, TypeError, AttributeError) as exc:
                 # Name the shape problem only; never echo message content.
                 self._warn(f"skipped a hub item it could not read ({type(exc).__name__}: {exc})")
                 continue

@@ -182,9 +182,20 @@ class FakeCommands:
                 return subprocess.CompletedProcess(argv, 1, "private diagnostic", "private diagnostic")
             payload = []
             if self.malformed_first and len(self.polls) == 1:
-                # A typed or data-only post: no text part. Content must never be echoed.
-                payload.append(dict(kind="message", message={"from": self.addresses[0],
-                    "parts": [{"type": "data", "data": "SECRET-PAYLOAD"}]}))
+                # Everything a-mail's inbox contract allows besides a plain post. Content must never be echoed.
+                payload += [
+                    dict(kind="message", message={"from": self.addresses[0], "parts": [
+                        {"type": "data", "taxi_type": "x.Y", "data": "SECRET-PAYLOAD"}]}),
+                    dict(kind="message", message={"from": "system", "sender_kind": "system",
+                        "parts": [{"type": "event", "event": "member_joined"}]}),
+                    dict(kind="message", message={"from": self.addresses[0], "status": "undecryptable",
+                        "parts": [{"type": "text", "text": "SECRET-PLACEHOLDER"}]}),
+                    dict(kind="system", system={"event": "group_joined", "message": "You joined"}),
+                    dict(kind="room_key", room_key={"key": "SECRET-KEY"}),
+                    dict(kind="message", message={"from": self.addresses[0], "sender_kind": "agent", "parts": [
+                        {"type": "text", "text": "first half"}, {"type": "data", "data": "SECRET-PAYLOAD"},
+                        {"type": "text", "text": "second half"}], "created_at": "now"}),
+                ]
             if len(self.polls) == 1 or wait == 3:
                 payload.append(dict(kind="message", message={"from": self.addresses[0],
                     "parts": [{"text": "Interface agreed\n" + "x" * 300}], "created_at": "now"}))
@@ -734,7 +745,7 @@ def test_poller_errors_warn_once_and_do_not_fail_the_swarm(repo, tmp_path, offli
     assert fake.polls[-1][0] == 3
 
 
-def test_poller_keeps_the_rest_of_a_batch_when_one_item_is_unreadable(repo, tmp_path, offline, capsys):
+def test_poller_follows_the_amail_inbox_contract_and_keeps_the_batch(repo, tmp_path, offline, capsys):
     # Arrange: reading acks the whole batch, so a skipped item must not take its neighbours with it.
     fake, _ = offline
     fake.malformed_first = True
@@ -745,9 +756,15 @@ def test_poller_keeps_the_rest_of_a_batch_when_one_item_is_unreadable(repo, tmp_
     out, err = capsys.readouterr()
     result, directory = summary()
     rows = [json.loads(line) for line in (directory / "channel.jsonl").read_text().splitlines()]
-    assert rows[0]["text"].startswith("Interface agreed")
-    assert err.count("skipped a hub item it could not read (KeyError: 'text')") == 1
-    assert "SECRET-PAYLOAD" not in out + err
+    texts = [row["text"] for row in rows]
+    assert texts[0] == "first half\nsecond half"          # text from every text part, data skipped
+    assert any(text.startswith("Interface agreed") for text in texts)
+    assert len(rows) == 3                                  # 2 posts in poll one + the final poll's post
+    assert err.count("skipped a hub post with no text part (data)") == 1
+    assert err.count("skipped a hub message a-mail marked undecryptable") == 1
+    assert "member_joined" not in err and "group_joined" not in err   # notices are quiet
+    assert all(secret not in out + err + (directory / "channel.jsonl").read_text()
+               for secret in ("SECRET-PAYLOAD", "SECRET-PLACEHOLDER", "SECRET-KEY"))
 
 
 @pytest.mark.parametrize("failure", ["configuration", "interrupt", "invalid-group"])

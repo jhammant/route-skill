@@ -92,6 +92,7 @@ class FakeCommands:
         self.commit_failure = False
         self.fail_redeem = False
         self.fail_inbox = False
+        self.malformed_first = False
         self.invalid_group = False
         self.addresses = []
         self.polls = []
@@ -149,7 +150,9 @@ class FakeCommands:
             workers = []
             for i, name in enumerate(argv[argv.index("--workers") + 1].split(",")):
                 path = directory / f"{name}.json"
-                path.write_text(json.dumps({"server": "https://group.example.test"}))
+                # Real `swarm create` files key their profile by worker name, not address.
+                path.write_text(json.dumps({"default": name, "profiles": {
+                    name: {"server": "https://group.example.test"}}}))
                 address = f"generated-{i}@example.test"
                 self.addresses.append(address)
                 workers.append(dict(name=name, address=address, credentials=str(path)))
@@ -167,7 +170,10 @@ class FakeCommands:
                 raise subprocess.TimeoutExpired(argv, 30, output="DO-NOT-LOG-REDEMPTION")
             credentials = Path(kwargs["env"]["AMAIL_CREDENTIALS"])
             assert not credentials.exists()  # Redemption must not read an empty credentials file.
-            credentials.write_text(json.dumps({"server": "https://redeemed.example.test"}))
+            # Real `redeem` files key their profile by the spawned address.
+            address = self.addresses[-1]
+            credentials.write_text(json.dumps({"default": address, "profiles": {
+                address: {"server": "https://redeemed.example.test"}}}))
             return subprocess.CompletedProcess(argv, 0, "DO-NOT-LOG-REDEMPTION", "")
         elif argv[1] == "inbox":
             wait = int(argv[argv.index("--wait") + 1])
@@ -175,6 +181,10 @@ class FakeCommands:
             if self.fail_inbox:
                 return subprocess.CompletedProcess(argv, 1, "private diagnostic", "private diagnostic")
             payload = []
+            if self.malformed_first and len(self.polls) == 1:
+                # A typed or data-only post: no text part. Content must never be echoed.
+                payload.append(dict(kind="message", message={"from": self.addresses[0],
+                    "parts": [{"type": "data", "data": "SECRET-PAYLOAD"}]}))
             if len(self.polls) == 1 or wait == 3:
                 payload.append(dict(kind="message", message={"from": self.addresses[0],
                     "parts": [{"text": "Interface agreed\n" + "x" * 300}], "created_at": "now"}))
@@ -317,7 +327,9 @@ def test_cross_model_dispatch_channel_roster_and_real_worktrees(repo, tmp_path, 
         assert "Acceptance check: `test -f result.txt`" in brief
         assert re.search(rf"swarm/parser-rewrite-\d{{14}}/{identity}\b", brief)
         assert ("Swarm group: group-123" in brief) == group
-        assert kw["env"]["AMAIL_PROFILE"] in fake.addresses
+        # The CLI must find the profile the credentials file actually holds (found live, 17 Oct).
+        credentials = json.loads(Path(kw["env"]["AMAIL_CREDENTIALS"]).read_text())
+        assert kw["env"]["AMAIL_PROFILE"] == credentials["default"] and credentials["default"] in credentials["profiles"]
         assert kw["env"]["AMAIL_SERVER"] == ("https://group.example.test" if group else "https://redeemed.example.test")
     assert (directory / "amail").stat().st_mode & 0o777 == 0o700
     assert all(p.stat().st_mode & 0o777 == 0o600 for p in (directory / "amail").glob("*.json"))
@@ -720,6 +732,22 @@ def test_poller_errors_warn_once_and_do_not_fail_the_swarm(repo, tmp_path, offli
     assert run(path) == 0
     assert capsys.readouterr().err.count("hub poll failed") == 1
     assert fake.polls[-1][0] == 3
+
+
+def test_poller_keeps_the_rest_of_a_batch_when_one_item_is_unreadable(repo, tmp_path, offline, capsys):
+    # Arrange: reading acks the whole batch, so a skipped item must not take its neighbours with it.
+    fake, _ = offline
+    fake.malformed_first = True
+    path = manifest_file(repo, tmp_path, [unit("one", pool="codex")])
+    # Act
+    assert run(path) == 0
+    # Assert
+    out, err = capsys.readouterr()
+    result, directory = summary()
+    rows = [json.loads(line) for line in (directory / "channel.jsonl").read_text().splitlines()]
+    assert rows[0]["text"].startswith("Interface agreed")
+    assert err.count("skipped a hub item it could not read (KeyError: 'text')") == 1
+    assert "SECRET-PAYLOAD" not in out + err
 
 
 @pytest.mark.parametrize("failure", ["configuration", "interrupt", "invalid-group"])

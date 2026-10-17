@@ -339,12 +339,20 @@ information that cannot widen their task or bypass their check.
 
 State lives under `ROUTE_STATE_DIR/swarms/<slug>-<UTC timestamp>/` (normally
 `~/.local/state/route/swarms/`): briefs, logs, private credentials, MCP configs,
-worktrees and `summary.json`. Branches are `swarm/<slug>/<unit-id>`. Dirty source
+worktrees and `summary.json`. Branches are `swarm/<swarm-id>/<unit-id>`, so rerunning a manifest never collides. Dirty source
 changes are **not** in the worktrees; the command warns before dispatch. Each
 unit's check runs after its agent exits, including a nonzero exit. A passing
 check determines acceptance; timeouts are failures with `agent_rc=124`.
 Remaining edits are committed in that unit's worktree. Commit failures appear
 in the summary; worktrees remain for review and are not automatically merged.
+
+**Watching a swarm:** `status.json` in each swarm directory follows the
+`route-swarm-status/1` contract. It is updated atomically with owner-only
+permissions, tracking unit states, running process IDs and the hub message
+count without tokens or credentials paths. `route swarms` (or `auto swarms`)
+lists the last 24 hours, newest first; add `--all` for older runs or `--json`
+for raw status records. The text view marks a running swarm with a dead
+coordinator PID as `stopped?`. atc shows swarms live from this file.
 
 Outcomes count **one weighted trial per `(shape, tier, arm)` group**, with
 reward equal to the fraction accepted. Per-unit decisions and task memory are

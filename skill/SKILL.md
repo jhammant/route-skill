@@ -146,3 +146,10 @@ broadcast when supported; `route swarm-log` reads the hub transcript. Use
 and refused for sensitive units. Swarm outcomes are already settled as one
 trial per `(shape, tier, arm)` group: do not run `settle` on individual members.
 Failed units get a stronger-arm suggestion only; do not retry automatically.
+
+**Watching a swarm:** Each swarm directory has an atomically updated, private
+`status.json` following the `route-swarm-status/1` contract, with unit states,
+running PIDs and channel message counts; it contains no tokens or credentials
+paths. `route swarms` / `auto swarms` lists the last 24 hours, newest first;
+use `--all` for older runs and `--json` for raw status records. A dead
+coordinator appears as `stopped?` in the text view. atc shows swarms live.

@@ -10,6 +10,7 @@ import sys
 import threading
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 DEFAULT_SERVER = "https://amail.hammantlabs.com"
 
@@ -171,10 +172,11 @@ def mcp_runtime() -> tuple[str, str]:
 class HubPoller:
     """Read only the hub inbox, never the user's anchor inbox."""
 
-    def __init__(self, channel: Channel, path: Path):
+    def __init__(self, channel: Channel, path: Path, *, on_message: Callable[[int], None] | None = None):
         self.channel = channel
         self.path = path
         self.count = 0
+        self._on_message = on_message
         self._stop = threading.Event()
         self._warned = False
         self._names = {worker.address: name for name, worker in channel.workers.items()}
@@ -197,6 +199,8 @@ class HubPoller:
                 with self.path.open("a", encoding="utf-8") as stream:
                     stream.write(json.dumps(row) + "\n")
                 self.count += 1
+                if self._on_message is not None:
+                    self._on_message(self.count)
                 one_line = " ".join(text.split())[:200]
                 print(f"[channel] {row['from_unit'] or address} → hub: {one_line}", flush=True)
         except (ChannelError, OSError, KeyError, IndexError, TypeError, AttributeError):

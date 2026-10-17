@@ -16,7 +16,9 @@ import shlex
 import subprocess
 import sys
 import time
-from dataclasses import asdict
+from contextlib import ExitStack
+from copy import copy
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from . import __version__
@@ -29,7 +31,7 @@ from .benchmark import (
     seed_priors,
 )
 from .complexity import TIERS, estimate_complexity, is_long_horizon
-from .eligibility import SensitiveRoutingError, fetch_quota, gate
+from .eligibility import GateResult, SensitiveRoutingError, fetch_quota, gate
 from .federate import (
     FederationState,
     aggregate,
@@ -41,7 +43,7 @@ from .federate import (
     push,
     status,
 )
-from .pools import load_pools, pools_for_host
+from .pools import Pool, load_pools, pools_for_host
 from .memory import TaskMemory
 from .outcomes import OUTCOME_EVENTS, record_failure, record_score, score_from_fix_passes, validate_score
 from .router import Router, cell_name
@@ -52,6 +54,7 @@ from .ship import RunResult, ShipAbort, build_pr_body, ship
 from .stats import report_quota, Decision, Stats, report_arm, report_cells, report_throughput
 from .storage import JsonStorage
 from .surplus import load_surplus_k, quota_adjustment
+from .swarm import detect_swarm, plan_swarm
 
 
 def _build_router() -> Router:
@@ -68,12 +71,28 @@ def _build_router() -> Router:
     return Router(storage=storage, community=community)
 
 
-def decide(args: argparse.Namespace, *, auto: bool) -> int:
-    text = " ".join(args.task).strip()
-    if not text:
-        print("route: empty task", file=sys.stderr)
-        return 2
+@dataclass
+class PlanContext:
+    pools: dict[str, Pool]
+    result: GateResult
+    decision: Decision
+    template: str
+    task_on_stdin: bool
+    router: Router
 
+
+class PlanningError(ValueError):
+    def __init__(self, message: str, exit_code: int = 1):
+        super().__init__(message)
+        self.exit_code = exit_code
+
+
+def plan_task(text: str, opts: argparse.Namespace, *, quota=None, exclude=(),
+              record: bool = True) -> tuple[dict, PlanContext]:
+    """Plan without dispatching; record=False leaves routing state untouched."""
+    args = opts
+    if not text.strip():
+        raise PlanningError("empty task", 2)
     host = args.host
     pools = pools_for_host(load_pools(), host)
     classification = (ShapeClassification(args.shape, "high", "explicit") if args.shape else
@@ -81,7 +100,9 @@ def decide(args: argparse.Namespace, *, auto: bool) -> int:
     shape = classification.shape
     tier = args.tier or estimate_complexity(text)
     long_horizon = is_long_horizon(text)
-    quota = fetch_quota() if not args.no_quota else {}
+    if quota is None:
+        quota = ({} if args.no_quota else
+                 fetch_quota() if record else fetch_quota(cache_result=False))
     # Quota gating is fail-open by contract, but a silent no-op is how a
     # 97%-used pool keeps getting picked. Say so in the plan.
     if args.no_quota:
@@ -97,9 +118,6 @@ def decide(args: argparse.Namespace, *, auto: bool) -> int:
     # (--sensitive, a sensitive:true task field, or the sensitive.toml path
     # allowlist). Never inferred from content heuristics.
     sensitive = detect_sensitive(text, flag=args.sensitive)
-    if getattr(args, "allow_network", False) and sensitive:
-        print("route: --allow-network cannot be combined with a sensitive task", file=sys.stderr)
-        return 2
     # The content regex is a one-way safety net: it may only ever move a task
     # toward MORE caution, never less. If it thinks this might be private, the
     # safest destination is the machine the data cannot leave — not Claude,
@@ -113,6 +131,8 @@ def decide(args: argparse.Namespace, *, auto: bool) -> int:
     if not sensitive and probably_private(text):
         sensitive = True
         auto_sensitive = True
+    if getattr(args, "allow_network", False) and sensitive:
+        raise PlanningError("--allow-network cannot be combined with a sensitive task", 2)
 
     try:
         result = gate(
@@ -130,10 +150,15 @@ def decide(args: argparse.Namespace, *, auto: bool) -> int:
         )
     except (SensitiveRoutingError, ValueError) as exc:
         # Fail loudly — never silently fall back to a remote arm.
-        print(f"route: {exc}", file=sys.stderr)
-        return 1
+        raise PlanningError(str(exc)) from exc
 
+    survivors = [arm for arm in result.eligible if arm not in exclude]
+    if survivors:
+        result.eligible = survivors
     router = _build_router()
+    if not record:
+        router = copy(router)
+        router.storage = router.storage.snapshot()
     memory = TaskMemory()
     adjustments = {arm: 0.0 for arm in result.eligible}
     neighbours = []
@@ -155,7 +180,8 @@ def decide(args: argparse.Namespace, *, auto: bool) -> int:
             adjustments[arm] = quota_adjustment(
                 window.get("percentUsed"), window.get("resetsInMinutes"), k,
                 headroom=quota.get(provider))
-        neighbours = memory.neighbours(text, shape, candidates)
+        if record or memory.salt_path.is_file():
+            neighbours = memory.neighbours(text, shape, candidates)
         chosen = router.select(shape, tier, result.eligible, prefer=prefer,
                                record_impression=False, neighbours=neighbours, quota_adjustment=adjustments)
         why = "posterior" if any(sum(v) for v in observed.values()) else "prior"
@@ -172,8 +198,9 @@ def decide(args: argparse.Namespace, *, auto: bool) -> int:
 
     decision = Decision(cell=cell_name(shape, tier), shape=shape, tier=tier,
                         eligible=result.eligible, chosen=chosen, why=why)
-    Stats().record_decision(decision)
-    memory.remember(decision.decision_id, text, shape, tier, chosen)
+    if record:
+        Stats().record_decision(decision)
+        memory.remember(decision.decision_id, text, shape, tier, chosen)
 
     plan = {
         "decision_id": decision.decision_id,
@@ -203,7 +230,36 @@ def decide(args: argparse.Namespace, *, auto: bool) -> int:
         plan["veto"] = {"name": result.veto.name, "reason": result.veto.reason}
     if getattr(args, "allow_network", False):
         plan["allow_network"] = True  # on the record: this run may reach the network
+    hint = detect_swarm(text, shape)
+    cap = plan_swarm(hint.units, pools[chosen].parallel_limit,
+                     quota.get(QUOTA_PROVIDER.get(chosen)) or "comfortable")
+    plan["swarm"] = {**asdict(hint), "cap": cap,
+                     "suggested": hint.suggested and cap >= 2}
+    if hint.suggested and cap < 2:
+        headroom = quota.get(QUOTA_PROVIDER.get(chosen)) or "comfortable"
+        plan["swarm"]["reason"] = f"quota: {chosen} headroom {headroom}"
+    override = getattr(args, "swarm", None)
+    if override is not None:
+        plan["swarm"].update(suggested=override,
+                             reason="user:--swarm" if override else "user:--no-swarm")
+    template, task_on_stdin = pools[chosen].dispatch_for(shape)
+    return plan, PlanContext(pools, result, decision, template, task_on_stdin, router)
+
+
+def decide(args: argparse.Namespace, *, auto: bool) -> int:
+    text = " ".join(args.task).strip()
+    try:
+        plan, ctx = plan_task(text, args)
+    except PlanningError as exc:
+        print(f"route: {exc}", file=sys.stderr)
+        return exc.exit_code
+    pools, router, decision = ctx.pools, ctx.router, ctx.decision
+    chosen, host, shape, tier = (plan[k] for k in ("chosen", "host", "shape", "tier"))
     print(json.dumps(plan, indent=2, sort_keys=True), flush=True)
+    if plan["swarm"]["suggested"]:
+        hint = plan["swarm"]
+        print(f"swarm: this splits into ~{hint['units']} independent units (cap {hint['cap']}). "
+              "Write a manifest and run: auto swarm <manifest.json>")
 
     if args.plan_only:
         print("dispatch: plan only (nothing launched)")
@@ -213,8 +269,7 @@ def decide(args: argparse.Namespace, *, auto: bool) -> int:
         print("dispatch: stay (this task belongs here)")
         return 0
 
-    pool = pools[chosen]
-    template, task_on_stdin = pool.dispatch_for(shape)
+    template, task_on_stdin = ctx.template, ctx.task_on_stdin
     if getattr(args, "allow_network", False):
         if chosen == "codex":
             template = with_network(template)
@@ -313,11 +368,14 @@ def with_network(template: str) -> str:
     return template.replace("codex exec", f"codex exec {CODEX_NETWORK}", 1)
 
 
-def _dispatch(template: str, task: str, *, target: str | None = None, stdin: bool = False) -> int:
+def _dispatch(template: str | list[str], task: str, *, target: str | None = None,
+              stdin: bool = False, cwd: str | Path | None = None,
+              env: dict[str, str] | None = None, log: str | Path | None = None,
+              timeout: float | None = None) -> int:
     if not template:
         print("dispatch: no command configured for this pool", file=sys.stderr)
         return 1
-    tokens = shlex.split(template)
+    tokens = shlex.split(template) if isinstance(template, str) else list(template)
     if stdin:
         # The task travels on stdin, never argv (deepseek batch: `ask -`).
         argv = tokens
@@ -328,14 +386,28 @@ def _dispatch(template: str, task: str, *, target: str | None = None, stdin: boo
     started = time.monotonic()
     try:
         # A delegated agent must see itself as host if it invokes route again.
-        env = dict(os.environ)
+        child_env = dict(os.environ)
+        child_env.update(env or {})
         if target in ("claude", "codex"):
-            env["ROUTE_HOST"] = target
-        proc = subprocess.run(argv, env=env, **({"input": task, "text": True} if stdin else {}))
+            child_env["ROUTE_HOST"] = target
+        kwargs = {"input": task, "text": True} if stdin else {}
+        if cwd is not None:
+            kwargs["cwd"] = cwd
+        if timeout is not None:
+            kwargs["timeout"] = timeout
+        with ExitStack() as stack:
+            if log is not None:
+                kwargs["stdout"] = stack.enter_context(Path(log).open("w", encoding="utf-8"))
+                kwargs["stderr"] = subprocess.STDOUT
+            proc = subprocess.run(argv, env=child_env, **kwargs)
+    except subprocess.TimeoutExpired:
+        print(f"dispatch: timed out after {timeout}s", file=sys.stderr)
+        return 124
     except OSError as exc:
         print(f"dispatch failed: {exc}", file=sys.stderr)
         return 1
-    print(f"dispatch: exit {proc.returncode} in {time.monotonic() - started:.1f}s")
+    if log is None:
+        print(f"dispatch: exit {proc.returncode} in {time.monotonic() - started:.1f}s")
     return proc.returncode
 
 
@@ -358,6 +430,8 @@ def cmd_outcome(args: argparse.Namespace) -> int:
     stats = Stats()
     decision = _outcome_decision(args, stats)
     decision_id = decision.get("decision_id") if decision else None
+    if decision and decision.get("swarm"):
+        raise ValueError(f"decision {decision_id} was settled as part of swarm {decision['swarm']}")
     shape, tier, arm = args.shape, args.tier, args.arm
     already = set(decision.get("outcome_events", [])) if decision else set()
 
@@ -601,6 +675,23 @@ def _parser(prog: str) -> argparse.ArgumentParser:
     t = sub.add_parser("task", help="route a task (default)")
     _add_task_flags(t)
 
+    swarm = sub.add_parser("swarm", help="dispatch independently checked units across model pools")
+    swarm.add_argument("manifest", help="JSON manifest path, or - for stdin")
+    swarm.add_argument("--host", choices=["claude", "codex"],
+                       default=os.environ.get("ROUTE_HOST", "claude"))
+    swarm.add_argument("--plan-only", action="store_true")
+    swarm.add_argument("--pool", help="pin units that do not name their own pool")
+    swarm.add_argument("--no-amail", action="store_true")
+    swarm.add_argument("--ttl", type=_ttl_arg, default=120, metavar="MIN")
+    swarm.add_argument("--max-parallel", type=_positive_int, default=4, metavar="N")
+    swarm.add_argument("--unit-timeout", type=_positive_int, default=3600, metavar="S")
+    swarm.add_argument("--check-timeout", type=_positive_int, default=600, metavar="S")
+    swarm.add_argument("--allow-network", action="store_true", help="codex only; refused with sensitive units")
+    swarm.add_argument("--sensitive", action="store_true")
+    swarm.add_argument("--no-quota", action="store_true")
+    swarm_log = sub.add_parser("swarm-log", help="read a swarm's hub channel log")
+    swarm_log.add_argument("swarm_id")
+
     s = sub.add_parser("stats")
     s.add_argument("--arm")
     s.add_argument("--throughput", action="store_true")
@@ -691,6 +782,11 @@ def _add_task_flags(p: argparse.ArgumentParser) -> None:
     llm.add_argument("--llm-shape", action="store_true", help="resolve low-confidence shapes with the local LLM")
     llm.add_argument("--no-llm", action="store_true", help="skip the local-LLM shape tiebreak (default)")
     p.add_argument("--no-quota", action="store_true", help="skip quotamax")
+    swarm = p.add_mutually_exclusive_group()
+    swarm.add_argument("--swarm", dest="swarm", action="store_true", default=None,
+                       help="suggest a swarm, even when quota limits concurrency")
+    swarm.add_argument("--no-swarm", dest="swarm", action="store_false",
+                       help="suppress swarm suggestions")
 
 
 def _score_arg(text: str) -> float:
@@ -709,7 +805,25 @@ def _fix_passes_arg(text: str) -> int:
         raise argparse.ArgumentTypeError("fix passes must be a non-negative integer") from exc
 
 
-_SUBCOMMANDS = {"task", "stats", "outcome", "settle", "reseed", "federate", "benchmark", "ship"}
+def _positive_int(text: str) -> int:
+    try:
+        value = int(text)
+        if value > 0:
+            return value
+    except ValueError:
+        pass
+    raise argparse.ArgumentTypeError("must be a positive integer")
+
+
+def _ttl_arg(text: str) -> int:
+    value = _positive_int(text)
+    if value > 10080:
+        raise argparse.ArgumentTypeError("ttl must be between 1 and 10080 minutes")
+    return value
+
+
+_SUBCOMMANDS = {"task", "stats", "outcome", "settle", "reseed", "federate", "benchmark", "ship",
+                "swarm", "swarm-log"}
 
 
 def _run(argv: list[str] | None, *, auto: bool) -> int:
@@ -727,6 +841,12 @@ def _run(argv: list[str] | None, *, auto: bool) -> int:
         if args.abandoned and (args.outcome is not None or args.score is not None):
             parser.error("--abandoned cannot be combined with --outcome or --score")
     try:
+        if args.command == "swarm":
+            from .swarm_dispatch import run_swarm
+            return run_swarm(args, auto=auto)
+        if args.command == "swarm-log":
+            from .swarm_dispatch import swarm_log
+            return swarm_log(args.swarm_id)
         if getattr(args, "func", None):
             return args.func(args)
         return decide(args, auto=auto)

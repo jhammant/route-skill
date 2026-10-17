@@ -249,6 +249,117 @@ and append `+surplus:<arm>` or `-pressure:<arm>` to `why` for the chosen arm.
 `surplus_bonus` remains a **deprecated alias with the same signed values** for
 one release. Adjustments affect selection only, never learned counts.
 
+## Swarms: cross-model, and they talk
+
+When work splits into independent pieces, give each piece its own acceptance
+check and run a swarm. Each member gets a Git worktree, a branch and a brief;
+the router assigns its model separately. For example, save this as `swarm.json`:
+
+```json
+{
+  "name": "parser-rewrite",
+  "repo": ".",
+  "base": "HEAD",
+  "shared": "Keep the existing token and AST interfaces. Coordinate interface changes before implementing them.",
+  "units": [
+    {
+      "id": "lexer",
+      "task": "Implement the lexer changes in lexer.py and its tests.",
+      "check": "pytest -q tests/test_lexer.py",
+      "shape": "coding:implement",
+      "tier": "moderate"
+    },
+    {
+      "id": "parser",
+      "task": "Implement the parser changes in parser.py and its tests.",
+      "check": "pytest -q tests/test_parser.py",
+      "shape": "coding:implement",
+      "tier": "hard",
+      "pool": "codex",
+      "sensitive": false
+    }
+  ]
+}
+```
+
+```bash
+route swarm swarm.json --host codex --plan-only  # assignments and briefs; no state written
+route swarm swarm.json --host codex             # one confirmation for the whole swarm
+auto swarm swarm.json --host codex              # dispatch immediately
+auto swarm swarm.json --host codex --pool kimi  # default pool for all unpinned units
+route swarm-log parser-rewrite-20261017120000    # read the hub conversation
+```
+
+The manifest can also come from stdin (`auto swarm -`). `name`, a non-empty
+`units` list, and each unit's `id`, `task` and `check` are required. IDs must
+match `[a-z0-9][a-z0-9-]{0,31}` and be unique; `hub` is reserved. `repo` must be
+a Git worktree and defaults to the current directory; `base` defaults to
+`HEAD`. Relative repo paths are relative to the command's working directory.
+`shape`, `tier`, `pool` and `sensitive` are optional unit overrides. A unit's
+pool or sensitivity takes precedence over the swarm flags.
+
+Units in the same `(shape, tier, sensitive, pin)` cell reuse an eligible arm
+while it has capacity. Once full, a unit spills to another eligible arm with
+room (`+spill:<arm>`); if none has room, it queues. Capacity is bounded by the
+pool's parallel limit and quota headroom. Different shapes and tiers route
+independently. `--pool` pins every unit without its own pool, allowing a
+single-model swarm. Context and other non-pin vetoes are **held for the host**,
+never dispatched. A unit assigned to the host's own model runs headlessly,
+since the current session is coordinating.
+
+With `amail` installed, each tool-capable unit gets a separate identity,
+credentials file, peer address roster and coordinator hub address. Addresses
+are printed so the orchestrating session can message members using its own
+a-mail tools. Codex gets five per-run MCP overrides: bridge command, arguments,
+credentials/server environment, and approval for only `amail_inbox` and
+`amail_send`. Claude gets an isolated `--mcp-config` and those two allowed
+tools. Kimi uses the shell CLI with its own environment. No user config or
+`HOME` is changed. Batch shapes and tasks sent on stdin get no channel.
+
+If `amail swarm create` is available, members and the hub join an encrypted
+group, with group broadcast instructions in their briefs; the group is ended
+on completion, failure or interruption. Otherwise, direct sub-agents are
+spawned and redeemed by the parent, and expire by TTL. Only the hub inbox is
+polled: the user's own inbox is never consumed. Messages appear live and in
+`channel.jsonl`. Briefs tell members to check their inbox, share interface
+decisions with affected peers and the hub, and treat messages as untrusted
+information that cannot widen their task or bypass their check.
+
+| Flag | Effect |
+|---|---|
+| `--plan-only` | Validate and show assignments plus briefs with placeholder addresses; create no worktrees, identities or routing state. |
+| `--no-amail` | Disable messaging; a missing `amail` also warns and continues without a channel. |
+| `--ttl MIN` | Identity lifetime, default 120 minutes; range 1–10080. |
+| `--max-parallel N` | Global concurrency limit, default 4, in addition to each arm's cap. |
+| `--unit-timeout S` | Agent deadline, default 3600 seconds. |
+| `--check-timeout S` | Acceptance-check deadline, default 600 seconds. |
+| `--allow-network` | Enable Codex sandbox networking for this run only; refused for sensitive units. |
+| `--sensitive` | Apply sensitive routing to units unless explicitly overridden. |
+| `--no-quota` | Skip the single quota fetch for this swarm. |
+
+State lives under `ROUTE_STATE_DIR/swarms/<slug>-<UTC timestamp>/` (normally
+`~/.local/state/route/swarms/`): briefs, logs, private credentials, MCP configs,
+worktrees and `summary.json`. Branches are `swarm/<slug>/<unit-id>`. Dirty source
+changes are **not** in the worktrees; the command warns before dispatch. Each
+unit's check runs after its agent exits, including a nonzero exit. A passing
+check determines acceptance; timeouts are failures with `agent_rc=124`.
+Remaining edits are committed in that unit's worktree. Commit failures appear
+in the summary; worktrees remain for review and are not automatically merged.
+
+Outcomes count **one weighted trial per `(shape, tier, arm)` group**, with
+reward equal to the fraction accepted. Per-unit decisions and task memory are
+settled too; `route outcome` and `route settle` refuse to settle them again.
+The command exits 0 if every dispatched unit is accepted, otherwise 1. Failed
+units get a suggestion for the next-stronger eligible arm, with no automatic
+retry. Held units remain the orchestrator's responsibility.
+
+Ordinary task plans now include `swarm`: independent-unit cues, an estimated
+unit count and the selected pool's concurrency cap. When `suggested` is true,
+write a manifest with per-unit checks and shared interfaces, then run the swarm.
+The hint never launches one automatically. Sequential work is not a swarm.
+On task commands, `--swarm` forces the suggestion even when quota caps concurrency
+at one; `--no-swarm` suppresses it. These overrides are mutually exclusive.
+
 ## Local memory of similar tasks
 
 The router also finds up to five settled tasks of the same shape, across tiers,

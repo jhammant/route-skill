@@ -58,9 +58,16 @@ class JsonStorage:
     units accepted (SPEC 'Swarms', statistical honesty).
     """
 
-    def __init__(self, path: str | Path | None = None) -> None:
+    def __init__(self, path: str | Path | None = None, *, persist: bool = True) -> None:
         self.path = Path(path) if path is not None else state_dir() / "bandits.json"
         self._data: dict[str, dict[str, float]] | None = None
+        self.persist = persist
+
+    def snapshot(self) -> JsonStorage:
+        """An independent, in-memory copy for planning without writing seeds."""
+        snapshot = JsonStorage(self.path, persist=False)
+        snapshot._data = {key: dict(counts) for key, counts in self._load().items()}
+        return snapshot
 
     def _load(self) -> dict[str, dict[str, float]]:
         if self._data is None:
@@ -77,6 +84,8 @@ class JsonStorage:
 
     def _save(self) -> None:
         assert self._data is not None
+        if not self.persist:
+            return
         self.path.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=self.path.parent, prefix=".bandits-", suffix=".tmp")
         try:

@@ -108,3 +108,41 @@ Privacy: classification reads the task locally; delegation sends it to the
 selected arm. Raw task text never persists in task memory. Federation exports
 shapes, model identities and counts, never task text, hashes, file paths or
 repo names. `route federate export` previews that payload and shares nothing.
+
+## Swarms
+
+If the plan's `swarm.suggested` is true, or you can see the task splits into
+independent units that each have a check, write the manifest (one unit per
+independent piece, each with its own `check`, plus shared interface notes in
+`shared`) and run `route swarm` / `auto swarm`. Otherwise dispatch normally.
+Don't swarm sequential work.
+
+When the user says to swarm (or not to), pass `--swarm`/`--no-swarm` on the task
+command; when they name a model for the swarm, pass `--pool`. An explicit
+override beats detection, including quota caps on the hint. The manifest has
+`name`, `repo` (default `.`), `base` (default `HEAD`), `shared`, and `units`.
+Each unit needs a unique lowercase alphanumeric/hyphen `id` (1–32 characters,
+not `hub`), `task`, and `check`; `shape`, `tier`, `pool` and `sensitive` are
+optional. A unit's pool/sensitivity overrides the swarm flags.
+
+```bash
+route swarm manifest.json --host codex --plan-only
+route swarm manifest.json --host codex
+route swarm-log <swarm-id>
+```
+
+Use `--host claude` in Claude Code. `route swarm` asks once for the whole swarm;
+`auto swarm` dispatches immediately. Same-cell units reuse a model until its
+capacity is full, then spill to another eligible arm or queue. Non-pin vetoes
+are held for you to handle. Each member runs in its own worktree and branch,
+gets checked and commits its result. Review the summary and branches afterward.
+
+a-mail addresses are printed so the orchestrating session can message members
+with its own amail tools. Members get a peer roster and hub, with group
+broadcast when supported; `route swarm-log` reads the hub transcript. Use
+`--no-amail` to disable it. Batch/stdin units have no channel. `--max-parallel`
+(default 4), `--ttl` (120 minutes), `--unit-timeout` (3600 seconds), and
+`--check-timeout` (600 seconds) bound the run. `--allow-network` is Codex-only
+and refused for sensitive units. Swarm outcomes are already settled as one
+trial per `(shape, tier, arm)` group: do not run `settle` on individual members.
+Failed units get a stronger-arm suggestion only; do not retry automatically.

@@ -47,14 +47,22 @@ class Worker:
     credentials_path: Path
 
     def environment(self) -> dict[str, str]:
+        # a-mail files are {"default": name, "profiles": {name: {..., "server"}}}. `redeem` keys the
+        # profile by address but `swarm create` by worker name, so name the file's own default.
+        server, profile = DEFAULT_SERVER, self.address
         try:
             credentials = json.loads(self.credentials_path.read_text(encoding="utf-8"))
-            server = credentials.get("server") or DEFAULT_SERVER
+            profiles, default = credentials.get("profiles"), credentials.get("default")
+            if isinstance(profiles, dict) and isinstance(default, str) and isinstance(profiles.get(default), dict):
+                profile = default
+                server = profiles[default].get("server") or server
+            else:
+                server = credentials.get("server") or server
         except (OSError, ValueError, AttributeError):
-            server = DEFAULT_SERVER
+            pass
         return {"AMAIL_CREDENTIALS": str(self.credentials_path),
                 "AMAIL_SERVER": os.environ.get("AMAIL_SERVER", server),
-                "AMAIL_PROFILE": self.address}
+                "AMAIL_PROFILE": profile}
 
 
 class Channel:
@@ -178,7 +186,7 @@ class HubPoller:
         self.count = 0
         self._on_message = on_message
         self._stop = threading.Event()
-        self._warned = False
+        self._warnings: set[str] = set()
         self._names = {worker.address: name for name, worker in channel.workers.items()}
         self._thread = threading.Thread(target=self._loop, name="swarm-hub", daemon=True)
 
@@ -188,25 +196,42 @@ class HubPoller:
 
     def _poll(self, wait: int) -> None:
         try:
-            for item in self.channel.inbox(wait):
-                if not isinstance(item, dict) or item.get("kind") != "message":
-                    continue
+            items = self.channel.inbox(wait)
+        except (ChannelError, OSError) as exc:
+            # ChannelError text is sanitized (it never carries CLI output or tokens).
+            self._warn(f"hub poll failed ({exc}); continuing the swarm")
+            return
+        # Reading acks the whole batch, so one odd item must never cost the rest.
+        for item in items:
+            if not isinstance(item, dict) or item.get("kind") != "message":
+                continue
+            try:
                 message = item["message"]
                 address = message["from"]
                 text = message["parts"][0]["text"]
-                row = {"at": message.get("created_at"), "from": address,
-                       "from_unit": self._names.get(address), "text": text}
+                if not isinstance(address, str) or not isinstance(text, str):
+                    raise TypeError("non-text message")
+            except (KeyError, IndexError, TypeError, AttributeError) as exc:
+                # Name the shape problem only; never echo message content.
+                self._warn(f"skipped a hub item it could not read ({type(exc).__name__}: {exc})")
+                continue
+            row = {"at": message.get("created_at"), "from": address,
+                   "from_unit": self._names.get(address), "text": text}
+            try:
                 with self.path.open("a", encoding="utf-8") as stream:
                     stream.write(json.dumps(row) + "\n")
-                self.count += 1
-                if self._on_message is not None:
-                    self._on_message(self.count)
-                one_line = " ".join(text.split())[:200]
-                print(f"[channel] {row['from_unit'] or address} → hub: {one_line}", flush=True)
-        except (ChannelError, OSError, KeyError, IndexError, TypeError, AttributeError):
-            if not self._warned:
-                print("channel: hub poll failed; continuing the swarm", file=sys.stderr)
-                self._warned = True
+            except OSError as exc:
+                self._warn(f"hub log write failed ({exc}); continuing the swarm")
+            self.count += 1
+            if self._on_message is not None:
+                self._on_message(self.count)
+            one_line = " ".join(text.split())[:200]
+            print(f"[channel] {row['from_unit'] or address} → hub: {one_line}", flush=True)
+
+    def _warn(self, text: str) -> None:
+        if text not in self._warnings:
+            self._warnings.add(text)
+            print(f"channel: {text}", file=sys.stderr)
 
     def _loop(self) -> None:
         while not self._stop.is_set():

@@ -102,7 +102,11 @@ sensitive data is excluded from `free` before quota or the bandit are
 consulted, subject to the explicit pin policy above. Content matching also
 escalates potentially private tasks to sensitive, preferring local arms.
 Explicit `--private` pins to the current host. Neither replaces the caller's
-explicit sensitivity signal: when in doubt, mark `--sensitive`.
+explicit sensitivity signal: when in doubt, mark `--sensitive`. When the safety
+net misfires on public work (for example a brief saying "no customer data"),
+pass `--open` to declare the data public. It overrides only the keyword guess,
+never `--sensitive`, `--private` or a `sensitive.toml` path, and the plan
+records `data_class_override`.
 
 Privacy: classification reads the task locally; delegation sends it to the
 selected arm. Raw task text never persists in task memory. Federation exports

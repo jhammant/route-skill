@@ -103,13 +103,15 @@ def detect_veto(
     needs_context: bool = False,
     cross_repo: bool = False,
     skip_private: bool = False,
+    trust_open: bool = False,
 ) -> Veto | None:
     """Evaluate hard gates before anything else. First veto wins.
 
     Explicit flags beat inferred cues; a user pool pin beats everything.
     ``skip_private`` suppresses the private-data safety net when the caller
     handles sensitivity itself (the sensitive dataClass), so later vetoes —
-    e.g. orchestration — still surface.
+    e.g. orchestration — still surface. ``trust_open`` (the user's ``--open``)
+    skips only the content regex; an explicit ``private`` flag still vetoes.
     """
     if pool_pin:
         return Veto("user-pin", f"user pinned pool '{pool_pin}'", target=pool_pin)
@@ -117,7 +119,7 @@ def detect_veto(
         return Veto("needs-context", "needs this conversation's context — no other pool has it")
     if cross_repo or _CROSS_REPO_RE.search(text):
         return Veto("cross-repo", "cross-repo / multi-directory orchestration — remote pools are dir-sandboxed")
-    if not skip_private and (private or _PRIVATE_RE.search(text)):
+    if not skip_private and (private or (not trust_open and _PRIVATE_RE.search(text))):
         return Veto("private-data", "private data must not leave the machine")
     if no_acceptance or _NO_ACCEPTANCE_RE.search(text):
         return Veto("no-acceptance", "no clear acceptance check — can't verify a hand-off")
@@ -431,6 +433,7 @@ def gate(
     needs_context: bool = False,
     cross_repo: bool = False,
     host: str = VETO_TARGET,
+    open_data: bool = False,
 ) -> GateResult:
     """Steps 2-4 in order: veto, eligibility, quota.
 
@@ -456,6 +459,8 @@ def gate(
         # safety net (keep claude AND local-*, prefer local), so it subsumes
         # the private-data veto — later vetoes still apply.
         skip_private=sensitive,
+        # --open: the user declared the data public, so the keyword guess is overridden.
+        trust_open=open_data,
     )
     if veto is not None:
         if veto.name != "user-pin":

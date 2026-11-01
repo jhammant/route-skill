@@ -118,7 +118,14 @@ def plan_task(text: str, opts: argparse.Namespace, *, quota=None, exclude=(),
     # dataClass: 'open' by default, 'sensitive' only on an explicit signal
     # (--sensitive, a sensitive:true task field, or the sensitive.toml path
     # allowlist). Never inferred from content heuristics.
+    open_data = getattr(args, "open_data", False)
+    if open_data and (args.sensitive or args.private):
+        raise PlanningError("--open contradicts --sensitive/--private: pick one", 2)
     sensitive = detect_sensitive(text, flag=args.sensitive)
+    if open_data and sensitive:
+        # sensitive.toml is the user's own explicit config: it outranks a per-task flag.
+        raise PlanningError("--open cannot override a path listed in sensitive.toml; "
+                            "edit that file if the path is no longer sensitive", 2)
     # The content regex is a one-way safety net: it may only ever move a task
     # toward MORE caution, never less. If it thinks this might be private, the
     # safest destination is the machine the data cannot leave — not Claude,
@@ -128,10 +135,18 @@ def plan_task(text: str, opts: argparse.Namespace, *, quota=None, exclude=(),
     #
     # It is never the reverse: the regex NOT firing proves nothing, which is why
     # detect_sensitive stays explicit-only.
+    #
+    # --open is the explicit way out of a false positive (e.g. "no customer data"
+    # trips the regex): the user declares the data public. It overrides only this
+    # keyword guess, never an explicit signal, and the plan records that it fired.
     auto_sensitive = False
+    safety_net_overridden = False
     if not sensitive and probably_private(text):
-        sensitive = True
-        auto_sensitive = True
+        if open_data:
+            safety_net_overridden = True
+        else:
+            sensitive = True
+            auto_sensitive = True
     if getattr(args, "allow_network", False) and sensitive:
         raise PlanningError("--allow-network cannot be combined with a sensitive task", 2)
 
@@ -148,6 +163,7 @@ def plan_task(text: str, opts: argparse.Namespace, *, quota=None, exclude=(),
             needs_context=args.needs_context,
             cross_repo=args.cross_repo,
             host=host,
+            open_data=open_data,
         )
     except (SensitiveRoutingError, ValueError) as exc:
         # Fail loudly — never silently fall back to a remote arm.
@@ -231,6 +247,9 @@ def plan_task(text: str, opts: argparse.Namespace, *, quota=None, exclude=(),
         plan["veto"] = {"name": result.veto.name, "reason": result.veto.reason}
     if getattr(args, "allow_network", False):
         plan["allow_network"] = True  # on the record: this run may reach the network
+    if open_data:
+        # on the record: the user declared the data public, and whether that overrode the safety net
+        plan["data_class_override"] = {"flag": "--open", "content_safety_net_matched": safety_net_overridden}
     hint = detect_swarm(text, shape)
     cap = plan_swarm(hint.units, pools[chosen].parallel_limit,
                      quota.get(QUOTA_PROVIDER.get(chosen)) or "comfortable")
@@ -793,6 +812,9 @@ def _add_task_flags(p: argparse.ArgumentParser) -> None:
     p.add_argument("--allow-network", action="store_true",
                    help="codex only, this run only: let the sandbox use the network, including local "
                         "test sockets (workspace-write has it off). Refused with --sensitive")
+    p.add_argument("--open", dest="open_data", action="store_true",
+                   help="declare the task's data public: overrides the content safety net (a keyword guess), "
+                        "never --sensitive, --private or a sensitive.toml path; recorded in the plan")
     p.add_argument("--no-acceptance", action="store_true", help="veto: no clear acceptance check")
     p.add_argument("--needs-context", action="store_true", help="veto: needs this conversation")
     p.add_argument("--cross-repo", action="store_true", help="veto: cross-repo orchestration")

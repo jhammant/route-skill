@@ -45,6 +45,11 @@ allowlist in `sensitive.toml`). The content match above is a **one-way safety
 net**: a hit escalates caution, a miss proves nothing. Do not rely on it —
 a heuristic that misses silently ships private data to a third party.
 
+When it misfires the other way (public work that mentions "customer data" to say there
+is none), `--open` declares the data public. It overrides only the content match, never
+an explicit signal (`--sensitive`, `--private`, a `sensitive.toml` path, which all make
+`--open` fail loudly), and the plan records `data_class_override` so it stays auditable.
+
 ## Six arms, four cost classes
 
 | arm | cost class | for |

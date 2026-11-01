@@ -64,6 +64,10 @@ turn the network on for that one Codex run (`-c sandbox_workspace_write.network_
 `~/.codex/config.toml` is never changed). Use it only when the brief needs sockets
 and touches nothing sensitive. It is refused with `--sensitive`, other pools ignore
 it, and the plan records `allow_network: true`. Run the final test pass yourself either way.
+If the content safety net wrongly marks public work as sensitive (it matches words like
+"customer data" even in "no customer data"), pass `--open` to declare the data public; it
+overrides only that keyword guess, never `--sensitive`, `--private` or a `sensitive.toml`
+path, and the plan records `data_class_override`. Only use it when the data really is public.
 
 Rules that still apply in auto mode:
 

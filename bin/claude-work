@@ -22,6 +22,39 @@ main_login_fingerprint() {
   security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null | shasum -a 256 | cut -c1-16
 }
 
+# A setup-token, from text that may hold ANSI codes and a wrapped, indented line.
+# Prints nothing unless the result looks like a whole token.
+normalize_token() {
+  python3 -I -c '
+import re, sys
+text = re.sub(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07", "", sys.stdin.read()).replace("\r", "")
+m = re.search(r"sk-ant-oat01-[A-Za-z0-9_\-\s]+", text)
+if m:
+    token = re.sub(r"\s+", "", re.split(r"\n[ \t]*\n", m.group(0))[0])
+    if re.fullmatch(r"sk-ant-oat01-[A-Za-z0-9_-]{60,}", token):
+        print(token)
+'
+}
+
+extract_token() { [ -f "$1" ] && normalize_token < "$1"; }
+
+# Hidden multi-line read: lines until an empty one, then normalised.
+read_pasted_token() {
+  local line all=""
+  while IFS= read -rs line && [ -n "$line" ]; do all="$all$line"$'\n'; done
+  printf '%s' "$all" | normalize_token
+}
+
+# Into the Keychain through `security -i` on stdin, so the token is never on argv.
+store_token() {
+  printf 'add-generic-password -U -s "%s" -a "%s" -l "Claude Code work account (setup-token)" -w "%s"\n' \
+    "$SERVICE" "$USER" "$1" | security -i >/dev/null
+  case "$(stored_token)" in
+    sk-ant-oat01-*) ;;
+    *) echo "claude-work: storing the token failed." >&2; exit 1 ;;
+  esac
+}
+
 # write_opener PATH APP PROFILE: a $BROWSER script that opens its URL in a Chrome
 # profile, in a named app, or (both empty) only prints it.
 write_opener() {
@@ -56,9 +89,8 @@ claude-work login
   1. Open the sign-in URL printed below in the browser where claude.ai is signed in as the
      WORK account (or a private window: sign in as work there, approve, close it).
      Check the page names the work account before you approve.
-  2. When it finishes, copy the token it prints (it starts with sk-ant-oat).
-  3. Paste it at the hidden prompt that follows. It goes straight into the Keychain,
-     never to a file or your shell history.
+  2. When it finishes, the token is picked up and stored in the Keychain for you.
+     (If that fails you'll be asked to paste it; wrapped lines and spaces are fine.)
 
 EOF
   # A throwaway config dir gives this login its own Keychain item name
@@ -70,21 +102,27 @@ EOF
   # Claude Code opens URLs with $BROWSER. Point it at a tiny opener so the sign-in
   # page goes to the work browser/profile, or nowhere (just printed) by default.
   write_opener "$tmp/open-url" "$app" "$profile"
-  BROWSER="$tmp/open-url" CLAUDE_CONFIG_DIR="$tmp" claude setup-token || true
+  # `script` records the session (in this owner-only temp dir) so the token can be
+  # read back without copy-paste: the terminal UI wraps it and indents the wrap.
+  script -q "$tmp/session.log" env BROWSER="$tmp/open-url" CLAUDE_CONFIG_DIR="$tmp" claude setup-token || true
+  local token
+  token="$(extract_token "$tmp/session.log")"
   security delete-generic-password -s "Claude Code-credentials-$hash" >/dev/null 2>&1 || true
   rm -rf "$tmp"
 
-  echo
-  echo "Paste the token at the prompt below, twice (input is hidden):"
-  security add-generic-password -U -s "$SERVICE" -a "$USER" \
-    -l "Claude Code work account (setup-token)" -w
-  case "$(stored_token)" in
-    sk-ant-oat*) echo "Stored in the Keychain as \"$SERVICE\"." ;;
-    *)
-      security delete-generic-password -s "$SERVICE" >/dev/null 2>&1 || true
-      echo "That didn't look like a setup-token token (they start with sk-ant-oat). Nothing kept; run claude-work login again." >&2
-      exit 1 ;;
-  esac
+  if [ -z "$token" ]; then
+    echo
+    echo "Couldn't read the token from the screen. Paste it below, then press Enter on an empty line"
+    echo "(input is hidden; line breaks and spaces inside it are fine):"
+    token="$(read_pasted_token)"
+  fi
+  if [ -z "$token" ]; then
+    echo "That didn't look like a setup-token token (sk-ant-oat01-...). Nothing stored; run claude-work login again." >&2
+    exit 1
+  fi
+  store_token "$token"
+  token=""
+  echo "Stored in the Keychain as \"$SERVICE\"."
   if [ "$before" != "$(main_login_fingerprint)" ]; then
     echo "WARNING: your main Claude Code login changed during this. Run /login in a normal claude session to restore it." >&2
   fi
@@ -101,12 +139,7 @@ status() {
   "$QUOTAMAX" probe claude-work
   echo
   echo "main account, for comparison (a different account shows different numbers and reset times):"
-  "$QUOTAMAX" agent --json 2>/dev/null | python3 -I -c '
-import json, sys
-d = json.load(sys.stdin)
-w = d.get("weekly") or {}
-print(f"  weekly: {w.get(\"percentUsed\")}% used, resets in {round((w.get(\"resetsInMinutes\") or 0) / 1440, 1)}d")
-' || true
+  "$QUOTAMAX" status 2>/dev/null | sed -n '/5h session/,/weekly (all)/p' || true
 }
 
 case "${1:-}" in

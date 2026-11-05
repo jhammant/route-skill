@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 import shlex
-import subprocess
 import sys
 from pathlib import Path
 
@@ -79,6 +78,8 @@ def test_network_remote_and_destructive_programs_are_refused(command, prefix):
     "pytest ../other", "pytest tests/../outside", "pytest --rootdir=../other",
     "pytest --rootdir=..", "pytest /etc/passwd", "pytest --rootdir=/tmp/outside",
     "pytest -c/tmp/outside.ini", "make test -C../other", "make test -C/tmp",
+    "make test -C~", "make test -C~/other", "make test -C~someone",
+    "npm test --prefix ~", "npm test --prefix=~someone/other",
     "bash test/../../outside.sh", "zsh tests/../outside.sh",
 ])
 def test_paths_outside_repo_are_refused(command, tmp_path, monkeypatch):
@@ -126,6 +127,8 @@ def test_safe_env_strips_credentials_without_mutating_base():
         "OPENAI_API_KEY", "DEEPSEEK_API_KEY", "GITHUB_TOKEN", "GH_TOKEN",
         "AWS_SECRET_ACCESS_KEY", "AWS_ACCESS_KEY_ID", "AWS_PROFILE", "AMAIL_PASSWORD",
         "FOO_API_KEY", "FOO_TOKEN", "FOO_SECRET", "lowercase_token",
+        "db_password_file", "PGPASSWORD", "DB_PASS", "DB_PWD", "OPENAI_KEY",
+        "GITHUB_PAT", "SERVICE_AUTH", "CREDENTIAL_FILE", "SSH_AUTH_SOCK",
     }
     base = dict.fromkeys(credentials, "fake-credential")
     base.update(PATH="/usr/bin", LANG="en_US.UTF-8", ROUTE_WORKER="0")
@@ -220,6 +223,7 @@ def test_run_checked_times_out_sleeping_pytest(check_repo):
     assert result.rc == 124
     assert result.timed_out
     assert "sleep-started" in result.output
+    assert result.output.count("sleep-started") == 1
 
 
 def test_run_checked_truncates_output_keeping_tail(check_repo):
@@ -250,20 +254,34 @@ def test_run_checked_resolves_paths_against_supplied_cwd(check_repo):
 def test_run_checked_timeout_is_shared_across_chain(tmp_path, monkeypatch):
     ticks = iter([0, 1, 4])
     calls = []
+    timeouts = []
     monkeypatch.setattr("route.ultra_safety.time.monotonic", lambda: next(ticks))
 
-    def run(argv, **kwargs):
-        calls.append((argv, kwargs))
-        return subprocess.CompletedProcess(argv, 0, stdout="ok\n")
+    class Process:
+        returncode = 0
 
-    monkeypatch.setattr("route.ultra_safety.subprocess.run", run)
+        def __init__(self, argv, **kwargs):
+            calls.append((argv, kwargs))
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def communicate(self, *, timeout):
+            timeouts.append(timeout)
+            return "ok\n", None
+
+    monkeypatch.setattr("route.ultra_safety.subprocess.Popen", Process)
 
     result = run_checked("pytest && node --test", tmp_path, timeout=5)
 
     assert result.rc == 0
     assert result.output == "ok\nok\n"
-    assert [kwargs["timeout"] for _, kwargs in calls] == [4, 1]
+    assert timeouts == [4, 1]
     assert all(kwargs["shell"] is False for _, kwargs in calls)
+    assert all(kwargs["start_new_session"] is True for _, kwargs in calls)
     assert [argv for argv, _ in calls] == [["pytest"], ["node", "--test"]]
 
 
@@ -283,6 +301,8 @@ def test_run_checked_missing_program_is_a_failed_check(tmp_path, monkeypatch):
     "password: 'hunter2hunter2hunter2'",
     "API_KEY=abc123def456ghi789",
     "summarise the customer data export",
+    "'db_password' : 'hunter2hunter2'",
+    '{"api_key" : "abc123def456ghi789"}',
 ])
 def test_screen_digest_flags_credentials_or_private_data(text):
     reason = screen_digest(text)
@@ -295,6 +315,7 @@ def test_screen_digest_flags_credentials_or_private_data(text):
     "", "Implemented parser tests and checked the README.",
     "Use a server secret for signed links; no credentials in code.",
     "Document password policy and API key rotation.",
+    '{"password_policy": "Rotate credentials every 12 months."}',
 ])
 def test_screen_digest_passes_ordinary_text(text):
     reason = screen_digest(text)
@@ -327,3 +348,25 @@ def test_pytest_plugins_can_only_be_disabled():
     assert lint_command("python3 -m pytest -q -p no:cacheprovider") is None
     assert lint_command("pytest -p evil_plugin") is not None
     assert lint_command("pytest -pevil_plugin") is not None
+
+
+@pytest.mark.parametrize("assignment", ["X=plain", "X:=plain", "X+=plain", "X?=plain"])
+def test_make_assignments_are_refused_even_without_expansion(assignment):
+    command = f"make test {assignment}"
+
+    reason = lint_command(command)
+
+    assert reason is not None
+
+
+@pytest.mark.parametrize("runner", ["pytest", "python3 -m pytest", "uv run pytest"])
+@pytest.mark.parametrize("options", [
+    "-oaddopts=-pevil_plugin", "--override-ini addopts=-pevil_plugin",
+    "--basetemp src", "--rootdir=src", "--rootdir src",
+])
+def test_pytest_configuration_and_directory_overrides_are_refused(runner, options):
+    command = f"{runner} {options}"
+
+    reason = lint_command(command)
+
+    assert reason is not None

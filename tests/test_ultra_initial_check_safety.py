@@ -19,7 +19,9 @@ def test_initial_checks_use_safety():
     directory = MagicMock(spec=Path)
     directory.name = 'repro'
     directory.exists.return_value = False
-    proc = NS(returncode=0, stdout='', stderr='')
+    proc = MagicMock(returncode=0, stdout='', stderr='')
+    proc.__enter__.return_value = proc
+    proc.communicate.return_value = ('', None)
     runner = Mock(return_value=proc)
     dependencies = dict(
         load_manifest=lambda value: value, assign_units=Mock(return_value=([assignment], [])),
@@ -42,6 +44,7 @@ def test_initial_checks_use_safety():
         _settle=Mock(), _report=Mock(side_effect=lambda *args: args[-2]))
     with patch.dict(ns, **dependencies), patch.multiple(u, **orchestration), \
          patch.object(u.Run, 'save'), patch.object(subprocess, 'run', runner), \
+         patch.object(subprocess, 'Popen', runner), \
          patch.dict(os.environ, AWS_SECRET_ACCESS_KEY='SYNTHETIC'), \
          patch.multiple(u.cli, load_pools=Mock(return_value={}), fetch_quota=Mock(return_value={}),
                         fetch_usage=Mock(return_value={}), _dispatch=Mock(return_value=0)):
@@ -52,3 +55,9 @@ def test_initial_checks_use_safety():
               if c.kwargs.get('shell') and
               (c.kwargs.get('env') is None or 'AWS_SECRET_ACCESS_KEY' in c.kwargs['env'])]
     assert not unsafe, 'Model-written check ran in a raw shell with credentials'
+    checks = [c for c in runner.call_args_list if c.args[0] == ['pytest', '-q']]
+    assert len(checks) == 1, 'The initial check must actually pass through the safe runner'
+    assert checks[0].kwargs['shell'] is False
+    assert checks[0].kwargs['start_new_session'] is True
+    assert 'AWS_SECRET_ACCESS_KEY' not in checks[0].kwargs['env']
+    assert checks[0].kwargs['env']['ROUTE_WORKER'] == '1'

@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import re
 import shlex
+import signal
 import subprocess
 import time
 from dataclasses import dataclass
@@ -41,12 +42,12 @@ ALLOWED: list[tuple[str, ...]] = [
 ]
 
 _OUTPUT_LIMIT = 20_000
-_FORBIDDEN = re.compile(r"[;|><`&\r\n\x00]|\$\(")
-# The existing safety net handles quoted colon assignments. Digests can also
-# contain YAML-style, unquoted values, which need the same conservative check.
-_UNQUOTED_SECRET = re.compile(
+_FORBIDDEN = re.compile(r"[;|><`&$\r\n\x00]")
+# Digests can quote JSON keys or contain unquoted YAML values; neither format
+# should evade the existing private-content heuristic's credential threshold.
+_COLON_SECRET = re.compile(
     r"\b[\w-]*(?:password|passwd|secret|token|api[_-]?key|credential)s?"
-    r"\s*:\s*(?=[^\s\"']{12,})(?=[^\s\"']*\d)[^\s\"']+",
+    r"[\"']?\s*:\s*[\"']?(?=[^\s\"']{12,})(?=[^\s\"']*\d)[^\s\"']+",
     re.IGNORECASE,
 )
 
@@ -70,13 +71,17 @@ def _argument_reason(argv: list[str]) -> str | None:
     """Some allowed programs can still run arbitrary code through an argument.
 
     `npm run <script>` runs whatever package.json names (deploy, postinstall), and
-    pytest's `-p NAME` imports a plugin by module name, so both are narrowed to
-    the forms a check actually needs.
+    pytest's plugin/configuration flags can import code or delete a directory.
+    Make assignments can expand shell functions before any Makefile is read.
     """
     if argv[:2] == ["npm", "run"] and (len(argv) < 3 or not _NPM_SCRIPT.match(argv[2])):
         return "npm run is limited to test, check, lint and typecheck scripts"
+    if argv[0] == "make" and any("=" in token for token in argv[2:]):
+        return "make command-line assignments are not allowed"
     if any("pytest" in token for token in argv[:3]):
         for i, token in enumerate(argv):
+            if token.startswith(("-o", "--override-ini", "--basetemp", "--rootdir")):
+                return "pytest configuration overrides and directory overrides are not allowed"
             value = argv[i + 1] if token == "-p" and i + 1 < len(argv) else token[2:] if token.startswith("-p") and len(token) > 2 else None
             if value is not None and not value.startswith("no:"):
                 return "pytest -p may only disable plugins (-p no:NAME)"
@@ -84,11 +89,13 @@ def _argument_reason(argv: list[str]) -> str | None:
 
 
 def _path_reason(argv: list[str], repo: Path) -> str | None:
-    """Check flag values too, so --rootdir=/outside cannot evade the boundary."""
+    """Check flag values before tools expand home paths or attached options."""
     for token in argv[1:]:
         for value in re.split(r"[=,]", token):
-            # Attached short options (-c/path, -C../repo) also name paths.
-            value = re.sub(r"^-[A-Za-z]+(?=/|\.{1,2}/)", "", value)
+            # Attached short options (-c/path, -C.., -C~) also name paths.
+            value = re.sub(r"^-[A-Za-z]+(?=/|~|\.{1,2}(?:/|$))", "", value)
+            if value.startswith("~"):
+                return "home-directory expansion is not allowed"
             path = Path(value.split("::", 1)[0])
             if ".." in path.parts:
                 return "parent path segments are not allowed"
@@ -130,12 +137,15 @@ def lint_command(cmd: str) -> str | None:
 
 
 def safe_env(base: dict[str, str] | None = None) -> dict[str, str]:
-    """Checks must not inherit the orchestrator's provider or messaging secrets."""
+    """Checks must not inherit provider/database credentials or SSH agent access."""
     source = os.environ if base is None else base
     env = {
         key: value for key, value in source.items()
         if not key.upper().startswith(("ANTHROPIC_", "AWS_", "AMAIL_"))
-        and not key.upper().endswith(("_TOKEN", "_SECRET", "_API_KEY"))
+        and not key.upper().endswith(("_TOKEN", "_SECRET", "_KEY", "_PASS", "_PWD", "_PAT", "_AUTH"))
+        and "PASSWORD" not in key.upper()
+        and "CREDENTIAL" not in key.upper()
+        and key.upper() != "SSH_AUTH_SOCK"
     }
     env["ROUTE_WORKER"] = "1"
     return env
@@ -159,7 +169,8 @@ def run_checked(cmd: str, cwd: Path, *, timeout: float = 600) -> RunResult:
     """Validate the entire chain first; share one timeout across all its checks.
 
     Keeping only the output tail preserves failure details without bloating the
-    review context. Each check inherits the same stripped environment.
+    review context. Each check inherits the same stripped environment. A new
+    process group lets a timeout stop descendants before the next stage edits.
     """
     reason = _lint_command(cmd, cwd.resolve())
     if reason:
@@ -173,19 +184,26 @@ def run_checked(cmd: str, cwd: Path, *, timeout: float = 600) -> RunResult:
         if remaining <= 0:
             return RunResult(rc=124, output=output, timed_out=True)
         try:
-            proc = subprocess.run(
+            with subprocess.Popen(
                 shlex.split(part), cwd=cwd, env=env, shell=False,
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, errors="replace", timeout=remaining,
-            )
-        except subprocess.TimeoutExpired as exc:
-            output = (output + _output_text(exc.output))[-_OUTPUT_LIMIT:]
-            return RunResult(rc=124, output=output, timed_out=True)
+                text=True, errors="replace", start_new_session=True,
+            ) as proc:
+                try:
+                    stdout, _ = proc.communicate(timeout=remaining)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass  # The group may have exited just before the signal.
+                    stdout, _ = proc.communicate()
+                    output = (output + _output_text(stdout))[-_OUTPUT_LIMIT:]
+                    return RunResult(rc=124, output=output, timed_out=True)
         except OSError as exc:
             output = (output + f"could not run check: {exc}")[-_OUTPUT_LIMIT:]
             rc = 127 if isinstance(exc, FileNotFoundError) else 126
             return RunResult(rc=rc, output=output, timed_out=False)
-        output = (output + _output_text(proc.stdout))[-_OUTPUT_LIMIT:]
+        output = (output + _output_text(stdout))[-_OUTPUT_LIMIT:]
         if proc.returncode:
             return RunResult(rc=proc.returncode, output=output, timed_out=False)
     return RunResult(rc=0, output=output, timed_out=False)
@@ -195,6 +213,6 @@ def screen_digest(text: str) -> str | None:
     """A content heuristic may block sharing; a miss never proves data public."""
     if detect_sensitive(text):
         return "digest names a configured sensitive path"
-    if probably_private(text) or _UNQUOTED_SECRET.search(text):
+    if probably_private(text) or _COLON_SECRET.search(text):
         return "digest may contain credentials or private data"
     return None

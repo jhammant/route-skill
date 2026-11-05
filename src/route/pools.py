@@ -162,17 +162,19 @@ class Pool:
 
 
 def pool_family(pool: Pool) -> str:
-    """Group model lineages so two accounts do not masquerade as independent reviewers."""
+    """Keep model lineage across account names and router/cloud vendor prefixes."""
     if pool.family:
         return pool.family
     name, model = pool.name.lower(), pool.model.name.lower()
-    if name.startswith("claude") or model.startswith("claude"):
+    words = set(re.findall(r"[a-z0-9]+", model))
+    if name.startswith("claude") or words & {"anthropic", "claude"}:
         return "anthropic"
-    if name == "codex" or model.startswith(("gpt", "codex")) or re.match(r"o(?:\d|$)", model):
+    if (name == "codex" or words & {"openai", "gpt", "codex", "o"}
+            or any(re.fullmatch(r"o\d+", word) for word in words)):
         return "openai"
-    if name.startswith("kimi") or model.startswith("kimi"):
+    if name.startswith("kimi") or words & {"moonshot", "moonshotai", "kimi"}:
         return "moonshot"
-    if name.startswith("deepseek") or model.startswith("deepseek"):
+    if name.startswith("deepseek") or "deepseek" in words:
         return "deepseek"
     if pool.cost == "local":
         return "local"

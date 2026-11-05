@@ -1,7 +1,7 @@
 # A second Claude subscription as worker pools. Copy to ~/.config/route/pools.toml
 # (replace HOME with your home directory) after `claude-work login` has stored a token.
 #
-# Every arm dispatches through bin/claude-work, which runs `claude` with that
+# Every arm dispatches through claude-work (github.com/jhammant/claude-work), which runs `claude` with that
 # account's token for that process only. Workers start with no MCP servers
 # (worker-mcp.json is {"mcpServers": {}}); without that each one would start
 # every server in your config. Swarm members still get their a-mail server.

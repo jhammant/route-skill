@@ -90,7 +90,7 @@ If you want to see the decision before it runs, use `/route` instead.
 
 `claude-work` pools (`claude-work`, `claude-work-fable`, `claude-work-sonnet`)
 are headless Claude Code workers on a second subscription. They dispatch
-through `bin/claude-work`, which hands that account's token (stored by
+through [claude-work](https://github.com/jhammant/claude-work), which hands that account's token (stored by
 `claude-work login`) to `claude` for that process only; the main login is
 untouched. Workers start with no MCP servers. quotamax reports the account as
 the `claude-work` pool and its Fable week as `claude-work:Fable`, so a spent

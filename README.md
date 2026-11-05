@@ -259,6 +259,8 @@ one release. Adjustments affect selection only, never learned counts.
 If you have a second Claude subscription (a work seat, say), its quota can run
 headless workers while your own session stays on your account.
 
+Install [claude-work](https://github.com/jhammant/claude-work) first, then:
+
 ```bash
 claude-work login      # mint a setup-token for that account; stored in the Keychain
 claude-work status     # fresh quota reading for it, next to your main account's
@@ -266,7 +268,7 @@ route "write the tests for src/parse.py" --pool claude-work-sonnet
 route "fix the flaky retry" --context digest     # the worker gets this conversation, minus tool output
 ```
 
-`bin/claude-work` passes the token to `claude` through `CLAUDE_CODE_OAUTH_TOKEN`
+`claude-work` passes the token to `claude` through `CLAUDE_CODE_OAUTH_TOKEN`
 for that process only, so the main login never changes. It shares `~/.claude`,
 which is what lets a worker fork a session.
 

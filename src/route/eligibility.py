@@ -43,6 +43,9 @@ DATA_SENSITIVE = "sensitive"
 #: second subscription, so the host arm is gated on that pool, and the shared
 #: quota cache (owned by the host account's sessions) is read but never written.
 CLAUDE_WORK_ACCOUNT = "CLAUDE_WORK_ACCOUNT"
+#: The quotamax pool the second account spends; also the ``account`` tag a
+#: claude-work session stamps on its own live ``quotamax agent`` payload.
+WORK_ACCOUNT = "claude-work"
 
 
 def in_claude_work_session() -> bool:
@@ -222,10 +225,12 @@ def parse_quota(payload: dict | list) -> dict[str, str]:
     if isinstance(payload, dict) and 'headroom' in payload:
         if not payload.get('ok'):
             return {}
-        out = {'claude': str(payload['headroom']).lower()}
+        # The agent view describes whichever account ran it: the host's unless tagged.
+        account = payload.get('account') or 'claude'
+        out = {account: str(payload['headroom']).lower()}
         for window in payload.get('scoped') or []:
             if isinstance(window, dict) and window.get('label') and isinstance(window.get('percentUsed'), (int, float)):
-                out[f"claude:{window['label']}"] = _bucket(window['percentUsed'])
+                out[f"{account}:{window['label']}"] = _bucket(window['percentUsed'])
         return out
     data = payload.get("pools", payload) if isinstance(payload, dict) else {}
     out: dict[str, str] = {}
@@ -262,6 +267,10 @@ def _cached_quota_payloads(timeout: float, *, cache_result: bool = True):
     pressure adjustment). A five-minute cache keeps routing fast and quota-aware.
     Only successful probes are cached, and never by a claude-work session: its
     ``quotamax agent`` view is the second account's, which would poison the host's.
+    For the same reason a live probe taken inside such a session is tagged with
+    the account it describes: the cached view (written by the host) still parses
+    as ``claude``, while the live one parses as ``claude-work`` so the host arm,
+    which spends that account, is gated on what was actually observed.
     """
     from .storage import state_dir
 
@@ -275,6 +284,8 @@ def _cached_quota_payloads(timeout: float, *, cache_result: bool = True):
     with ThreadPoolExecutor(max_workers=2) as pool:
         payloads = list(pool.map(lambda c: _run_json(c, timeout),
             [("quotamax", "agent", "--json"), ("quotamax", "providers", "--json")]))
+    if in_claude_work_session() and isinstance(payloads[0], dict):
+        payloads[0] = {**payloads[0], "account": WORK_ACCOUNT}
     if cache_result and not in_claude_work_session() and payloads and payloads[0] is not None:
         try:
             cache.parent.mkdir(parents=True, exist_ok=True)
@@ -359,7 +370,7 @@ def quota_provider(arm: str, pools: dict[str, Pool] | None = None) -> str | None
     so it is gated on ``claude-work`` rather than on the host account it never spends.
     """
     if arm == VETO_TARGET and in_claude_work_session():
-        return "claude-work"
+        return WORK_ACCOUNT
     pool = (pools or {}).get(arm)
     if pool is not None and pool.quota_provider is not None:
         return pool.quota_provider or None

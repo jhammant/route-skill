@@ -6,7 +6,9 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
+import time
 import types
 from pathlib import Path
 
@@ -143,7 +145,7 @@ def test_run_swarm_manifest_raises_with_the_reason(repo, tmp_path, offline, monk
 
     monkeypatch.setattr(swarm_dispatch, "_git", git)
     # Act / Assert
-    with pytest.raises(RuntimeError, match="produced no summary"):
+    with pytest.raises(RuntimeError, match="worktree setup failed for one"):
         run_swarm_manifest(dict(name="x", repo=str(repo), swarm_id=PRESET, units=[unit("one", pool="codex")]),
                            host="codex", no_amail=True, no_quota=True)
     status = json.loads((swarm_dir(PRESET) / "status.json").read_text())
@@ -198,3 +200,119 @@ def test_claude_work_session_gates_the_host_arm_on_claude_work(monkeypatch, pool
     assert quota_provider("claude", pools) == "claude-work"
     assert quota_provider("codex", pools) == "codex"
     assert "claude" in result.removed_by_quota and "codex" in result.eligible
+
+
+# -- review fixes: cancellation stops live delegates, persistence failures surface,
+# -- a live work-account probe is keyed as the account it describes
+
+def slow_agent(tmp_path, name="codex"):
+    """A delegate that records its PID and then sleeps far longer than any test."""
+    binary_dir = tmp_path / "bin"
+    binary_dir.mkdir(exist_ok=True)
+    script = binary_dir / name
+    script.write_text("#!/bin/sh\necho $$ > agent-pid.txt\nexec sleep 60\n")
+    script.chmod(0o700)
+    return binary_dir
+
+
+def pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def test_cancelling_a_swarm_kills_the_live_delegate_before_returning(repo, tmp_path, monkeypatch):  # noqa: F811
+    # Arrange: a real delegate that would run for a minute; the run is interrupted once it is up.
+    monkeypatch.setenv("PATH", f"{slow_agent(tmp_path)}{os.pathsep}{os.environ['PATH']}")
+    pid_file = swarm_dir(PRESET) / "wt" / "one" / "agent-pid.txt"
+
+    def interrupt(futures):
+        deadline = time.monotonic() + 10
+        while not pid_file.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert pid_file.exists(), "delegate never started"
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(swarm_dispatch, "as_completed", interrupt)
+    manifest = dict(name="x", repo=str(repo), swarm_id=PRESET, units=[unit("one", pool="codex")])
+    # Act
+    started = time.monotonic()
+    with pytest.raises(KeyboardInterrupt):
+        run_swarm_manifest(manifest, host="codex", no_amail=True, no_quota=True)
+    elapsed = time.monotonic() - started
+    # Assert: the delegate is dead, the unit was neither checked nor committed, and it was quick.
+    pid = int(pid_file.read_text().strip())
+    assert not pid_alive(pid)
+    assert elapsed < swarm_dispatch.CANCEL_GRACE_SECONDS + 10
+    status = json.loads((swarm_dir(PRESET) / "status.json").read_text())
+    assert (status["state"], status["exit_code"]) == ("interrupted", 130)
+    [row] = status["units"]
+    assert (row["state"], row["pid"], row["agent_rc"]) == ("failed", None, 130)
+    assert "Acceptance check" not in Path(row["log"]).read_text()
+    head = subprocess.run(["git", "-C", row["worktree"], "rev-parse", "HEAD"], capture_output=True, text=True)
+    base = subprocess.run(["git", "-C", str(repo), "rev-parse", "main"], capture_output=True, text=True)
+    assert head.stdout == base.stdout, "a cancelled unit must not commit"
+
+
+def test_cancellation_escalates_to_sigkill_when_sigterm_is_ignored(monkeypatch):
+    # Arrange: a registered process that ignores SIGTERM, with a short grace period.
+    proc = subprocess.Popen(["python3", "-c", "import signal, time\n"
+                             "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                             "print('ready', flush=True)\ntime.sleep(60)"], stdout=subprocess.PIPE, text=True)
+    assert proc.stdout.readline().strip() == "ready"
+    monkeypatch.setattr(swarm_dispatch, "CANCEL_GRACE_SECONDS", 0.5)
+    cancel = swarm_dispatch.Cancellation()
+    cancel.start("stubborn", proc.pid)
+    executor = swarm_dispatch.ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(proc.wait)
+    # Act
+    swarm_dispatch._stop_workers(cancel, executor, [future])
+    # Assert: the thread has ended because the process was killed, not because it finished.
+    assert future.done() and proc.returncode == -signal.SIGKILL
+
+
+def test_channel_teardown_failure_reaches_the_api_caller(repo, tmp_path, offline, monkeypatch):  # noqa: F811
+    # Arrange: units run fine, but closing the channel fails afterwards.
+    from route import swarm_channel
+
+    def close(channel):
+        raise RuntimeError("group end refused")
+
+    monkeypatch.setattr(swarm_channel.DirectChannel, "close", close)
+    manifest = dict(name="x", repo=str(repo), swarm_id=PRESET, units=[unit("one", pool="codex")])
+    # Act / Assert: the summary is on disk, but the run is reported broken, not completed.
+    with pytest.raises(RuntimeError, match="group end refused"):
+        run_swarm_manifest(manifest, host="codex", no_quota=True)
+    assert (swarm_dir(PRESET) / "summary.json").exists()
+
+
+def test_live_work_account_probe_is_keyed_as_claude_work(monkeypatch):
+    # Arrange: no cache, a work session, and an agent view with a Fable window and a weekly window.
+    agent = {"ok": True, "headroom": "low", "weekly": {"percentUsed": 70, "resetsInMinutes": 90},
+             "scoped": [{"label": "Fable", "percentUsed": 99}], "backstop": {"available": False}}
+    monkeypatch.setattr(eligibility, "_run_json",
+                        lambda cmd, timeout: agent if cmd[1] == "agent" else None)
+    monkeypatch.setenv("CLAUDE_WORK_ACCOUNT", "1")
+    # Act
+    quota = fetch_quota(cache_result=False)
+    # Assert: everything the probe reported belongs to the work account, nothing to the host's.
+    assert quota["claude-work"] == "low" and quota["claude-work:Fable"] == "critical"
+    assert "claude" not in quota and "claude:Fable" not in quota
+    assert set(quota.weekly) == {"claude-work", "claude-work:Fable"}
+    assert quota_provider("claude") == "claude-work"
+
+
+def test_cached_host_probe_keeps_its_identity_inside_a_work_session(monkeypatch):
+    # Arrange: the host wrote a fresh cache; a worker reads it without probing.
+    agent = {"ok": True, "headroom": "critical", "backstop": {"available": False}}
+    cache = state_dir() / "quota-cache.json"
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    cache.write_text(json.dumps({"at": time.time(), "payloads": [agent, None]}))
+    monkeypatch.setattr(eligibility, "_run_json", lambda *a, **k: pytest.fail("must not probe"))
+    monkeypatch.setenv("CLAUDE_WORK_ACCOUNT", "1")
+    # Act
+    quota = fetch_quota()
+    # Assert: the host's spent week stays keyed to the host; the work account is unknown.
+    assert quota["claude"] == "critical" and "claude-work" not in quota

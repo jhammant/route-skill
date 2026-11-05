@@ -1,7 +1,7 @@
 """Handoff context for a delegated task: brief, digest or fork.
 
-A Claude Code transcript is mostly tool output. Across Jon's twelve largest
-recent sessions, tool results were 91.7% of the text, tool calls 5.7%, and what
+A Claude Code transcript is mostly tool output. Across twelve large real
+sessions, tool results were 91.7% of the text, tool calls 5.7%, and what
 the user and assistant actually said 2.4%. A *digest* keeps the conversation, the
 progress notes said between tool calls (stored only as short thinking-block
 summaries, so detail written mid-turn survives only as that summary), and a

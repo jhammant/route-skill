@@ -435,7 +435,10 @@ def _dispatch(template: str | list[str], task: str, *, target: str | None = None
         child_env["ROUTE_WORKER"] = "1"
         if target in ("claude", "codex"):
             child_env["ROUTE_HOST"] = target
-        kwargs = {"input": task, "text": True} if stdin else {}
+        # A delegate that does not take its task on stdin gets /dev/null there:
+        # `codex exec` reads "additional input" from any open stdin and would
+        # otherwise wait forever on the parent's pipe or terminal.
+        kwargs = {"input": task, "text": True} if stdin else {"stdin": subprocess.DEVNULL}
         if cwd is not None:
             kwargs["cwd"] = cwd
         if timeout is not None:

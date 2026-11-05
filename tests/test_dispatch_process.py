@@ -118,3 +118,26 @@ def _gone(pid: int) -> bool:
         return True
     state = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout
     return not state.strip() or state.strip().startswith("Z")
+
+
+def test_dispatch_never_hands_the_parent_stdin_to_a_delegate(tmp_path):
+    # Arrange: a delegate that blocks reading stdin, the way `codex exec` reads
+    # "additional input" from any open stdin.
+    import os
+    import subprocess
+    import sys
+    from route import cli
+    script = tmp_path / "reads_stdin.py"
+    script.write_text("import sys\nsys.stdin.read()\nprint('stdin closed')\n")
+    read_end, write_end = os.pipe()  # a parent stdin that never reaches EOF
+    saved = os.dup(0)
+    os.dup2(read_end, 0)
+    try:
+        # Act
+        rc = cli._dispatch([sys.executable, str(script)], "task", timeout=10)
+    finally:
+        os.dup2(saved, 0)
+        for fd in (read_end, write_end, saved):
+            os.close(fd)
+    # Assert: it finished instead of timing out (124) on the inherited pipe
+    assert rc == 0

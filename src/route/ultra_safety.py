@@ -63,6 +63,26 @@ def _allowed(argv: list[str]) -> bool:
     return False
 
 
+_NPM_SCRIPT = re.compile(r"^(test|check|lint|typecheck)([:._-][\w.:-]*)?$")
+
+
+def _argument_reason(argv: list[str]) -> str | None:
+    """Some allowed programs can still run arbitrary code through an argument.
+
+    `npm run <script>` runs whatever package.json names (deploy, postinstall), and
+    pytest's `-p NAME` imports a plugin by module name, so both are narrowed to
+    the forms a check actually needs.
+    """
+    if argv[:2] == ["npm", "run"] and (len(argv) < 3 or not _NPM_SCRIPT.match(argv[2])):
+        return "npm run is limited to test, check, lint and typecheck scripts"
+    if any("pytest" in token for token in argv[:3]):
+        for i, token in enumerate(argv):
+            value = argv[i + 1] if token == "-p" and i + 1 < len(argv) else token[2:] if token.startswith("-p") and len(token) > 2 else None
+            if value is not None and not value.startswith("no:"):
+                return "pytest -p may only disable plugins (-p no:NAME)"
+    return None
+
+
 def _path_reason(argv: list[str], repo: Path) -> str | None:
     """Check flag values too, so --rootdir=/outside cannot evade the boundary."""
     for token in argv[1:]:
@@ -94,7 +114,7 @@ def _lint_command(cmd: str, repo: Path) -> str | None:
             return "invalid command quoting"
         if not argv or not _allowed(argv):
             return "command is not an allowed check"
-        reason = _path_reason(argv, repo)
+        reason = _argument_reason(argv) or _path_reason(argv, repo)
         if reason:
             return reason
     return None

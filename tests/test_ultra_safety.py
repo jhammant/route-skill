@@ -311,3 +311,19 @@ def test_screen_digest_respects_sensitive_path_config(isolated_env):
 
     assert reason
     assert "configured sensitive path" in reason
+
+
+def test_npm_run_is_limited_to_check_scripts():
+    # Arrange
+    allowed = ["npm run test", "npm run test:unit", "npm run lint", "npm run typecheck"]
+    refused = ["npm run postinstall", "npm run deploy", "npm run", "npm run test; rm"]
+    # Act / Assert
+    assert all(lint_command(cmd) is None for cmd in allowed)
+    assert all(lint_command(cmd) is not None for cmd in refused)
+
+
+def test_pytest_plugins_can_only_be_disabled():
+    # Arrange / Act / Assert
+    assert lint_command("python3 -m pytest -q -p no:cacheprovider") is None
+    assert lint_command("pytest -p evil_plugin") is not None
+    assert lint_command("pytest -pevil_plugin") is not None

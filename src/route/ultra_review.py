@@ -145,6 +145,37 @@ def parse_findings(text: str) -> list[Finding]:
     return [finding for finding in map(_finding_from, raw) if finding is not None]
 
 
+def parse_review(rc: int, text: str) -> list[Finding]:
+    """A reviewer's verdict, or ValueError when it gave none.
+
+    A crash, a timeout, an authentication error or a reply without the marked
+    block is a review that did not happen, never a clean one: silence from a
+    model that was supposed to look is not evidence that there was nothing to see.
+    """
+    if rc != 0:
+        raise ValueError(f"reviewer exited {rc}")
+    if FINDINGS_BEGIN not in (text or ""):
+        raise ValueError(f"reviewer printed no {FINDINGS_BEGIN} block")
+    return parse_findings(text)
+
+
+def resolved(findings: list[Finding], worktree: str | Path, *, timeout: float = 600) -> tuple[list[Finding], list[Finding]]:
+    """Split once-confirmed findings into (resolved, outstanding) after a fix.
+
+    The bar is the opposite of ``confirm``'s: a bug is gone only when its repro
+    exits zero. A timeout, a refused command or a missing program says nothing,
+    so the finding stays outstanding rather than quietly disappearing.
+    """
+    passing, outstanding = [], []
+    for finding in findings:
+        if finding.repro is None:
+            outstanding.append(finding)
+            continue
+        result = run_checked(finding.repro, Path(worktree), timeout=timeout)
+        (passing if result.rc == 0 and not result.timed_out else outstanding).append(finding)
+    return passing, outstanding
+
+
 def confirm(findings: list[Finding], worktree: str | Path, *, timeout: float = 600) -> tuple[list[Finding], list[Finding]]:
     """Split findings into (confirmed, advisory) by running each repro in the unit's worktree.
 

@@ -322,5 +322,7 @@ def to_manifest(plan: Plan, *, repo: str | Path, base: str, swarm_id: str, arms:
         if unit.tier is not None:
             row["tier"] = unit.tier
         units.append(row)
+    # Every check here was written by a model: the swarm must run them through
+    # ultra_safety (no shell, no credentials), as ultra does for every other command.
     return {"name": plan.name, "repo": str(repo), "base": base, "shared": plan.shared,
-            "swarm_id": swarm_id, "units": units}
+            "swarm_id": swarm_id, "safe_checks": True, "units": units}

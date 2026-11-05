@@ -42,17 +42,23 @@ def score_from_fix_passes(fix_passes: int = 0, *, abandoned: bool = False) -> fl
 
 
 def record_score(router: Router, shape: str, tier: str, arm: str, score: float, *,
-                 previous_score: float = 0.0, impression_recorded: bool = False) -> None:
+                 previous_score: float = 0.0, impression_recorded: bool = False,
+                 weight: float = 1.0) -> None:
     """Credit one fractional trial, or replace an existing trial's reward.
 
     A dispatch already owns its impression. Moving its reward by the delta
     changes alpha by that delta and beta by its negative, never its mass.
+    ``weight`` is the share of the trial this score owns: a swarm records n
+    units sharing an arm and cell as ONE trial, so regrading one of them may
+    only move 1/n of it.
     """
     score = validate_score(score)
     previous_score = validate_score(previous_score)
+    if not 0 < weight <= 1:
+        raise ValueError("weight must be in (0, 1]")
     if not impression_recorded:
         router.observe(shape, tier, arm, [arm])
-    delta = score - previous_score
+    delta = (score - previous_score) * weight
     if delta:
         # Write directly: settlement must report storage errors, not silently
         # swallow them through banditry.reward's fail-open policy.

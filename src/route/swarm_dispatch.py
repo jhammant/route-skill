@@ -29,6 +29,7 @@ from .storage import atomic_write, state_dir
 from .swarm import plan_swarm, record_swarm_outcome
 from .swarm_channel import Channel, ChannelError, HubPoller, Worker, amail_binary, mcp_runtime, open_channel
 from .swarm_status import SwarmStatus, utc_now
+from .ultra_safety import run_checked
 
 UNIT_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
 #: A caller-chosen run ID (``route ultra`` names its swarm after the run). Path-safe by
@@ -299,10 +300,26 @@ class Cancellation:
         with self._lock:
             pids = list(self._pids.values())
         for pid in pids:
-            try:
-                os.kill(pid, signum)
-            except OSError:
-                pass  # Already gone; its thread is about to finish on its own.
+            signal_tree(pid, signum)
+
+
+def signal_tree(pid: int, signum: int) -> bool:
+    """Signal a process and, when it leads its own process group, the whole group.
+
+    ``cli._dispatch`` starts every tracked delegate in a new session, so its
+    shells and test runners share its group and stop with it. A process that
+    does not lead its group is signalled alone: its group may be the user's
+    shell. Our own group is never signalled. False when the process is gone.
+    """
+    try:
+        pgid = os.getpgid(pid)
+        if pgid == pid and pgid != os.getpgrp():
+            os.killpg(pgid, signum)
+        else:
+            os.kill(pid, signum)
+    except OSError:
+        return False  # Already gone; nothing left to stop.
+    return True
 
 
 def _stop_workers(cancel: Cancellation, executor: ThreadPoolExecutor, futures: list) -> None:
@@ -317,11 +334,22 @@ def _stop_workers(cancel: Cancellation, executor: ThreadPoolExecutor, futures: l
 
 
 def _acceptance_check(a: Assignment, worktree: Path, output, timeout: float,
-                      cancel: Cancellation) -> int:
-    """Run the unit's check in its worktree; 124 on timeout, 1 if it cannot start."""
+                      cancel: Cancellation, *, safe: bool = False) -> int:
+    """Run the unit's check in its worktree; 124 on timeout, 1 if it cannot start.
+
+    A manifest that asks for ``safe_checks`` (route ultra, whose checks a model
+    wrote) gets them run through ultra_safety: linted, without a shell, without
+    the orchestrator's credentials, and refused (126) when they stray.
+    """
     identity = a.unit["id"]
     output.write(f"\nAcceptance check: {a.unit['check']}\n")
     output.flush()
+    if safe:
+        result = run_checked(a.unit["check"], worktree, timeout=timeout)
+        output.write(result.output)
+        if result.timed_out:
+            output.write("Acceptance check timed out\n")
+        return result.rc
     try:
         with subprocess.Popen(a.unit["check"], shell=True, cwd=worktree,
                               stdout=output, stderr=subprocess.STDOUT) as check:
@@ -377,7 +405,8 @@ def _run_unit(a: Assignment, manifest: dict, directory: Path, args: argparse.Nam
             return cancelled(130)
         live_status.unit(identity, state="checking", pid=None, agent_rc=agent_rc)
         with log.open("a", encoding="utf-8") as output:
-            check_rc = _acceptance_check(a, worktree, output, args.check_timeout, cancel)
+            check_rc = _acceptance_check(a, worktree, output, args.check_timeout, cancel,
+                                         safe=bool(manifest.get("safe_checks")))
         if check_rc == 124:
             agent_rc = 124
         if cancel.requested.is_set():

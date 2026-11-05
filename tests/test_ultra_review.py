@@ -182,3 +182,38 @@ def test_confirm_treats_timeouts_refusals_and_missing_programs_as_not_evidence(w
     monkeypatch.setattr(ultra_review, "run_checked", lambda cmd, cwd, *, timeout: result)
     confirmed, advisory = confirm([finding("unproven")], directory, timeout=1)
     assert confirmed == [] and [f.title for f in advisory] == ["unproven"]
+
+
+# -- parse_review and resolved ------------------------------------------------
+
+def test_parse_review_needs_a_clean_exit_and_a_marked_block():
+    # Arrange
+    text = marked([{"title": "bug", "severity": "high", "detail": "d", "repro": "bash tests/fails.sh"}])
+    # Act
+    found = ultra_review.parse_review(0, text)
+    # Assert: a verdict is a block from a reviewer that finished; anything else is no verdict.
+    assert [f.title for f in found] == ["bug"]
+    with pytest.raises(ValueError, match="exited 1"):
+        ultra_review.parse_review(1, text)
+    with pytest.raises(ValueError, match="no ULTRA-FINDINGS-BEGIN"):
+        ultra_review.parse_review(0, "Looks fine to me.")
+    with pytest.raises(ValueError, match="not valid JSON"):
+        ultra_review.parse_review(0, marked("{not json"))
+
+
+def test_resolved_counts_only_a_passing_repro_as_gone(worktree, monkeypatch):
+    # Arrange: one repro per outcome, by patching the runner with a table.
+    directory, _ = worktree
+    results = {
+        "bash tests/passes.sh": RunResult(rc=0, output="", timed_out=False),
+        "bash tests/fails.sh": RunResult(rc=1, output="", timed_out=False),
+        "bash tests/slow.sh": RunResult(rc=124, output="", timed_out=True),
+        "rm -rf tests": RunResult(rc=126, output="refused: x", timed_out=False),
+    }
+    monkeypatch.setattr(ultra_review, "run_checked", lambda cmd, cwd, *, timeout: results[cmd])
+    findings = [finding(cmd, cmd) for cmd in results] + [finding("no repro", None)]
+    # Act
+    passing, outstanding = ultra_review.resolved(findings, directory, timeout=1)
+    # Assert: a timeout or a refusal has not shown the bug gone.
+    assert [f.title for f in passing] == ["bash tests/passes.sh"]
+    assert [f.title for f in outstanding] == ["bash tests/fails.sh", "bash tests/slow.sh", "rm -rf tests", "no repro"]

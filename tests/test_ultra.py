@@ -462,3 +462,54 @@ def test_settle_outside_the_swarm_is_still_refused(repo, fake, monkeypatch):
     assert cli.main(["settle", "--decision", decision_id, "--fix-passes", "0", "--merged"]) == 2
     assert cli.main(["settle", "--decision", decision_id, "--fix-passes", "0", "--merged",
                      "--within-swarm", summary["run_id"]]) == 0
+
+
+# -- guards --------------------------------------------------------------------
+
+def test_commits_refuse_any_branch_but_the_runs_own(repo, tmp_path):
+    # Arrange: a worktree on ultra/x; a model then checks out another branch in it.
+    worktree = tmp_path / "integration"
+    base = git(repo, "rev-parse", "HEAD").strip()
+    git(repo, "worktree", "add", "-b", "ultra/x", str(worktree), base)
+    (worktree / "new.txt").write_text("kept\n")
+    # Act / Assert: on the right branch the commit lands.
+    assert ultra._commit_if_changed(worktree, "ok", branch="ultra/x", base_sha=base) is True
+    assert ultra._commit_if_changed(worktree, "clean", branch="ultra/x", base_sha=base) is False
+    git(worktree, "checkout", "-q", "-b", "other")
+    (worktree / "new.txt").write_text("moved\n")
+    with pytest.raises(ultra.CommitError, match="refs/heads/other, not refs/heads/ultra/x"):
+        ultra._commit_if_changed(worktree, "nope", branch="ultra/x", base_sha=base)
+    assert git(worktree, "status", "--porcelain").startswith(" M")
+    git(worktree, "checkout", "-q", "--detach")
+    assert "detached HEAD" in ultra._on_branch(worktree, "ultra/x")
+    assert git(repo, "rev-parse", "HEAD").strip() == base
+
+
+def test_carried_review_tests_skip_links_and_only_land_on_the_unit_branch(repo, tmp_path):
+    # Arrange: a review worktree with a real new test, a link to a secret, and a test in a linked dir.
+    base = git(repo, "rev-parse", "HEAD").strip()
+    review_wt, unit_wt = tmp_path / "review", tmp_path / "unit"
+    git(repo, "worktree", "add", "--detach", str(review_wt), base)
+    git(repo, "worktree", "add", "-b", "unit-x", str(unit_wt), base)
+    secret = tmp_path / "secret.txt"
+    secret.write_text("SYNTHETIC\n")
+    (review_wt / "tests" / "test_real.sh").write_text("true\n")
+    (review_wt / "tests" / "leak.py").symlink_to(secret)
+    (review_wt / "tests" / "linked").symlink_to(tmp_path)
+    (unit_wt / "tests" / "test_taken.sh").symlink_to(secret)  # the unit side may not be a link either
+    (review_wt / "tests" / "test_taken.sh").write_text("true\n")
+    # Act
+    carried = ultra._carry_review_tests(review_wt, unit_wt, "x", branch="unit-x")
+    # Assert: only the regular file travelled, committed on the unit branch; the base is untouched.
+    assert carried == ["tests/test_real.sh"]
+    assert git(unit_wt, "show", "unit-x:tests/test_real.sh") == "true\n"
+    assert not (unit_wt / "tests" / "leak.py").exists() and not (unit_wt / "tests" / "secret.txt").exists()
+    assert git(repo, "rev-parse", "HEAD").strip() == base
+    assert git(repo, "status", "--porcelain") == ""
+
+
+def test_settle_weight_must_be_a_share():
+    assert cli._weight_arg("0.5") == 0.5 and cli._weight_arg("1") == 1.0
+    for bad in ("0", "1.5", "-1", "x"):
+        with pytest.raises(Exception):
+            cli._weight_arg(bad)

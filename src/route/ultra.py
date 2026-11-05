@@ -13,12 +13,14 @@ from __future__ import annotations
 
 import contextlib
 import io
+from collections import Counter
 import json
 import os
 import re
 import signal
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -26,10 +28,11 @@ from . import cli
 from .digest import digest_preamble, write_digest
 from .pools import Pool, pool_family, pools_for_host
 from .storage import atomic_write, state_dir
-from .swarm_dispatch import run_swarm_manifest, swarm_dir
+from .swarm_dispatch import run_swarm_manifest, signal_tree, swarm_dir
 from .swarm_status import utc_now
 from .ultra_plan import Plan, PlanError, lint_plan, merge_overlaps, parse_plan, planner_prompt, to_manifest
-from .ultra_review import Finding, confirm, fix_prompt, needs_review, parse_findings, review_prompt, unit_diff
+from .ultra_review import (Finding, confirm, fix_prompt, needs_review, parse_review, resolved, review_prompt,
+                           unit_diff)
 from .ultra_safety import run_checked, screen_digest
 from .ultra_select import candidates, dispatch_template, pick, review_independence
 
@@ -41,6 +44,8 @@ PLANNER_TIMEOUT = 1800
 REVIEW_TIMEOUT = 1800
 FIX_TIMEOUT = 3600
 CHECK_TIMEOUT = 600
+#: How long a cancel waits for SIGTERM to work before it sends SIGKILL.
+CANCEL_GRACE = 5.0
 FINISHED = frozenset({"done", "failed", "planned", "cancelled", "interrupted"})
 
 
@@ -152,13 +157,51 @@ def _throwaway(repo: Path, path: Path, rev: str):
         _git(repo, "worktree", "remove", "--force", str(path))
 
 
-def _commit_if_changed(worktree: Path, message: str) -> bool:
+class CommitError(RuntimeError):
+    """A result that could not be kept: wrong branch, or git refused the commit."""
+
+
+def _on_branch(worktree: Path, branch: str, base_sha: str | None = None) -> str | None:
+    """Why the worktree is not on ``branch`` (descending from the base), or None.
+
+    A linked worktree shares the repository's refs, so a model told to work in
+    it can still check out main or the base branch; every commit and merge the
+    orchestrator makes is preceded by this check so nothing lands anywhere but
+    on a branch the run owns.
+    """
+    head = _git(worktree, "symbolic-ref", "-q", "HEAD")
+    current = head.stdout.strip() if head.returncode == 0 else ""
+    if current != f"refs/heads/{branch}":
+        return f"worktree is on {current or 'a detached HEAD'}, not refs/heads/{branch}"
+    if base_sha and _git(worktree, "merge-base", "--is-ancestor", base_sha, "HEAD").returncode:
+        return f"{branch} no longer descends from the base {base_sha[:12]}"
+    return None
+
+
+def _commit_if_changed(worktree: Path, message: str, *, branch: str | None = None,
+                       base_sha: str | None = None) -> bool:
+    """Commit whatever changed; True when a commit was made, False when the tree was clean.
+
+    Raises CommitError when the worktree is not on ``branch`` or git refused:
+    a fix that exists only in a working tree is not a result, and the caller
+    must not report one.
+    """
+    if branch is not None:
+        reason = _on_branch(worktree, branch, base_sha)
+        if reason:
+            raise CommitError(reason)
     status = _git(worktree, "status", "--porcelain")
-    if status.returncode or not status.stdout.strip():
+    if status.returncode:
+        raise CommitError(f"git status failed: {status.stderr.strip()}")
+    if not status.stdout.strip():
         return False
-    if _git(worktree, "add", "-A").returncode:
-        return False
-    return _git(worktree, "commit", "-q", "-m", message).returncode == 0
+    added = _git(worktree, "add", "-A")
+    if added.returncode:
+        raise CommitError(f"git add failed: {added.stderr.strip()}")
+    commit = _git(worktree, "commit", "-q", "-m", message)
+    if commit.returncode:
+        raise CommitError(f"git commit failed: {(commit.stderr or commit.stdout).strip()}")
+    return True
 
 
 # -- context -------------------------------------------------------------------
@@ -244,13 +287,37 @@ def _print_plan(plan: Plan, arms: dict[str, str], held: list[dict], planner: str
 
 # -- review and fix ------------------------------------------------------------
 
-def _carry_review_tests(review_wt: Path, unit_wt: Path, unit_id: str) -> list[str]:
+def _read_regular_file(path: Path) -> bytes | None:
+    """The bytes of a regular file reached without following a symlink, else None."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        return None
+    with os.fdopen(fd, "rb") as handle:
+        return handle.read()
+
+
+def _write_new_file(path: Path, data: bytes) -> bool:
+    """Create ``path`` with ``data``; False when anything is already there (link or file)."""
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+    except OSError:
+        return False
+    with os.fdopen(fd, "wb") as handle:
+        handle.write(data)
+    return True
+
+
+def _carry_review_tests(review_wt: Path, unit_wt: Path, unit_id: str, *, branch: str | None = None) -> list[str]:
     """New test files the reviewer wrote travel to the unit's branch, so repros can run there.
 
-    Only untracked files under test directories qualify; a reviewer cannot edit
-    the unit's code or its existing tests through this door.
+    Only untracked regular files under test directories qualify, reached and
+    written without following symlinks and only inside the two worktrees: a
+    reviewer cannot edit the unit's code or its existing tests through this
+    door, and a link it plants (to a credential file, say) is not copied.
     """
     status = _git(review_wt, "status", "--porcelain", "--untracked-files=all")
+    review_root, unit_root = review_wt.resolve(), unit_wt.resolve()
     carried = []
     for line in status.stdout.splitlines():
         if not line.startswith("?? "):
@@ -259,19 +326,47 @@ def _carry_review_tests(review_wt: Path, unit_wt: Path, unit_id: str) -> list[st
         if not rel.startswith(("tests/", "test/")) or ".." in Path(rel).parts:
             continue
         source, target = review_wt / rel, unit_wt / rel
-        if not source.is_file() or target.exists():
+        if source.is_symlink() or not source.is_file() or source.resolve() != review_root / rel:
+            continue
+        if target.is_symlink() or target.exists() or target.resolve() != unit_root / rel:
+            continue
+        data = _read_regular_file(source)
+        if data is None:
             continue
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(source.read_bytes())
-        carried.append(rel)
+        if _write_new_file(target, data):
+            carried.append(rel)
     if carried:
-        _commit_if_changed(unit_wt, f"ultra({unit_id}): review tests")
+        try:
+            _commit_if_changed(unit_wt, f"ultra({unit_id}): review tests", branch=branch)
+        except CommitError:
+            # Tests that are not on the branch would not reach the merge; leave the tree as it was.
+            _git(unit_wt, "reset", "-q", "--", *carried)
+            for rel in carried:
+                (unit_wt / rel).unlink(missing_ok=True)
+            return []
     return carried
 
 
+def _another_reviewer(tried: list[str], author: str, pools: dict[str, Pool], quota: dict, host: str,
+                      allow_lower: bool) -> str | None:
+    """A second reviewer after the first failed to deliver: cross-family if there is one."""
+    others = candidates(pools, quota, host=host, allow_lower=allow_lower, exclude_arms=set(tried) | {author})
+    if not others:
+        return None
+    family = pool_family(pools[author]) if author in pools else ""
+    foreign = [arm for arm in others if pool_family(pools[arm]) != family]
+    return (foreign or others)[0]
+
+
 def _review_unit(run: Run, unit: dict, row: dict, pools: dict[str, Pool], quota: dict, host: str,
-                 allow_lower: bool, repo: Path, base_sha: str) -> list[Finding]:
-    """Review one accepted unit; returns the findings its repros confirmed."""
+                 allow_lower: bool, repo: Path, base_sha: str) -> list[Finding] | None:
+    """Review one accepted unit; the findings its repros confirmed, or None when no reviewer delivered.
+
+    None is a failed review, recorded as such on the unit: a crashed, timed-out
+    or incoherent reviewer has not cleared anything. One other reviewer gets a
+    try first, when there is one.
+    """
     unit_id, worktree = unit["id"], Path(row["worktree"])
     diff = unit_diff(worktree, base_sha)
     if not needs_review(unit, diff):
@@ -281,27 +376,34 @@ def _review_unit(run: Run, unit: dict, row: dict, pools: dict[str, Pool], quota:
     if reviewer is None:
         run.unit(unit_id, review={"skipped": "no reviewer with quota"})
         return []
-    independence = review_independence(row["arm"], reviewer, pools)
-    run.step("reviewing", f"{unit_id} by {reviewer} ({independence})")
-    try:
-        with _throwaway(repo, run.dir / "review" / unit_id, row["branch"]) as review_wt:
-            rc, text = _dispatch(run, reviewer, pools, host, review_prompt(unit, diff), review_wt,
-                                 f"review-{unit_id}.log", REVIEW_TIMEOUT)
-            carried = _carry_review_tests(review_wt, worktree, unit_id)
-    except RuntimeError as exc:
-        run.unit(unit_id, review={"skipped": str(exc)})
-        return []
-    note = ""
-    try:
-        findings = parse_findings(text)
-    except ValueError as exc:
-        findings, note = [], f"findings unreadable: {exc}"
-    confirmed, advisory = confirm(findings, worktree, timeout=CHECK_TIMEOUT)
-    run.unit(unit_id, review={
-        "reviewer": reviewer, "independence": independence, "agent_rc": rc, "findings": len(findings),
-        "confirmed": [finding.to_dict() for finding in confirmed],
-        "advisory": [finding.to_dict() for finding in advisory], "carried_tests": carried, "note": note})
-    return confirmed
+    tried: list[str] = []
+    failures: list[str] = []
+    while reviewer is not None:
+        tried.append(reviewer)
+        independence = review_independence(row["arm"], reviewer, pools)
+        run.step("reviewing", f"{unit_id} by {reviewer} ({independence})")
+        try:
+            with _throwaway(repo, run.dir / "review" / unit_id, row["branch"]) as review_wt:
+                rc, text = _dispatch(run, reviewer, pools, host, review_prompt(unit, diff), review_wt,
+                                     f"review-{unit_id}-{len(tried)}.log", REVIEW_TIMEOUT)
+                carried = _carry_review_tests(review_wt, worktree, unit_id, branch=row.get("branch"))
+            findings = parse_review(rc, text)
+        except (RuntimeError, ValueError) as exc:
+            failures.append(f"{reviewer}: {exc}")
+            run.note(f"review of {unit_id} by {reviewer} failed: {exc}")
+            reviewer = (_another_reviewer(tried, row["arm"], pools, quota, host, allow_lower)
+                        if len(tried) < 2 else None)
+            continue
+        confirmed, advisory = confirm(findings, worktree, timeout=CHECK_TIMEOUT)
+        run.unit(unit_id, review={
+            "reviewer": reviewer, "independence": independence, "agent_rc": rc, "findings": len(findings),
+            "confirmed": [finding.to_dict() for finding in confirmed],
+            "advisory": [finding.to_dict() for finding in advisory], "carried_tests": carried,
+            "attempts": list(tried), "note": "; ".join(failures)})
+        return confirmed
+    reason = "review failed: " + "; ".join(failures)
+    run.unit(unit_id, state="review failed", reason=reason, review={"attempts": tried, "failed": failures})
+    return None
 
 
 def _pick_fixer(pass_no: int, previous: list[str], author: str, pools: dict[str, Pool], quota: dict,
@@ -336,9 +438,15 @@ def _check_output(log: str) -> str:
 
 def _fix_unit(run: Run, unit: dict, row: dict, confirmed: list[Finding], pools: dict[str, Pool],
               quota: dict, host: str, allow_lower: bool) -> bool:
-    """Up to MAX_FIX_PASSES rounds of fix, re-check and re-confirm; True when the unit is sound."""
+    """Up to MAX_FIX_PASSES rounds of fix, re-check and re-confirm; True when the unit is sound.
+
+    Every finding that was ever confirmed is re-run after every pass, not only
+    the ones the fixer was told about: a second fix can undo the first, and a
+    repro that times out or is refused has not passed.
+    """
     unit_id, worktree, author = unit["id"], Path(row["worktree"]), row["arm"]
     check_output = None if row["accepted"] else _check_output(row["log"])
+    outstanding = list(confirmed)
     fixers: list[str] = []
     reason = ""
     for pass_no in range(1, MAX_FIX_PASSES + 1):
@@ -349,19 +457,23 @@ def _fix_unit(run: Run, unit: dict, row: dict, confirmed: list[Finding], pools: 
         fixers.append(fixer)
         run.unit(unit_id, state="fixing", fix_passes=pass_no, fixers=list(fixers))
         run.step("fixing", f"{unit_id} pass {pass_no} by {fixer}")
-        prompt = fix_prompt(unit, check_output=check_output, confirmed=confirmed, pass_no=pass_no)
+        prompt = fix_prompt(unit, check_output=check_output, confirmed=outstanding, pass_no=pass_no)
         _dispatch(run, fixer, pools, host, prompt, worktree, f"fix-{unit_id}-{pass_no}.log", FIX_TIMEOUT)
         result = run_checked(unit["check"], worktree, timeout=CHECK_TIMEOUT)
         check_output = None if result.rc == 0 else result.output
-        confirmed, _ = confirm(confirmed, worktree, timeout=CHECK_TIMEOUT)
-        _commit_if_changed(worktree, f"ultra({unit_id}): fix pass {pass_no}")
-        if result.rc == 0 and not confirmed:
+        _, outstanding = resolved(confirmed, worktree, timeout=CHECK_TIMEOUT)
+        try:
+            _commit_if_changed(worktree, f"ultra({unit_id}): fix pass {pass_no}", branch=row.get("branch"))
+        except CommitError as exc:
+            reason = f"fix pass {pass_no} could not be kept: {exc}"
+            break
+        if result.rc == 0 and not outstanding:
             run.unit(unit_id, state="fixed", reason=None, outstanding=[])
             return True
         reason = (f"check exit {result.rc}" if result.rc else "") + (
-            ("; " if result.rc else "") + f"{len(confirmed)} confirmed finding(s) remain" if confirmed else "")
+            ("; " if result.rc else "") + f"{len(outstanding)} confirmed finding(s) remain" if outstanding else "")
     run.unit(unit_id, state="failed", reason=reason or "unresolved after fix passes",
-             outstanding=[finding.to_dict() for finding in confirmed])
+             outstanding=[finding.to_dict() for finding in outstanding])
     return False
 
 
@@ -369,7 +481,12 @@ def _fix_unit(run: Run, unit: dict, row: dict, confirmed: list[Finding], pools: 
 
 def _integrate(run: Run, plan: Plan, rows: dict[str, dict], sound: set[str], repo: Path, base_sha: str,
                pools: dict[str, Pool], quota: dict, host: str, allow_lower: bool, goal: str) -> dict:
-    """Merge every sound unit onto ultra/<run-id> in plan order, then run the goal check there."""
+    """Merge every sound unit onto ultra/<run-id> in plan order, then run the goal check there.
+
+    Before every merge and commit the worktree must still be on that branch,
+    descending from the base; if anything moved it (a model that checked out
+    main, say) integration stops rather than touch whatever is checked out.
+    """
     branch, path = f"ultra/{run.id}", run.dir / "integration"
     result = {"branch": branch, "worktree": str(path), "merged": [], "goal_check": plan.goal_check,
               "goal_check_passed": False, "goal_check_rc": None, "goal_check_output": "", "fix": None}
@@ -383,6 +500,11 @@ def _integrate(run: Run, plan: Plan, rows: dict[str, dict], sound: set[str], rep
     for unit in plan.units:
         if unit.id not in sound:
             continue
+        reason = _on_branch(path, branch, base_sha)
+        if reason:
+            result["error"] = f"integration stopped: {reason}"
+            run.unit(unit.id, state="unmerged", reason=reason)
+            continue
         merge = _git(path, "merge", "--no-ff", "-m", f"ultra({run.id}): merge {unit.id}", rows[unit.id]["branch"])
         if merge.returncode:
             _git(path, "merge", "--abort")
@@ -391,6 +513,9 @@ def _integrate(run: Run, plan: Plan, rows: dict[str, dict], sound: set[str], rep
             continue
         result["merged"].append(unit.id)
         run.unit(unit.id, state="merged")
+    if result.get("error"):
+        run.save()
+        return result
     run.step("integrating", "goal check")
     check = run_checked(plan.goal_check, path, timeout=CHECK_TIMEOUT)
     if check.rc != 0:
@@ -402,21 +527,42 @@ def _integrate(run: Run, plan: Plan, rows: dict[str, dict], sound: set[str], rep
             rc, _ = _dispatch(run, integrator, pools, host,
                               fix_prompt(unit, check_output=check.output, confirmed=[], pass_no=1),
                               path, "integration-fix.log", FIX_TIMEOUT)
-            _commit_if_changed(path, f"ultra({run.id}): integration fix")
-            check = run_checked(plan.goal_check, path, timeout=CHECK_TIMEOUT)
             result["fix"] = {"arm": integrator, "agent_rc": rc}
+            try:
+                _commit_if_changed(path, f"ultra({run.id}): integration fix", branch=branch, base_sha=base_sha)
+            except CommitError as exc:
+                # The goal check must speak for the branch, so an unkept fix is not re-checked.
+                result["error"] = f"integration fix not kept: {exc}"
+            else:
+                check = run_checked(plan.goal_check, path, timeout=CHECK_TIMEOUT)
     result.update(goal_check_passed=check.rc == 0, goal_check_rc=check.rc, goal_check_output=check.output[-4000:])
     run.save()
     return result
 
 
 def _settle(run: Run, rows: dict[str, dict]) -> None:
-    """Grade each unit's decision for the router: merged with N fix passes, or abandoned."""
+    """Grade each unit's decision for the router: merged with N fix passes, or abandoned.
+
+    The swarm recorded the units sharing an arm and cell as one trial, so each
+    unit's grade carries 1/n of that trial's weight; otherwise abandoning two
+    units would take back two rewards where one was given.
+    """
+    stats = cli.Stats()
+    cells: dict[str, tuple] = {}
+    for unit_id, row in rows.items():
+        try:
+            decision = stats.decision(row["decision_id"])
+        except ValueError:
+            decision = {}
+        cells[unit_id] = (decision.get("shape", row.get("shape")), decision.get("tier", row.get("tier")),
+                          decision.get("chosen", row.get("arm")))
+    shares = {cell: 1 / count for cell, count in Counter(cells.values()).items()}
     for unit_id, row in rows.items():
         state = run.progress["units"][unit_id]
         merged = state["state"] == "merged"
         argv = ["settle", "--decision", row["decision_id"], "--fix-passes", str(state.get("fix_passes", 0)),
-                "--merged" if merged else "--abandoned", "--within-swarm", run.id]
+                "--merged" if merged else "--abandoned", "--within-swarm", run.id,
+                "--weight", repr(shares[cells[unit_id]])]
         with contextlib.redirect_stdout(io.StringIO()):
             try:
                 rc = cli.main(argv)
@@ -613,17 +759,22 @@ def _execute(run: Run, goal: str, repo: Path, base: str, base_sha: str, context:
                  reason=None if row["accepted"] else f"check failed (agent exit {row['agent_rc']})")
 
     units = {unit.id: unit.to_dict() for unit in plan.units}
-    confirmed: dict[str, list[Finding]] = {}
+    reviews: dict[str, list[Finding] | None] = {}
     run.step("reviewing", "")
     for unit_id, row in rows.items():
         if row["accepted"]:
-            confirmed[unit_id] = _review_unit(run, units[unit_id], row, pools, quota, host, allow_lower, repo, base_sha)
+            reviews[unit_id] = _review_unit(run, units[unit_id], row, pools, quota, host, allow_lower, repo, base_sha)
 
     sound: set[str] = set()
     for unit_id, row in rows.items():
-        if row["accepted"] and not confirmed.get(unit_id):
-            sound.add(unit_id)
-        elif _fix_unit(run, units[unit_id], row, confirmed.get(unit_id, []), pools, quota, host, allow_lower):
+        if not row["accepted"]:
+            if _fix_unit(run, units[unit_id], row, [], pools, quota, host, allow_lower):
+                sound.add(unit_id)
+            continue
+        confirmed = reviews[unit_id]
+        if confirmed is None:
+            continue  # review failed: nothing is known to fix, and nothing was cleared
+        if not confirmed or _fix_unit(run, units[unit_id], row, confirmed, pools, quota, host, allow_lower):
             sound.add(unit_id)
 
     integration = _integrate(run, plan, rows, sound, repo, base_sha, pools, quota, host, allow_lower, goal)
@@ -655,6 +806,16 @@ def _load_progress(run_id: str | None) -> tuple[dict | None, str]:
     return None, (f"no ultra run {run_id}" if run_id else "no ultra runs yet")
 
 
+def _zombie(pid: int) -> bool:
+    """A process that has exited but not been reaped still answers signals; ps tells it apart."""
+    try:
+        state = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True,
+                               timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return state.strip().startswith("Z")
+
+
 def _alive(pid: object) -> bool:
     if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
         return False
@@ -664,7 +825,31 @@ def _alive(pid: object) -> bool:
         return True
     except OSError:
         return False
-    return True
+    return not _zombie(pid)
+
+
+def _stop_processes(pids: list) -> tuple[list[int], list[int]]:
+    """SIGTERM every live process (with its group when it leads one), wait, then SIGKILL the rest.
+
+    Returns (stopped, survivors). A delegate's shells and test runners share its
+    group, so signalling the group is what makes a cancel reach them.
+    """
+    targets = []
+    for pid in pids:
+        if pid in targets or pid == os.getpid() or not _alive(pid):
+            continue
+        if signal_tree(pid, signal.SIGTERM):
+            targets.append(pid)
+    deadline = time.monotonic() + CANCEL_GRACE
+    while any(_alive(pid) for pid in targets) and time.monotonic() < deadline:
+        time.sleep(0.1)
+    for pid in targets:
+        # The sweep reaches group members that outlived a leader which already answered SIGTERM.
+        signal_tree(pid, signal.SIGKILL)
+    deadline = time.monotonic() + 1.0
+    while any(_alive(pid) for pid in targets) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    return targets, [pid for pid in targets if _alive(pid)]
 
 
 def ultra_status(run_id: str | None = None) -> int:
@@ -692,6 +877,35 @@ def ultra_status(run_id: str | None = None) -> int:
 
 
 def ultra_cancel(run_id: str) -> int:
+    """Stop a run: its orchestrator first, then every model process it recorded, with their groups.
+
+    The progress file is re-read before it is marked cancelled: a run that
+    finished while its processes were being checked keeps its own verdict.
+    """
+    progress, reason = _load_progress(run_id)
+    if progress is None:
+        print(f"route ultra cancel: {reason}", file=sys.stderr)
+        return 1
+    if progress["state"] in FINISHED:
+        print(f"run {run_id} already finished: {progress['state']}")
+        return 0
+    pids = [progress.get("pid")] + list(progress.get("pids", []))
+    try:
+        status = json.loads((swarm_dir(run_id) / "status.json").read_text(encoding="utf-8"))
+        pids += [row.get("pid") for row in status.get("units", [])]
+    except (OSError, ValueError, AttributeError):
+        pass
+    stopped, survivors = _stop_processes(pids)
+    latest, _ = _load_progress(run_id)
+    if latest is not None and latest["state"] in FINISHED:
+        print(f"run {run_id} finished meanwhile: {latest['state']}; stopped {len(stopped)} process(es)")
+        return 0
+    progress = latest or progress
+    progress.update(state="cancelled", exit_code=130, finished_at=utc_now(), updated_at=utc_now(), pids=[])
+    atomic_write(ultra_dir(run_id) / "progress.json", json.dumps(progress, indent=2) + "\n")
+    print(f"run {run_id} cancelled; stopped {len(stopped)} process(es)"
+          + (f"; {len(survivors)} did not confirm exit: {survivors}" if survivors else ""))
+    return 0
     """Stop a run: its orchestrator first, then every model process it recorded."""
     progress, reason = _load_progress(run_id)
     if progress is None:

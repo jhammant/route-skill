@@ -66,6 +66,11 @@ def test_shipped_account_arms_share_the_anthropic_family(ultra_pools, arm):
     ("custom", "qwen", "local", "local"),
     ("custom", "gpt-6-astra", "local", "openai"),
     ("custom", "other-model", "included", "other"),
+    ("custom", "anthropic.claude-opus-5-5", "included", "anthropic"),
+    ("custom", "bedrock/eu.anthropic.claude-fable-5-1", "included", "anthropic"),
+    ("custom", "openai/o3", "included", "openai"),
+    ("custom", "deepseek/deepseek-r1", "included", "deepseek"),
+    ("custom", "some-other-model", "included", "other"),
 ])
 def test_family_inference_for_custom_arms(name, model, cost, family):
     pool = Pool(name=name, shapes=(), model=Model(name=model), cost=cost)
@@ -106,6 +111,22 @@ def test_rank_depends_on_model_and_named_best_model_pools(name, model, rank):
 
     assert ULTRA_MIN_RANK == 2
     assert result == rank
+
+
+@pytest.mark.parametrize("name", ["claude", "claude-work", "codex"])
+@pytest.mark.parametrize("model,rank", [
+    ("anthropic/claude-sonnet-5-5", 1),
+    ("claude-haiku-4-5", 0),
+    ("octopus-v2", 0),
+    ("fabled-model", 0),
+])
+def test_pinned_models_override_named_pool_defaults(name, model, rank):
+    pool = Pool(name=name, shapes=(), model=Model(name=model))
+
+    result = model_rank(pool)
+
+    assert result == rank
+    assert candidates({name: pool}, {}) == []
 
 
 def test_candidates_put_fable_above_opus_and_codex_and_exclude_sonnet(ultra_pools):
@@ -329,3 +350,10 @@ def test_configured_host_template_is_preserved(pools):
     result = dispatch_template("claude", pools)
 
     assert result == template
+
+
+def test_unknown_arm_without_dispatch_fails_before_launch():
+    pools = {"custom": Pool(name="custom", shapes=())}
+
+    with pytest.raises(ValueError, match="no dispatch template for arm: custom"):
+        dispatch_template("custom", pools)

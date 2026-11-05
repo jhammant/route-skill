@@ -103,6 +103,11 @@ def parse_weekly(agent, providers, *, now: datetime | None = None) -> dict[str, 
 
     if isinstance(agent, dict) and agent.get("ok"):
         add("claude", agent.get("weekly"))
+        # Per-model windows (Fable) are keyed "claude:Fable", never "claude":
+        # one model's week must not stand in for the whole account's.
+        for window in agent.get("scoped") or []:
+            if isinstance(window, dict) and window.get("label"):
+                add(f"claude:{window['label']}", window)
     if isinstance(providers, list):
         for provider in providers:
             if not isinstance(provider, dict) or not provider.get("ok") or not provider.get("id"):
@@ -114,5 +119,6 @@ def parse_weekly(agent, providers, *, now: datetime | None = None) -> dict[str, 
                     continue
                 label = str(window.get("label", "")).lower()
                 if "week" in label or label in ("7d", "7 days", "7-day"):
-                    add(provider["id"], window)
+                    scope = window.get("scope")
+                    add(f"{provider['id']}:{scope}" if scope else provider["id"], window)
     return windows

@@ -47,8 +47,9 @@ from .federate import (
 from .pools import Pool, load_pools, pools_for_host
 from .memory import TaskMemory
 from .outcomes import OUTCOME_EVENTS, record_failure, record_score, score_from_fix_passes, validate_score
-from .router import Router, cell_name
-from .eligibility import QUOTA_PROVIDER, fetch_usage, probably_private, quotamax_available
+from .router import Router, cell_name, load_priors
+from .digest import CONTEXT_LEVELS, DEFAULT_MAX_CHARS, find_transcript, build_digest, prepare_handoff
+from .eligibility import fetch_usage, probably_private, quota_keys, quota_provider, quotamax_available
 from .sensitive import detect_sensitive
 from .shapes import SHAPES, ShapeClassification, classify_with_confidence
 from .ship import RunResult, ShipAbort, build_pr_body, ship
@@ -69,7 +70,8 @@ def _build_router() -> Router:
         for arm, (a, b) in arms.items():
             have_a, have_b = cell.get(arm, (0.0, 0.0))
             cell[arm] = (have_a + a, have_b + b)
-    return Router(storage=storage, community=community)
+    priors = load_priors().with_aliases({name: pool.prior_like for name, pool in load_pools().items()})
+    return Router(storage=storage, priors=priors, community=community)
 
 
 @dataclass
@@ -192,11 +194,14 @@ def plan_task(text: str, opts: argparse.Namespace, *, quota=None, exclude=(),
         weekly = getattr(quota, "weekly", {})
         k = load_surplus_k()
         for arm in candidates:
-            provider = QUOTA_PROVIDER.get(arm)
-            window = weekly.get(provider, {})
+            # A model-scoped arm is paced by the tighter of its pool's week and its model's week.
+            keys = quota_keys(arm, pools)
+            window = max((weekly.get(key, {}) for key in keys),
+                         key=lambda w: w.get("percentUsed") or 0, default={})
+            headroom = next((quota.get(key) for key in reversed(keys) if quota.get(key)), None)
             adjustments[arm] = quota_adjustment(
                 window.get("percentUsed"), window.get("resetsInMinutes"), k,
-                headroom=quota.get(provider))
+                headroom=headroom)
         if record or memory.salt_path.is_file():
             neighbours = memory.neighbours(text, shape, candidates)
         chosen = router.select(shape, tier, result.eligible, prefer=prefer,
@@ -252,11 +257,11 @@ def plan_task(text: str, opts: argparse.Namespace, *, quota=None, exclude=(),
         plan["data_class_override"] = {"flag": "--open", "content_safety_net_matched": safety_net_overridden}
     hint = detect_swarm(text, shape)
     cap = plan_swarm(hint.units, pools[chosen].parallel_limit,
-                     quota.get(QUOTA_PROVIDER.get(chosen)) or "comfortable")
+                     quota.get(quota_provider(chosen, pools)) or "comfortable")
     plan["swarm"] = {**asdict(hint), "cap": cap,
                      "suggested": hint.suggested and cap >= 2}
     if hint.suggested and cap < 2:
-        headroom = quota.get(QUOTA_PROVIDER.get(chosen)) or "comfortable"
+        headroom = quota.get(quota_provider(chosen, pools)) or "comfortable"
         plan["swarm"]["reason"] = f"quota: {chosen} headroom {headroom}"
     override = getattr(args, "swarm", None)
     if override is not None:
@@ -275,6 +280,12 @@ def decide(args: argparse.Namespace, *, auto: bool) -> int:
         return exc.exit_code
     pools, router, decision = ctx.pools, ctx.router, ctx.decision
     chosen, host, shape, tier = (plan[k] for k in ("chosen", "host", "shape", "tier"))
+    handoff = None
+    if chosen != host and getattr(args, "context", "brief") != "brief":
+        pool = pools[chosen]
+        handoff = prepare_handoff(args.context, text, ctx.template, session_id=args.session,
+                                  claude_cli=pool.claude_cli, plan_only=args.plan_only)
+        plan["context"] = {"requested": args.context, "level": handoff.level, "note": handoff.note}
     print(json.dumps(plan, indent=2, sort_keys=True), flush=True)
     if plan["swarm"]["suggested"]:
         hint = plan["swarm"]
@@ -290,6 +301,8 @@ def decide(args: argparse.Namespace, *, auto: bool) -> int:
         return 0
 
     template, task_on_stdin = ctx.template, ctx.task_on_stdin
+    if handoff is not None:
+        text, template = handoff.text, handoff.template
     if getattr(args, "allow_network", False):
         if chosen == "codex":
             template = with_network(template)
@@ -314,7 +327,7 @@ def decide(args: argparse.Namespace, *, auto: bool) -> int:
     started = time.monotonic()
     rc = _dispatch(template, text, target=chosen, stdin=task_on_stdin)
     wall_clock_s = round(time.monotonic() - started, 1)
-    quota = _quota_cost(chosen, usage_before, fetch_usage() if usage_before else {})
+    quota = _quota_cost(chosen, usage_before, fetch_usage() if usage_before else {}, pools=pools)
     Stats().annotate(decision.decision_id, wall_clock_s=wall_clock_s, quota=quota)
     # Other route calls may have learned while this subprocess was running.
     # Reopen counts so its completion cannot overwrite their newer evidence.
@@ -326,13 +339,13 @@ def decide(args: argparse.Namespace, *, auto: bool) -> int:
         )
         print(f"quota: {quota['provider']} {moved}")
     elif not args.no_quota:
-        print(f"quota: not tracked for {chosen}" + ("" if chosen in QUOTA_PROVIDER else " (no quota pool)"))
+        print(f"quota: not tracked for {chosen}" + ("" if quota_provider(chosen, pools) else " (no quota pool)"))
     return rc
 
 
-def _quota_cost(arm: str, before: dict, after: dict) -> dict | None:
+def _quota_cost(arm: str, before: dict, after: dict, *, pools: dict | None = None) -> dict | None:
     """Before/after usage for the arm's quota pool; None when not measurable."""
-    provider = QUOTA_PROVIDER.get(arm)
+    provider = quota_provider(arm, pools)
     if not provider or provider not in before or provider not in after:
         return None
     b, a = before[provider], after[provider]
@@ -701,6 +714,18 @@ def cmd_ship(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_digest(args: argparse.Namespace) -> int:
+    if not args.session:
+        print("route digest: no session (set CLAUDE_CODE_SESSION_ID or pass --session)", file=sys.stderr)
+        return 2
+    path = find_transcript(args.session)
+    if path is None:
+        print(f"route digest: no transcript for session {args.session}", file=sys.stderr)
+        return 1
+    sys.stdout.write(build_digest(path, args.session, max_chars=args.max_chars))
+    return 0
+
+
 def _parser(prog: str) -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog=prog)
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
@@ -708,6 +733,12 @@ def _parser(prog: str) -> argparse.ArgumentParser:
 
     t = sub.add_parser("task", help="route a task (default)")
     _add_task_flags(t)
+
+    dg = sub.add_parser("digest", help="print a session's handoff digest (conversation minus tool output)")
+    dg.add_argument("--session", default=os.environ.get("CLAUDE_CODE_SESSION_ID"),
+                    help="session ID (default: CLAUDE_CODE_SESSION_ID, i.e. this one)")
+    dg.add_argument("--max-chars", type=_positive_int, default=DEFAULT_MAX_CHARS)
+    dg.set_defaults(func=cmd_digest)
 
     swarm = sub.add_parser("swarm", help="dispatch independently checked units across model pools")
     swarm.add_argument("manifest", help="JSON manifest path, or - for stdin")
@@ -817,6 +848,12 @@ def _add_task_flags(p: argparse.ArgumentParser) -> None:
                         "never --sensitive, --private or a sensitive.toml path; recorded in the plan")
     p.add_argument("--no-acceptance", action="store_true", help="veto: no clear acceptance check")
     p.add_argument("--needs-context", action="store_true", help="veto: needs this conversation")
+    p.add_argument("--context", choices=CONTEXT_LEVELS, default="brief",
+                   help="what a delegate gets beyond the task text: brief (nothing, default), digest "
+                        "(this conversation minus tool output, ~2-10%% of it) or fork (the whole session, "
+                        "Claude Code arms only; cheap only on the same account and model)")
+    p.add_argument("--session", default=os.environ.get("CLAUDE_CODE_SESSION_ID"),
+                   help="session to digest or fork (default: CLAUDE_CODE_SESSION_ID, i.e. this one)")
     p.add_argument("--cross-repo", action="store_true", help="veto: cross-repo orchestration")
     llm = p.add_mutually_exclusive_group()
     llm.add_argument("--llm-shape", action="store_true", help="resolve low-confidence shapes with the local LLM")
@@ -863,7 +900,7 @@ def _ttl_arg(text: str) -> int:
 
 
 _SUBCOMMANDS = {"task", "stats", "outcome", "settle", "reseed", "federate", "benchmark", "ship",
-                "swarm", "swarm-log", "swarms"}
+                "swarm", "swarm-log", "swarms", "digest"}
 
 
 def _run(argv: list[str] | None, *, auto: bool) -> int:

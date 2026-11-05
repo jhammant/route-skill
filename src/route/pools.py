@@ -120,6 +120,21 @@ class Pool:
     #: 30 on ADVANCED). A swarm is a property of DISPATCH, never a separate
     #: arm — the bandit picks the pool, the concurrency planner picks n.
     parallel_limit: int = 1
+    #: quotamax pool this arm spends. None means the built-in mapping by arm
+    #: name (``eligibility.QUOTA_PROVIDER``); "" means untracked. Several arms
+    #: can share one pool: claude-work and claude-work-fable both spend the
+    #: second Claude subscription.
+    quota_provider: str | None = None
+    #: A per-model window inside that pool ("Fable"). The arm is also gated on
+    #: it, so a spent Fable week removes the Fable arm and leaves the Opus one.
+    quota_scope: str = ""
+    #: Borrow another arm's rule-table priors where the table doesn't name this
+    #: one. A new Claude-account arm starts where ``claude`` does, not at
+    #: Beta(unfavoured), and evidence moves it from there.
+    prior_like: str = ""
+    #: The dispatch is the Claude Code CLI (``claude``/``claude-work``), so it
+    #: can resume a forked parent session and take a per-swarm a-mail MCP config.
+    claude_cli: bool = False
 
     def __post_init__(self) -> None:
         if self.endpoint:
@@ -273,7 +288,13 @@ def load_pools(path: str | Path | None = None) -> dict[str, Pool]:
                 version=str(model_spec.get("version", "")),
             ),
             parallel_limit=int(spec.get("parallel_limit", 1)),
+            quota_provider=(str(spec["quota_provider"]) if "quota_provider" in spec else None),
+            quota_scope=str(spec.get("quota_scope", "")),
+            prior_like=str(spec.get("prior_like", "")),
+            claude_cli=bool(spec.get("claude_cli", False)),
         )
+        if pools[name].prior_like and pools[name].prior_like == name:
+            raise ValueError(f"pools.toml: {name} cannot take its priors from itself")
     return pools
 
 

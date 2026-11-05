@@ -174,6 +174,10 @@ def eligible_for(shape: str, pools: dict[str, Pool]) -> list[str]:
     return out
 
 
+def _bucket(percent_used: float) -> str:
+    return 'critical' if percent_used >= 95 else 'low' if percent_used >= 80 else 'ok'
+
+
 def parse_quota(payload: dict | list) -> dict[str, str]:
     """Normalise quotamax JSON to {pool: headroom}.
 
@@ -185,7 +189,10 @@ def parse_quota(payload: dict | list) -> dict[str, str]:
         for provider in payload:
             if not isinstance(provider, dict) or not provider.get('ok'):
                 continue
-            percents = []
+            # A limit with a ``scope`` is one model's window (claude-work's
+            # Fable week). It gates "<id>:<scope>" only, so a spent Fable week
+            # leaves the account's other arms eligible.
+            percents: dict[str, list[float]] = {}
             for limit in provider.get('limits', []):
                 reset = limit.get('resetsAt')
                 try:
@@ -194,14 +201,20 @@ def parse_quota(payload: dict | list) -> dict[str, str]:
                 except (ValueError, TypeError):
                     continue
                 percent = limit.get('percent')
-                if isinstance(percent, (int, float)):
-                    percents.append(percent)
-            if percents and provider.get('id'):
-                used = max(percents)
-                out[provider['id']] = 'critical' if used >= 95 else 'low' if used >= 80 else 'ok'
+                if isinstance(percent, (int, float)) and provider.get('id'):
+                    key = f"{provider['id']}:{limit['scope']}" if limit.get('scope') else provider['id']
+                    percents.setdefault(key, []).append(percent)
+            for key, values in percents.items():
+                out[key] = _bucket(max(values))
         return out
     if isinstance(payload, dict) and 'headroom' in payload:
-        return {'claude': str(payload['headroom']).lower()} if payload.get('ok') else {}
+        if not payload.get('ok'):
+            return {}
+        out = {'claude': str(payload['headroom']).lower()}
+        for window in payload.get('scoped') or []:
+            if isinstance(window, dict) and window.get('label') and isinstance(window.get('percentUsed'), (int, float)):
+                out[f"claude:{window['label']}"] = _bucket(window['percentUsed'])
+        return out
     data = payload.get("pools", payload) if isinstance(payload, dict) else {}
     out: dict[str, str] = {}
     for pool, value in data.items():
@@ -326,6 +339,24 @@ def _fetch_quota(cmd: tuple[str, ...], timeout: float) -> dict[str, str]:
 QUOTA_PROVIDER: dict[str, str] = {"claude": "claude", "codex": "codex", "kimi": "kimi", "deepseek": "deepseek"}
 
 
+def quota_provider(arm: str, pools: dict[str, Pool] | None = None) -> str | None:
+    """The quotamax pool an arm spends: its pools.toml ``quota_provider``, else the built-in map."""
+    pool = (pools or {}).get(arm)
+    if pool is not None and pool.quota_provider is not None:
+        return pool.quota_provider or None
+    return QUOTA_PROVIDER.get(arm)
+
+
+def quota_keys(arm: str, pools: dict[str, Pool] | None = None) -> list[str]:
+    """Every quota key that can remove an arm: its pool, plus its model window if it has one."""
+    provider = quota_provider(arm, pools)
+    if provider is None:
+        return []
+    pool = (pools or {}).get(arm)
+    scope = pool.quota_scope if pool is not None else ""
+    return [provider, f"{provider}:{scope}"] if scope else [provider]
+
+
 def parse_usage(agent, providers) -> dict[str, dict[str, float]]:
     """Raw percentages, {provider: {limit_label: percent}}, from both quotamax views.
 
@@ -369,18 +400,20 @@ def apply_quota(
     eligible: list[str],
     quota: dict[str, str],
     *,
-    quota_pool: dict[str, str | None] | None = None,
+    quota_pool: dict[str, str | list[str] | None] | None = None,
 ) -> list[str]:
-    """Step 4: remove arms whose pool reports critical headroom.
+    """Step 4: remove arms whose pool (or model window) reports critical headroom.
 
-    ``quota_pool`` maps arm -> quotamax pool name; arms mapped to None (local
+    ``quota_pool`` maps arm -> quotamax pool name, or a list of keys (pool
+    plus model window, from ``quota_keys``); arms mapped to None (local
     models) have no quota and always survive.
     """
     mapping = quota_pool or QUOTA_PROVIDER
     out = []
     for arm in eligible:
-        pool_name = mapping.get(arm)
-        if pool_name is not None and quota.get(pool_name) == "critical":
+        keys = mapping.get(arm)
+        keys = [keys] if isinstance(keys, str) else (keys or [])
+        if any(quota.get(key) == "critical" for key in keys):
             continue
         out.append(arm)
     return out
@@ -475,7 +508,7 @@ def gate(
     if sensitive:
         eligible, removed_sensitive = sensitive_veto(eligible, pools, host=host)
     if quota:
-        survivors = apply_quota(eligible, quota)
+        survivors = apply_quota(eligible, quota, quota_pool={arm: quota_keys(arm, pools) for arm in eligible})
         removed = [a for a in eligible if a not in survivors]
         eligible = survivors
     else:

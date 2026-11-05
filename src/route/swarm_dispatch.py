@@ -19,7 +19,7 @@ from pathlib import Path
 
 from . import cli
 from .complexity import TIERS
-from .eligibility import QUOTA_PROVIDER
+from .eligibility import quota_provider
 from .memory import TaskMemory
 from .pools import STRENGTH_ORDER
 from .shapes import SHAPES
@@ -133,7 +133,7 @@ def assign_units(manifest: dict, args: argparse.Namespace, quota: dict) -> tuple
 
         def has_room(arm):
             cap = plan_swarm(counts[arm] + 1, ctx.pools[arm].parallel_limit,
-                             quota.get(QUOTA_PROVIDER.get(arm)) or "comfortable")
+                             quota.get(quota_provider(arm, ctx.pools)) or "comfortable")
             return counts[arm] + 1 <= cap
 
         previous = [arm for arm in cells[cell] if arm in plan["eligible"]]
@@ -216,7 +216,9 @@ def dispatch_command(assignment: Assignment, worker: Worker | None, directory: P
     if worker is None:
         return argv, {}
     env = worker.environment()
-    if assignment.arm in ("codex", "claude"):
+    pool = assignment.ctx.pools.get(assignment.arm)
+    claude_cli = assignment.arm == "claude" or bool(pool and pool.claude_cli)
+    if assignment.arm == "codex" or claude_cli:
         node, bridge = mcp_runtime()
         mcp_env = {key: env[key] for key in ("AMAIL_CREDENTIALS", "AMAIL_SERVER")}
         if assignment.arm == "codex":
@@ -234,6 +236,8 @@ def dispatch_command(assignment: Assignment, worker: Worker | None, directory: P
             path = directory / "mcp" / f"{assignment.unit['id']}.json"
             atomic_write(path, json.dumps({"mcpServers": {"amail": {
                 "command": node, "args": [bridge], "env": mcp_env}}}))
+            # claude-work passes every argument through to claude, and claude takes
+            # --mcp-config more than once, so this also joins a lean worker config.
             argv[1:1] = ["--mcp-config", str(path), "--allowedTools",
                          "mcp__amail__amail_inbox,mcp__amail__amail_send"]
     return argv, env
@@ -406,7 +410,7 @@ def run_swarm(args: argparse.Namespace, *, auto: bool) -> int:
         counts = Counter(a.arm for a in assignments)
         semaphores = {a.arm: threading.Semaphore(max(1, plan_swarm(
             counts[a.arm], a.ctx.pools[a.arm].parallel_limit,
-            quota.get(QUOTA_PROVIDER.get(a.arm)) or "comfortable"))) for a in assignments}
+            quota.get(quota_provider(a.arm, a.ctx.pools)) or "comfortable"))) for a in assignments}
         if channel:
             poller = HubPoller(channel, directory / "channel.jsonl", on_message=live_status.channel)
             poller.start()

@@ -307,7 +307,9 @@ route ultra "Add rate limiting to src/api/, stdlib only. Goal check: pytest -q t
 3. A model from a different family reviews each non-trivial accepted unit. A
    finding counts only when its repro command shows the bug, and each unit
    gets at most two fix passes.
-4. Accepted branches merge onto `ultra/<run-id>` and the goal check runs there.
+4. Accepted branches merge onto `ultra/<run-id>` (build artefacts are never
+   staged; a real conflict gets the integrator one pass) and the goal check
+   runs there.
 5. Outcomes are settled for the router, and `summary.md` names the branch, the
    units that passed, the bugs the reviews confirmed, the quota spent per pool
    and the merge command.
@@ -316,9 +318,9 @@ It never merges into your base branch or main, and never pushes. Checks run
 without a shell, and only test runners are allowed in them. `--plan-only`
 shows the plan, `--context digest` hands the workers this conversation, and
 `route ultra status` and `route ultra cancel <run-id>` watch and stop a run.
-Each run's state lives in `ROUTE_STATE_DIR/ultra/<run-id>/`. Exit 0 means the
-goal check passed, 1 that a unit or the goal check failed, and 2 that it could
-not plan or no usable model had quota. `ultra` is the same command. For
+Each run's state lives in `ROUTE_STATE_DIR/ultra/<run-id>/`. Exit 0 means every
+unit merged and the goal check passed, 1 that a unit was not merged or the goal
+check failed, and 2 that it could not plan or no usable model had quota. `ultra` is the same command. For
 `/ultra` in Claude Code, link the skill:
 `ln -s "$PWD/skill-ultra" "$HOME/.claude/skills/ultra"`.
 

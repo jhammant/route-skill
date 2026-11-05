@@ -32,8 +32,10 @@ case "$prompt" in
   *ULTRA-MANIFEST-BEGIN*) role=planner ;;
   *ULTRA-FINDINGS-BEGIN*) role=reviewer ;;
   *"Fix pass "*) role=fixer ;;
+  *"Resolve the merge conflict"*) role=merger ;;
 esac
-unit=$(printf '%s\n' "$prompt" | sed -n -e 's/^Unit id: //p' -e 's/^## Your unit: //p' | head -1)
+unit=$(printf '%s\n' "$prompt" | sed -n -e 's/^Unit id: //p' -e 's/^## Your unit: //p' \
+  -e 's/^Resolve the merge conflict for unit \([^:]*\):.*/\1/p' | head -1)
 echo "$(basename "$0") $role ${unit:-plan} $PWD" >> "$FAKE_DIR/calls.log"
 if [ "$role" = planner ]; then
   n=$(cat "$FAKE_DIR/plans.count" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > "$FAKE_DIR/plans.count"
@@ -44,10 +46,15 @@ if [ "$role" = reviewer ]; then
   findings="$FAKE_DIR/findings-$unit.json"
   echo "ULTRA-FINDINGS-BEGIN"; if [ -f "$findings" ]; then cat "$findings"; else echo "[]"; fi; echo "ULTRA-FINDINGS-END"; exit 0
 fi
-verb=write; [ "$role" = fixer ] && verb=fix
+verb=write; [ "$role" = fixer ] && verb=fix; [ "$role" = merger ] && verb=merge
 printf '%s\n' "$prompt" | grep -o "ultra-fake: $verb [^ ]* [^ ]*" | sort -u | while read -r _ _ path content; do
   mkdir -p "$(dirname "$path")"; printf '%s\n' "$content" > "$path"
 done
+# A worker that commits for itself, artefacts and all, like a real model running `git add -A`.
+check=$(printf '%s\n' "$prompt" | grep -o "ultra-fake: selfcommit [^ ]*" | head -1 | cut -d' ' -f3)
+if [ "$role" = worker ] && [ -n "$check" ]; then
+  bash "$check" >/dev/null 2>&1; git add -A && git commit -q -m "worker: $unit"
+fi
 exit 0
 '''
 
@@ -72,7 +79,14 @@ def repo(tmp_path):
         "repro_alpha.sh": 'grep -q fixed alpha.txt',
         "passes.sh": 'true',
         "fails_goal.sh": 'false',
+        "check_goal3.sh": 'test -s alpha.txt && test -s beta.txt && test -s gamma.txt',
     }
+    # Checks that leave build artefacts behind, each with different bytes at the same paths.
+    for name in ("alpha", "beta", "gamma"):
+        scripts[f"check_pyc_{name}.sh"] = (
+            f"mkdir -p __pycache__ tests/__pycache__ .pytest_cache && printf '{name}' > __pycache__/x.pyc && "
+            f"printf '{name}' > tests/__pycache__/__init__.cpython-314.pyc && printf '{name}' > .pytest_cache/v && "
+            f"printf '{name}' > .coverage && test -s {name}.txt")
     for name, body in scripts.items():
         (directory / "tests" / name).write_text(f"#!/bin/sh\n{body}\n")
     subprocess.run(["git", "-C", str(directory), "add", "."], check=True, capture_output=True)
@@ -513,3 +527,156 @@ def test_settle_weight_must_be_a_share():
     for bad in ("0", "1.5", "-1", "x"):
         with pytest.raises(Exception):
             cli._weight_arg(bad)
+
+
+# -- artefacts, scope and conflicts (the dogfooding failure) -------------------
+
+def tracked(repo, ref):
+    return git(repo, "ls-tree", "-r", "--name-only", ref).split()
+
+
+def artefacts_in(paths):
+    return [p for p in paths if "__pycache__" in p or p.endswith((".pyc", ".coverage")) or ".pytest_cache" in p]
+
+
+def test_three_units_whose_checks_write_pyc_files_all_merge(repo, fake):
+    # Arrange: the live failure: disjoint sources, but every check writes __pycache__ with different bytes.
+    units = [unit(name, touches=[f"{name}.txt"], write=f"{name}.txt {name}", check=f"bash tests/check_pyc_{name}.sh")
+             for name in ("alpha", "beta", "gamma")]
+    write_plan(fake, plan(units, goal_check="bash tests/check_goal3.sh"))
+    # Act
+    rc = run_ultra("Three files", repo=str(repo), host="claude")
+    # Assert: all three merged, the goal check passed on 3 of 3, and no artefact is tracked anywhere.
+    summary, run_dir = latest_run()
+    assert rc == 0, (run_dir / "summary.md").read_text()
+    assert summary["integration"]["merged"] == ["alpha", "beta", "gamma"] and summary["integration"]["unmerged"] == []
+    assert all(row["state"] == "merged" for row in summary["units"])
+    run_id = summary["run_id"]
+    assert artefacts_in(tracked(repo, f"ultra/{run_id}")) == []
+    for name in ("alpha", "beta", "gamma"):
+        assert artefacts_in(tracked(repo, f"swarm/{run_id}/{name}")) == []
+        assert (Path(swarm_dir(run_id)) / "wt" / name / "__pycache__" / "x.pyc").read_text() == name
+    text = (run_dir / "summary.md").read_text()
+    assert "Goal check `bash tests/check_goal3.sh`: passed on 3 of 3 units" in text
+    assert "Result: complete: all 3 units merged and the goal check passed" in text
+
+
+def test_artefacts_a_worker_committed_itself_do_not_block_the_merge(repo, fake):
+    # Arrange: both workers run their check and commit with `git add -A`, pyc files included.
+    units = [unit("alpha", touches=["alpha.txt"], write="alpha.txt alpha", check="bash tests/check_pyc_alpha.sh"),
+             unit("beta", touches=["beta.txt"], write="beta.txt beta", check="bash tests/check_pyc_beta.sh")]
+    for row in units:
+        row["task"] += f" ultra-fake: selfcommit tests/check_pyc_{row['id']}.sh"
+    write_plan(fake, plan(units))
+    # Act
+    rc = run_ultra("Two files", repo=str(repo), host="claude")
+    # Assert: the add/add conflict on the .pyc files is settled without a model; both units merge.
+    summary, run_dir = latest_run()
+    run_id = summary["run_id"]
+    assert "__pycache__/x.pyc" in tracked(repo, f"swarm/{run_id}/beta")  # the worker really did commit it
+    assert rc == 0 and summary["integration"]["merged"] == ["alpha", "beta"]
+    assert any("artefact conflict(s) dropped" in note for note in summary["notes"])
+    assert "merger" not in [role for _, role, _, _ in calls(fake)]
+    assert git(repo, "status", "--porcelain") == ""
+
+
+def test_real_conflict_gets_one_integrator_pass(repo, fake):
+    # Arrange: both units edit shared.txt; beta's brief tells the merger what the resolution is.
+    units = [unit("alpha", touches=["alpha.txt"], write="shared.txt alpha", check="bash tests/passes.sh"),
+             unit("beta", touches=["beta.txt"], write="shared.txt beta", check="bash tests/passes.sh")]
+    units[1]["task"] += " ultra-fake: merge shared.txt merged"
+    write_plan(fake, plan(units, goal_check="bash tests/passes.sh"))
+    head_before = git(repo, "rev-parse", "HEAD").strip()
+    # Act
+    rc = run_ultra("Two files", repo=str(repo), host="claude")
+    # Assert: one merger pass on beta, the merge committed with both parents, base untouched.
+    summary, run_dir = latest_run()
+    run_id = summary["run_id"]
+    assert rc == 0, (run_dir / "summary.md").read_text()
+    assert summary["integration"]["merged"] == ["alpha", "beta"]
+    assert git(repo, "show", f"ultra/{run_id}:shared.txt") == "merged\n"
+    mergers = [(binary, who) for binary, role, who, _ in calls(fake) if role == "merger"]
+    assert mergers == [("fake-anthropic", "beta")]
+    assert (run_dir / "logs" / "merge-beta.log").is_file()
+    parents = git(repo, "log", "-1", "--format=%P", f"ultra/{run_id}").split()
+    assert len(parents) == 2 and git(repo, "rev-parse", f"swarm/{run_id}/beta").strip() in parents
+    progress = json.loads((run_dir / "progress.json").read_text())
+    assert progress["units"]["beta"]["resolver"] == "claude-work"
+    assert git(repo, "rev-parse", "HEAD").strip() == head_before
+    assert "passed on 2 of 2 units" in (run_dir / "summary.md").read_text()
+
+
+def test_failed_integrator_pass_restores_the_branch_and_reports_the_partial_merge(repo, fake):
+    # Arrange: a real conflict the merger leaves full of markers (no merge instruction anywhere).
+    units = [unit("alpha", touches=["alpha.txt"], write="shared.txt alpha", check="bash tests/passes.sh"),
+             unit("beta", touches=["beta.txt"], write="shared.txt beta", check="bash tests/passes.sh")]
+    write_plan(fake, plan(units, goal_check="bash tests/passes.sh"))
+    # Act
+    rc = run_ultra("Two files", repo=str(repo), host="claude")
+    # Assert: beta is a conflict, the worktree is back on alpha's merge, and the goal check is not oversold.
+    summary, run_dir = latest_run()
+    run_id = summary["run_id"]
+    beta = next(row for row in summary["units"] if row["id"] == "beta")
+    assert rc == 1 and beta["state"] == "conflict" and "left conflict markers" in beta["reason"]
+    assert [who for _, role, who, _ in calls(fake) if role == "merger"] == ["beta"]
+    integration = Path(summary["integration"]["worktree"])
+    assert git(integration, "status", "--porcelain") == ""
+    assert not (integration / ".git" / "MERGE_HEAD").exists()
+    assert git(repo, "show", f"ultra/{run_id}:shared.txt") == "alpha\n"
+    assert git(repo, "log", "--format=%s", f"ultra/{run_id}").split("\n")[0] == f"ultra({run_id}): merge alpha"
+    assert summary["integration"]["goal_check_passed"] and summary["integration"]["unmerged"] == ["beta"]
+    text = (run_dir / "summary.md").read_text()
+    assert "Goal check `bash tests/passes.sh`: passed on 1 of 2 units (1 not merged: beta)" in text
+    assert "Result: INCOMPLETE: 1 of 2 units not merged" in text and "Result: complete" not in text
+
+
+def test_out_of_scope_paths_are_recorded_after_the_worker_and_after_a_fix(repo, fake):
+    # Arrange: alpha strays outside its touches; beta's fix adds a stray file; gamma stays inside its directory.
+    alpha = unit("alpha", touches=["alpha.txt"], write="alpha.txt alpha")
+    alpha["task"] += " ultra-fake: write extra/notes.txt stray"
+    beta = unit("beta", touches=["beta.txt"], fix="beta.txt beta")
+    beta["task"] += " ultra-fake: fix stray.txt x"
+    gamma = unit("gamma", touches=["gamma/"], write="gamma/gamma.txt g", check="bash tests/passes.sh")
+    write_plan(fake, plan([alpha, beta, gamma]))
+    # Act
+    rc = run_ultra("Three files", repo=str(repo), host="claude")
+    # Assert: recorded and shown, but no unit fails for it.
+    summary, run_dir = latest_run()
+    by_id = {row["id"]: row for row in summary["units"]}
+    assert rc == 0 and all(row["state"] == "merged" for row in by_id.values())
+    assert by_id["alpha"]["out_of_scope"] == ["extra/notes.txt"]
+    assert by_id["beta"]["out_of_scope"] == ["stray.txt"] and by_id["beta"]["fix_passes"] == 1
+    assert by_id["gamma"]["out_of_scope"] == []
+    text = (run_dir / "summary.md").read_text()
+    assert "| alpha | claude-work | codex (cross-family) | 0 | 0 | extra/notes.txt | merged |" in text
+    assert "| gamma | claude-work | codex (cross-family) | 0 | 0 | - | merged |" in text
+
+
+def test_out_of_scope_rules():
+    changed = ["pkg/a.py", "pkg/sub/b.py", "tests/test_a.py", "tests/test_review.py", "README.md", "pkg2/x.py"]
+    assert ultra.out_of_scope(changed, ["pkg/", "tests/test_a.py"], ["tests/test_review.py"]) == ["README.md", "pkg2/x.py"]
+    assert ultra.out_of_scope(changed, ["pkg", "tests"]) == ["README.md", "pkg2/x.py"]
+    assert ultra.out_of_scope([], ["pkg"]) == []
+
+
+def test_is_artefact_matches_build_output_only():
+    for path in ("__pycache__/x.pyc", "tests/__pycache__/__init__.cpython-314.pyc", "a/b.pyo", ".pytest_cache/v",
+                 "node_modules/x/y.js", ".DS_Store", "src/.DS_Store", ".coverage", ".coverage.123",
+                 "pkg.egg-info/PKG-INFO", "src/.mypy_cache/3.12/a.json", ".ruff_cache/x"):
+        assert swarm_dispatch.is_artefact(path), path
+    for path in ("src/pkg/cache.py", "tests/test_pycache.py", "node_modules.md", "coverage.xml", "pyc/real.py"):
+        assert not swarm_dispatch.is_artefact(path), path
+
+
+def test_checks_run_without_writing_bytecode(monkeypatch):
+    from route.ultra_safety import safe_env
+    monkeypatch.setenv("PYTHONDONTWRITEBYTECODE", "")
+    assert safe_env()["PYTHONDONTWRITEBYTECODE"] == "1" and safe_env({})["PYTHONDONTWRITEBYTECODE"] == "1"
+
+
+def test_status_counts_the_units_the_goal_check_covered(repo, fake, capsys):
+    write_plan(fake, plan(two_units()))
+    run_ultra("Create two files", repo=str(repo), host="claude")
+    capsys.readouterr()
+    assert ultra_status() == 0
+    assert "goal check passed on 2 of 2 units" in capsys.readouterr().out

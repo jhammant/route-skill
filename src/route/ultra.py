@@ -1,0 +1,721 @@
+"""``route ultra``: plan a goal, build it as a swarm on the best models with quota,
+review each unit from another model family, fix what the repros confirm,
+integrate on the run's own branch and report.
+
+Everything the run does to the repository happens in worktrees under the state
+dir and on branches named for the run. The user's checked-out branch, the base
+branch and every remote are never written: merging ``ultra/<run-id>`` is the one
+step left to a person, and summary.md spells out the command. Nothing here ever
+asks for approval.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import io
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+from . import cli
+from .digest import digest_preamble, write_digest
+from .pools import Pool, pool_family, pools_for_host
+from .storage import atomic_write, state_dir
+from .swarm_dispatch import run_swarm_manifest, swarm_dir
+from .swarm_status import utc_now
+from .ultra_plan import Plan, PlanError, lint_plan, merge_overlaps, parse_plan, planner_prompt, to_manifest
+from .ultra_review import Finding, confirm, fix_prompt, needs_review, parse_findings, review_prompt, unit_diff
+from .ultra_safety import run_checked, screen_digest
+from .ultra_select import candidates, dispatch_template, pick, review_independence
+
+RUN_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,80}$")
+SCHEMA = "route-ultra-progress/1"
+MAX_FIX_PASSES = 2
+#: Seconds. Module constants so a test (or an operator) can shorten them.
+PLANNER_TIMEOUT = 1800
+REVIEW_TIMEOUT = 1800
+FIX_TIMEOUT = 3600
+CHECK_TIMEOUT = 600
+FINISHED = frozenset({"done", "failed", "planned", "cancelled", "interrupted"})
+
+
+def ultra_dir(run_id: str) -> Path:
+    """Where one run's plan, manifest, progress, logs, worktrees and summary live."""
+    return state_dir() / "ultra" / run_id
+
+
+def new_run_id(goal: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", goal.lower()).strip("-")[:24].rstrip("-") or "ultra"
+    return f"{slug}-{datetime.now(timezone.utc):%Y%m%d%H%M%S}"
+
+
+def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True, errors="replace")
+
+
+class Run:
+    """One run's directory and progress.json, written before every step acts.
+
+    A watcher (``route ultra status``) and a canceller only ever see this file,
+    so it carries every PID the run started and each unit's current state.
+    """
+
+    def __init__(self, run_id: str, goal: str, repo: Path, base: str, host: str):
+        self.id = run_id
+        self.dir = ultra_dir(run_id)
+        self.progress: dict = {
+            "schema": SCHEMA, "run_id": run_id, "goal": goal, "repo": str(repo), "base": base,
+            "base_sha": None, "host": host, "pid": os.getpid(), "state": "starting", "step": "",
+            "started_at": utc_now(), "updated_at": None, "finished_at": None, "exit_code": None,
+            "context": {}, "planner": None, "plan_problems": [], "pids": [], "units": {}, "held": [],
+            "integration": {}, "notes": [],
+        }
+
+    def save(self) -> None:
+        self.progress["updated_at"] = utc_now()
+        atomic_write(self.dir / "progress.json", json.dumps(self.progress, indent=2) + "\n")
+
+    def step(self, state: str, step: str = "") -> None:
+        self.progress.update(state=state, step=step)
+        self.save()
+
+    def note(self, text: str) -> None:
+        self.progress["notes"].append(text)
+        print(f"ultra: {text}", flush=True)
+        self.save()
+
+    def unit(self, unit_id: str, **fields) -> dict:
+        row = self.progress["units"].setdefault(unit_id, {"id": unit_id, "state": "planned", "fix_passes": 0})
+        row.update(fields)
+        self.save()
+        return row
+
+    def track(self, pid: int) -> None:
+        self.progress["pids"].append(pid)
+        self.save()
+
+    def untrack(self, pid: int) -> None:
+        self.progress["pids"] = [p for p in self.progress["pids"] if p != pid]
+        self.save()
+
+    def finish(self, state: str, exit_code: int) -> None:
+        self.progress.update(state=state, exit_code=exit_code, finished_at=utc_now(), pids=[])
+        self.save()
+
+
+def _resolve_base(repo: Path, base: str) -> str | None:
+    if base.startswith("-"):
+        return None
+    probe = _git(repo, "rev-parse", "--is-inside-work-tree")
+    if probe.returncode or probe.stdout.strip() != "true":
+        return None
+    sha = _git(repo, "rev-parse", "--verify", f"{base}^{{commit}}")
+    return sha.stdout.strip() if sha.returncode == 0 else None
+
+
+def _dispatch(run: Run, arm: str, pools: dict[str, Pool], host: str, prompt: str, cwd: Path,
+              log_name: str, timeout: float) -> tuple[int, str]:
+    """Run one model on a prompt in a directory, logging to the run dir; (exit code, output)."""
+    log = run.dir / "logs" / log_name
+    template = dispatch_template(arm, pools, host=host)
+    pid_box: list[int] = []
+
+    def started(pid: int) -> None:
+        pid_box.append(pid)
+        run.track(pid)
+
+    try:
+        rc = cli._dispatch(template, prompt, target=arm, cwd=cwd, log=log, timeout=timeout, on_start=started)
+    finally:
+        for pid in pid_box:
+            run.untrack(pid)
+    try:
+        return rc, log.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return rc, ""
+
+
+@contextlib.contextmanager
+def _throwaway(repo: Path, path: Path, rev: str):
+    """A detached worktree that is removed afterwards, whatever happened inside."""
+    added = _git(repo, "worktree", "add", "--detach", str(path), rev)
+    if added.returncode:
+        raise RuntimeError(f"could not create worktree at {path}: {added.stderr.strip()}")
+    try:
+        yield path
+    finally:
+        _git(repo, "worktree", "remove", "--force", str(path))
+
+
+def _commit_if_changed(worktree: Path, message: str) -> bool:
+    status = _git(worktree, "status", "--porcelain")
+    if status.returncode or not status.stdout.strip():
+        return False
+    if _git(worktree, "add", "-A").returncode:
+        return False
+    return _git(worktree, "commit", "-q", "-m", message).returncode == 0
+
+
+# -- context -------------------------------------------------------------------
+
+def _context(run: Run, context: str, session: str | None) -> str:
+    """The note every prompt carries about the conversation; brief carries nothing.
+
+    A digest that looks like it holds credentials or private data is deleted and
+    the run degrades to brief: what the workers never see cannot leak.
+    """
+    record = {"requested": context, "level": "brief", "note": ""}
+    run.progress["context"] = record
+    if context == "brief":
+        run.save()
+        return ""
+    if not session:
+        record["note"] = "no session id (set CLAUDE_CODE_SESSION_ID or pass --session)"
+        run.save()
+        return ""
+    try:
+        path = write_digest(session)
+    except OSError as exc:
+        record["note"] = f"digest unavailable: {exc}"
+        run.save()
+        return ""
+    reason = screen_digest(path.read_text(encoding="utf-8", errors="replace"))
+    if reason:
+        path.unlink(missing_ok=True)
+        record["note"] = f"digest refused ({reason}); workers get the goal only"
+        run.note(f"context digest -> brief: {reason}")
+        return ""
+    record.update(level="digest", note=f"digest at {path}", path=str(path))
+    run.save()
+    return digest_preamble(path)
+
+
+# -- plan ----------------------------------------------------------------------
+
+def _plan_once(run: Run, planner: str, pools: dict[str, Pool], host: str, prompt: str,
+               repo: Path, base_sha: str, max_units: int, attempt: int) -> tuple[Plan | None, list[str]]:
+    with _throwaway(repo, run.dir / f"plan-{attempt}", base_sha) as worktree:
+        rc, text = _dispatch(run, planner, pools, host, prompt, worktree, f"plan-{attempt}.log", PLANNER_TIMEOUT)
+    if rc == 124:
+        return None, ["planner timed out"]
+    try:
+        plan = merge_overlaps(parse_plan(text))
+    except PlanError as exc:
+        return None, [str(exc)]
+    problems = lint_plan(plan, max_units=max_units)
+    return (plan, []) if not problems else (None, problems)
+
+
+def _plan(run: Run, planner: str, pools: dict[str, Pool], host: str, goal: str, repo: Path, base: str,
+          base_sha: str, max_units: int, context_note: str) -> tuple[Plan | None, list[str]]:
+    """Plan, and on problems re-plan once with them appended; the planner sees its own mistakes."""
+    prompt = planner_prompt(goal, repo=repo, base=base, max_units=max_units, context_note=context_note)
+    run.step("planning", f"planner {planner} (attempt 1)")
+    plan, problems = _plan_once(run, planner, pools, host, prompt, repo, base_sha, max_units, 1)
+    if plan is not None:
+        return plan, []
+    run.progress["plan_problems"] = list(problems)
+    run.note("re-planning once: " + "; ".join(problems))
+    run.step("planning", f"planner {planner} (attempt 2)")
+    retry = prompt + ("\n\n# Problems with your previous plan (fix all of them)\n\n"
+                      + "\n".join(f"- {problem}" for problem in problems) + "\n")
+    plan, problems = _plan_once(run, planner, pools, host, retry, repo, base_sha, max_units, 2)
+    if plan is None:
+        run.progress["plan_problems"].extend(problems)
+    return plan, problems
+
+
+def _print_plan(plan: Plan, arms: dict[str, str], held: list[dict], planner: str, json_out: bool) -> None:
+    if json_out:
+        print(json.dumps({"plan": plan.to_dict(), "arms": arms, "held": held, "planner": planner}, indent=2))
+        return
+    print(f"plan: {plan.name} ({len(plan.units)} units; goal check: {plan.goal_check})")
+    print("unit\ttier\tarm\tcheck\ttouches")
+    for unit in plan.units:
+        print(f"{unit.id}\t{unit.tier or '-'}\t{arms.get(unit.id, 'held')}\t{unit.check}\t{', '.join(unit.touches)}")
+    for row in held:
+        print(f"held: {row['id']}: {row['reason']}")
+
+
+# -- review and fix ------------------------------------------------------------
+
+def _carry_review_tests(review_wt: Path, unit_wt: Path, unit_id: str) -> list[str]:
+    """New test files the reviewer wrote travel to the unit's branch, so repros can run there.
+
+    Only untracked files under test directories qualify; a reviewer cannot edit
+    the unit's code or its existing tests through this door.
+    """
+    status = _git(review_wt, "status", "--porcelain", "--untracked-files=all")
+    carried = []
+    for line in status.stdout.splitlines():
+        if not line.startswith("?? "):
+            continue
+        rel = line[3:].strip().strip('"')
+        if not rel.startswith(("tests/", "test/")) or ".." in Path(rel).parts:
+            continue
+        source, target = review_wt / rel, unit_wt / rel
+        if not source.is_file() or target.exists():
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(source.read_bytes())
+        carried.append(rel)
+    if carried:
+        _commit_if_changed(unit_wt, f"ultra({unit_id}): review tests")
+    return carried
+
+
+def _review_unit(run: Run, unit: dict, row: dict, pools: dict[str, Pool], quota: dict, host: str,
+                 allow_lower: bool, repo: Path, base_sha: str) -> list[Finding]:
+    """Review one accepted unit; returns the findings its repros confirmed."""
+    unit_id, worktree = unit["id"], Path(row["worktree"])
+    diff = unit_diff(worktree, base_sha)
+    if not needs_review(unit, diff):
+        run.unit(unit_id, review={"skipped": "trivial change"})
+        return []
+    reviewer = pick("reviewer", pools, quota, host=host, author_arm=row["arm"], allow_lower=allow_lower)
+    if reviewer is None:
+        run.unit(unit_id, review={"skipped": "no reviewer with quota"})
+        return []
+    independence = review_independence(row["arm"], reviewer, pools)
+    run.step("reviewing", f"{unit_id} by {reviewer} ({independence})")
+    try:
+        with _throwaway(repo, run.dir / "review" / unit_id, row["branch"]) as review_wt:
+            rc, text = _dispatch(run, reviewer, pools, host, review_prompt(unit, diff), review_wt,
+                                 f"review-{unit_id}.log", REVIEW_TIMEOUT)
+            carried = _carry_review_tests(review_wt, worktree, unit_id)
+    except RuntimeError as exc:
+        run.unit(unit_id, review={"skipped": str(exc)})
+        return []
+    note = ""
+    try:
+        findings = parse_findings(text)
+    except ValueError as exc:
+        findings, note = [], f"findings unreadable: {exc}"
+    confirmed, advisory = confirm(findings, worktree, timeout=CHECK_TIMEOUT)
+    run.unit(unit_id, review={
+        "reviewer": reviewer, "independence": independence, "agent_rc": rc, "findings": len(findings),
+        "confirmed": [finding.to_dict() for finding in confirmed],
+        "advisory": [finding.to_dict() for finding in advisory], "carried_tests": carried, "note": note})
+    return confirmed
+
+
+def _pick_fixer(pass_no: int, previous: list[str], author: str, pools: dict[str, Pool], quota: dict,
+                host: str, allow_lower: bool) -> str | None:
+    """The author fixes first; the second pass goes to a different model.
+
+    An author that could not fix its own work gets a sibling from its family
+    (same strengths, fresh eyes); a stranger that failed gives way to the best arm left.
+    """
+    if pass_no == 1 or not previous:
+        return pick("fixer", pools, quota, host=host, author_arm=author, allow_lower=allow_lower)
+    first = previous[-1]
+    others = candidates(pools, quota, host=host, allow_lower=allow_lower, exclude_arms={first})
+    if not others:
+        return first
+    if first == author:
+        family = pool_family(pools[author])
+        same = [arm for arm in others if pool_family(pools[arm]) == family]
+        return same[0] if same else others[0]
+    return others[0]
+
+
+def _check_output(log: str) -> str:
+    """The acceptance-check tail the swarm appended to the unit's log."""
+    try:
+        text = Path(log).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    marker = text.rfind("\nAcceptance check:")
+    return text[marker + 1:] if marker >= 0 else text[-6000:]
+
+
+def _fix_unit(run: Run, unit: dict, row: dict, confirmed: list[Finding], pools: dict[str, Pool],
+              quota: dict, host: str, allow_lower: bool) -> bool:
+    """Up to MAX_FIX_PASSES rounds of fix, re-check and re-confirm; True when the unit is sound."""
+    unit_id, worktree, author = unit["id"], Path(row["worktree"]), row["arm"]
+    check_output = None if row["accepted"] else _check_output(row["log"])
+    fixers: list[str] = []
+    reason = ""
+    for pass_no in range(1, MAX_FIX_PASSES + 1):
+        fixer = _pick_fixer(pass_no, fixers, author, pools, quota, host, allow_lower)
+        if fixer is None:
+            reason = "no fixer with quota"
+            break
+        fixers.append(fixer)
+        run.unit(unit_id, state="fixing", fix_passes=pass_no, fixers=list(fixers))
+        run.step("fixing", f"{unit_id} pass {pass_no} by {fixer}")
+        prompt = fix_prompt(unit, check_output=check_output, confirmed=confirmed, pass_no=pass_no)
+        _dispatch(run, fixer, pools, host, prompt, worktree, f"fix-{unit_id}-{pass_no}.log", FIX_TIMEOUT)
+        result = run_checked(unit["check"], worktree, timeout=CHECK_TIMEOUT)
+        check_output = None if result.rc == 0 else result.output
+        confirmed, _ = confirm(confirmed, worktree, timeout=CHECK_TIMEOUT)
+        _commit_if_changed(worktree, f"ultra({unit_id}): fix pass {pass_no}")
+        if result.rc == 0 and not confirmed:
+            run.unit(unit_id, state="fixed", reason=None, outstanding=[])
+            return True
+        reason = (f"check exit {result.rc}" if result.rc else "") + (
+            ("; " if result.rc else "") + f"{len(confirmed)} confirmed finding(s) remain" if confirmed else "")
+    run.unit(unit_id, state="failed", reason=reason or "unresolved after fix passes",
+             outstanding=[finding.to_dict() for finding in confirmed])
+    return False
+
+
+# -- integrate and settle ------------------------------------------------------
+
+def _integrate(run: Run, plan: Plan, rows: dict[str, dict], sound: set[str], repo: Path, base_sha: str,
+               pools: dict[str, Pool], quota: dict, host: str, allow_lower: bool, goal: str) -> dict:
+    """Merge every sound unit onto ultra/<run-id> in plan order, then run the goal check there."""
+    branch, path = f"ultra/{run.id}", run.dir / "integration"
+    result = {"branch": branch, "worktree": str(path), "merged": [], "goal_check": plan.goal_check,
+              "goal_check_passed": False, "goal_check_rc": None, "goal_check_output": "", "fix": None}
+    run.progress["integration"] = result
+    run.step("integrating", f"creating {branch}")
+    added = _git(repo, "worktree", "add", "-b", branch, str(path), base_sha)
+    if added.returncode:
+        result["error"] = f"could not create {branch}: {added.stderr.strip()}"
+        run.save()
+        return result
+    for unit in plan.units:
+        if unit.id not in sound:
+            continue
+        merge = _git(path, "merge", "--no-ff", "-m", f"ultra({run.id}): merge {unit.id}", rows[unit.id]["branch"])
+        if merge.returncode:
+            _git(path, "merge", "--abort")
+            detail = (merge.stdout + merge.stderr).strip().splitlines()
+            run.unit(unit.id, state="conflict", reason="merge conflict: " + (detail[-1] if detail else "")[:200])
+            continue
+        result["merged"].append(unit.id)
+        run.unit(unit.id, state="merged")
+    run.step("integrating", "goal check")
+    check = run_checked(plan.goal_check, path, timeout=CHECK_TIMEOUT)
+    if check.rc != 0:
+        integrator = pick("integrator", pools, quota, host=host, allow_lower=allow_lower)
+        if integrator is not None:
+            run.step("integrating", f"goal check failed (exit {check.rc}); fix pass by {integrator}")
+            unit = {"id": "integration", "task": f"{goal}\n\n(The units are merged on branch {branch}; "
+                    "make the whole goal pass its check.)", "check": plan.goal_check}
+            rc, _ = _dispatch(run, integrator, pools, host,
+                              fix_prompt(unit, check_output=check.output, confirmed=[], pass_no=1),
+                              path, "integration-fix.log", FIX_TIMEOUT)
+            _commit_if_changed(path, f"ultra({run.id}): integration fix")
+            check = run_checked(plan.goal_check, path, timeout=CHECK_TIMEOUT)
+            result["fix"] = {"arm": integrator, "agent_rc": rc}
+    result.update(goal_check_passed=check.rc == 0, goal_check_rc=check.rc, goal_check_output=check.output[-4000:])
+    run.save()
+    return result
+
+
+def _settle(run: Run, rows: dict[str, dict]) -> None:
+    """Grade each unit's decision for the router: merged with N fix passes, or abandoned."""
+    for unit_id, row in rows.items():
+        state = run.progress["units"][unit_id]
+        merged = state["state"] == "merged"
+        argv = ["settle", "--decision", row["decision_id"], "--fix-passes", str(state.get("fix_passes", 0)),
+                "--merged" if merged else "--abandoned", "--within-swarm", run.id]
+        with contextlib.redirect_stdout(io.StringIO()):
+            try:
+                rc = cli.main(argv)
+            except Exception as exc:  # settlement must never undo a finished build
+                rc, state["settle_error"] = 1, str(exc)
+        state["settled"] = rc == 0
+    run.save()
+
+
+# -- summary -------------------------------------------------------------------
+
+def _summary(run: Run, goal: str, plan: Plan | None, arms: dict[str, str], integration: dict,
+             usage_before: dict, usage_after: dict, exit_code: int) -> dict:
+    units = []
+    for unit_id, state in run.progress["units"].items():
+        review = state.get("review") or {}
+        units.append({
+            "id": unit_id, "arm": state.get("arm"), "tier": state.get("tier"), "state": state["state"],
+            "reviewer": review.get("reviewer"), "independence": review.get("independence"),
+            "confirmed_findings": len(review.get("confirmed", [])),
+            "advisory_findings": len(review.get("advisory", [])),
+            "fix_passes": state.get("fix_passes", 0), "reason": state.get("reason"),
+            "branch": state.get("branch"), "settled": state.get("settled"),
+        })
+    quota = {}
+    for provider in sorted(set(usage_before) | set(usage_after)):
+        before, after = usage_before.get(provider, {}), usage_after.get(provider, {})
+        quota[provider] = {label: {"before": before.get(label), "after": after.get(label)}
+                           for label in sorted(set(before) | set(after))}
+    return {
+        "run_id": run.id, "goal": goal, "repo": run.progress["repo"], "base": run.progress["base"],
+        "base_sha": run.progress["base_sha"], "state": run.progress["state"], "exit_code": exit_code,
+        "planner": run.progress.get("planner"), "context": run.progress.get("context"),
+        "plan": plan.to_dict() if plan else None, "plan_problems": run.progress.get("plan_problems", []),
+        "units": units, "held": run.progress.get("held", []), "integration": integration, "quota": quota,
+        "merge_command": f"git merge --no-ff {integration['branch']}" if integration.get("branch") else None,
+        "run_dir": str(run.dir), "notes": run.progress.get("notes", []),
+    }
+
+
+def _summary_md(summary: dict) -> str:
+    integration = summary["integration"] or {}
+    lines = [f"# ultra {summary['run_id']}", "", f"Goal: {summary['goal']}", "",
+             f"Repo: {summary['repo']} at {summary['base']} ({(summary['base_sha'] or '')[:12]})"]
+    if summary.get("planner"):
+        lines.append(f"Planner: {summary['planner']}")
+    context = summary.get("context") or {}
+    if context.get("requested") and context["requested"] != "brief":
+        lines.append(f"Context: {context['requested']} -> {context['level']}: {context['note']}")
+    if integration.get("branch"):
+        passed = integration.get("goal_check_passed")
+        lines += ["", f"Integration branch: {integration['branch']}", f"Worktree: {integration['worktree']}",
+                  f"Goal check `{integration['goal_check']}`: "
+                  + ("passed" if passed else f"FAILED (exit {integration.get('goal_check_rc')})")
+                  + (f"; integration fix pass by {integration['fix']['arm']}" if integration.get("fix") else "")]
+        if integration.get("error"):
+            lines.append(f"Integration error: {integration['error']}")
+    if summary["plan_problems"]:
+        lines += ["", "Plan problems: " + "; ".join(summary["plan_problems"])]
+    if summary["units"]:
+        lines += ["", "| unit | arm | review | confirmed | fix passes | state |", "|---|---|---|---|---|---|"]
+        for unit in summary["units"]:
+            review = (f"{unit['reviewer']} ({unit['independence']})" if unit.get("reviewer") else "-")
+            state = unit["state"] + (f": {unit['reason']}" if unit.get("reason") else "")
+            lines.append(f"| {unit['id']} | {unit['arm'] or '-'} | {review} | {unit['confirmed_findings']} "
+                         f"| {unit['fix_passes']} | {state} |")
+    for row in summary["held"]:
+        lines.append(f"| {row['id']} | held | - | - | - | {row['reason']} |")
+    if summary["quota"]:
+        lines += ["", "Quota (percent used, before -> after):"]
+        for provider, labels in summary["quota"].items():
+            moved = ", ".join(f"{label} {v['before']} -> {v['after']}" for label, v in labels.items())
+            lines.append(f"- {provider}: {moved}")
+    if summary.get("merge_command"):
+        lines += ["", "To take the result onto your branch (ultra never does this itself):", "",
+                  "```bash", summary["merge_command"], "```"]
+    if summary["notes"]:
+        lines += ["", "Notes:"] + [f"- {note}" for note in summary["notes"][:8]]
+    lines += ["", f"Run directory: {summary['run_dir']}", f"Exit: {summary['exit_code']}"]
+    return "\n".join(lines) + "\n"
+
+
+def _report(run: Run, goal: str, plan: Plan | None, arms: dict[str, str], integration: dict,
+            usage_before: dict, exit_code: int, json_out: bool) -> int:
+    state = "done" if exit_code == 0 else "failed"
+    run.finish(state, exit_code)
+    usage_after = cli.fetch_usage()
+    summary = _summary(run, goal, plan, arms, integration, usage_before, usage_after, exit_code)
+    atomic_write(run.dir / "summary.json", json.dumps(summary, indent=2) + "\n")
+    text = _summary_md(summary)
+    atomic_write(run.dir / "summary.md", text)
+    print(json.dumps(summary, indent=2) if json_out else text, flush=True)
+    return exit_code
+
+
+# -- the run -------------------------------------------------------------------
+
+def run_ultra(goal: str, *, repo: str | Path = ".", base: str = "HEAD", context: str = "brief",
+              session: str | None = None, max_units: int = 10, max_parallel: int = 6,
+              plan_only: bool = False, allow_lower: bool = False, json_out: bool = False,
+              host: str = "claude") -> int:
+    """One whole run; exit 0 when the goal check passed on the integration branch with
+    every unit merged, 1 when anything failed, 2 when it could not plan or nothing was usable."""
+    goal = goal.strip()
+    if not goal:
+        print("route ultra: empty goal", file=sys.stderr)
+        return 2
+    if context not in ("brief", "digest"):
+        print(f"route ultra: --context must be brief or digest, not {context}", file=sys.stderr)
+        return 2
+    repo_path = Path(repo).expanduser().resolve()
+    base_sha = _resolve_base(repo_path, base)
+    if base_sha is None:
+        print(f"route ultra: {repo_path} is not a git work tree with commit {base!r}", file=sys.stderr)
+        return 2
+    run = Run(new_run_id(goal), goal, repo_path, base, host)
+    try:
+        run.dir.mkdir(parents=True, mode=0o700)
+        (run.dir / "logs").mkdir(mode=0o700)
+    except FileExistsError:
+        print(f"route ultra: run {run.id} already exists at {run.dir}", file=sys.stderr)
+        return 2
+    run.progress["base_sha"] = base_sha
+    run.save()
+    print(f"ultra: run {run.id} at {run.dir}", flush=True)
+    try:
+        return _execute(run, goal, repo_path, base, base_sha, context, session, max_units, max_parallel,
+                        plan_only, allow_lower, json_out, host)
+    except KeyboardInterrupt:
+        run.finish("interrupted", 130)
+        print("ultra: interrupted", file=sys.stderr)
+        return 130
+
+
+def _give_up(run: Run, reason: str, json_out: bool, usage_before: dict, plan: Plan | None = None) -> int:
+    """Exit 2: nothing was built, and the summary says why."""
+    run.note(reason)
+    return _report(run, run.progress["goal"], plan, {}, {}, usage_before, 2, json_out)
+
+
+def _execute(run: Run, goal: str, repo: Path, base: str, base_sha: str, context: str, session: str | None,
+             max_units: int, max_parallel: int, plan_only: bool, allow_lower: bool, json_out: bool,
+             host: str) -> int:
+    pools = pools_for_host(cli.load_pools(), host)
+    quota = cli.fetch_quota()
+    usage_before = cli.fetch_usage()
+    run.progress["headroom"] = dict(quota)
+    context_note = _context(run, context, session)
+
+    planner = pick("planner", pools, quota, host=host, allow_lower=allow_lower)
+    if planner is None:
+        return _give_up(run, "no usable model has quota to plan (try --allow-lower-models)", json_out, usage_before)
+    run.progress["planner"] = planner
+    plan, problems = _plan(run, planner, pools, host, goal, repo, base, base_sha, max_units, context_note)
+    if plan is None:
+        return _give_up(run, "could not plan: " + "; ".join(problems), json_out, usage_before)
+
+    run.step("assigning", "choosing an arm per unit")
+    arms: dict[str, str] = {}
+    for unit in plan.units:
+        arm = pick("worker", pools, quota, tier=unit.tier or "moderate", host=host, allow_lower=allow_lower)
+        if arm is None:
+            run.progress["held"].append({"id": unit.id, "reason": "no usable model has quota"})
+            run.unit(unit.id, state="held", tier=unit.tier, reason="no usable model has quota")
+        else:
+            arms[unit.id] = arm
+            run.unit(unit.id, arm=arm, tier=unit.tier, state="planned")
+    atomic_write(run.dir / "plan.json", json.dumps(
+        {"plan": plan.to_dict(), "arms": arms, "held": run.progress["held"], "planner": planner}, indent=2) + "\n")
+    if plan_only:
+        _print_plan(plan, arms, run.progress["held"], planner, json_out)
+        run.finish("planned", 0)
+        return 0
+    if not arms:
+        return _give_up(run, "no usable model has quota for any unit", json_out, usage_before, plan)
+
+    manifest = to_manifest(plan, repo=repo, base=base_sha, swarm_id=run.id, arms=arms)
+    if context_note:
+        manifest["shared"] = f"{context_note}\n\n{manifest['shared']}".strip()
+    atomic_write(run.dir / "manifest.json", json.dumps(manifest, indent=2) + "\n")
+    run.step("running", f"swarm {run.id}: {len(arms)} unit(s), up to {max_parallel} in parallel")
+    try:
+        swarm = run_swarm_manifest(manifest, host=host, max_parallel=max_parallel, check_timeout=CHECK_TIMEOUT)
+    except RuntimeError as exc:
+        return _give_up(run, f"swarm did not run: {exc}", json_out, usage_before, plan)
+    run.progress["swarm_dir"] = str(swarm_dir(run.id))
+    rows = {row["id"]: row for row in swarm["units"]}
+    for row in swarm.get("held", []):
+        run.progress["held"].append(row)
+        run.unit(row["id"], state="held", reason=row["reason"])
+    for unit_id, row in rows.items():
+        run.unit(unit_id, state="accepted" if row["accepted"] else "failed", decision_id=row["decision_id"],
+                 branch=row["branch"], worktree=row["worktree"], log=row["log"], agent_rc=row["agent_rc"],
+                 reason=None if row["accepted"] else f"check failed (agent exit {row['agent_rc']})")
+
+    units = {unit.id: unit.to_dict() for unit in plan.units}
+    confirmed: dict[str, list[Finding]] = {}
+    run.step("reviewing", "")
+    for unit_id, row in rows.items():
+        if row["accepted"]:
+            confirmed[unit_id] = _review_unit(run, units[unit_id], row, pools, quota, host, allow_lower, repo, base_sha)
+
+    sound: set[str] = set()
+    for unit_id, row in rows.items():
+        if row["accepted"] and not confirmed.get(unit_id):
+            sound.add(unit_id)
+        elif _fix_unit(run, units[unit_id], row, confirmed.get(unit_id, []), pools, quota, host, allow_lower):
+            sound.add(unit_id)
+
+    integration = _integrate(run, plan, rows, sound, repo, base_sha, pools, quota, host, allow_lower, goal)
+    run.step("settling", "")
+    _settle(run, rows)
+    all_merged = set(integration["merged"]) == {unit.id for unit in plan.units}
+    exit_code = 0 if integration["goal_check_passed"] and all_merged else 1
+    return _report(run, goal, plan, arms, integration, usage_before, exit_code, json_out)
+
+
+# -- status and cancel ---------------------------------------------------------
+
+def _load_progress(run_id: str | None) -> tuple[dict | None, str]:
+    """The run's progress.json (latest run when no ID), or a reason there is none."""
+    if run_id is not None:
+        if not RUN_ID.fullmatch(run_id):
+            return None, "invalid run ID"
+        paths = [ultra_dir(run_id) / "progress.json"]
+    else:
+        paths = sorted((state_dir() / "ultra").glob("*/progress.json"),
+                       key=lambda path: path.stat().st_mtime, reverse=True)
+    for path in paths:
+        try:
+            progress = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(progress, dict) and progress.get("schema") == SCHEMA:
+            return progress, ""
+    return None, (f"no ultra run {run_id}" if run_id else "no ultra runs yet")
+
+
+def _alive(pid: object) -> bool:
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def ultra_status(run_id: str | None = None) -> int:
+    progress, reason = _load_progress(run_id)
+    if progress is None:
+        print(f"route ultra status: {reason}", file=sys.stderr)
+        return 1
+    state = progress["state"]
+    if state not in FINISHED and not _alive(progress.get("pid")):
+        state = f"{state} (stopped?)"
+    print(f"run {progress['run_id']}: {state}" + (f" — {progress['step']}" if progress.get("step") else ""))
+    print(f"goal: {progress['goal']}")
+    print(f"started {progress['started_at']}, updated {progress['updated_at']}")
+    if progress["units"]:
+        print("unit\tarm\tstate\tfix passes\treason")
+        for row in progress["units"].values():
+            print(f"{row['id']}\t{row.get('arm') or '-'}\t{row['state']}\t{row.get('fix_passes', 0)}"
+                  f"\t{row.get('reason') or ''}")
+    integration = progress.get("integration") or {}
+    if integration.get("branch"):
+        verdict = integration.get("goal_check_passed")
+        print(f"integration: {integration['branch']}: goal check "
+              + ("passed" if verdict else "pending" if integration.get("goal_check_rc") is None else "failed"))
+    return 0
+
+
+def ultra_cancel(run_id: str) -> int:
+    """Stop a run: its orchestrator first, then every model process it recorded."""
+    progress, reason = _load_progress(run_id)
+    if progress is None:
+        print(f"route ultra cancel: {reason}", file=sys.stderr)
+        return 1
+    if progress["state"] in FINISHED:
+        print(f"run {run_id} already finished: {progress['state']}")
+        return 0
+    pids = [progress.get("pid")] + list(progress.get("pids", []))
+    try:
+        status = json.loads((swarm_dir(run_id) / "status.json").read_text(encoding="utf-8"))
+        pids += [row.get("pid") for row in status.get("units", [])]
+    except (OSError, ValueError, AttributeError):
+        pass
+    stopped = []
+    for pid in pids:
+        if pid == os.getpid() or not _alive(pid):
+            continue
+        try:
+            os.kill(pid, signal.SIGTERM)
+            stopped.append(pid)
+        except OSError:
+            continue
+    progress.update(state="cancelled", exit_code=130, finished_at=utc_now(), updated_at=utc_now(), pids=[])
+    atomic_write(ultra_dir(run_id) / "progress.json", json.dumps(progress, indent=2) + "\n")
+    print(f"run {run_id} cancelled; stopped {len(stopped)} process(es)")
+    return 0

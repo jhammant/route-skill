@@ -479,7 +479,9 @@ def cmd_outcome(args: argparse.Namespace) -> int:
     stats = Stats()
     decision = _outcome_decision(args, stats)
     decision_id = decision.get("decision_id") if decision else None
-    if decision and decision.get("swarm"):
+    # A swarm settles its units as one weighted trial; only the orchestrator that ran
+    # that swarm (route ultra, naming it) may grade them again afterwards.
+    if decision and decision.get("swarm") and decision["swarm"] != getattr(args, "within_swarm", None):
         raise ValueError(f"decision {decision_id} was settled as part of swarm {decision['swarm']}")
     shape, tier, arm = args.shape, args.tier, args.arm
     already = set(decision.get("outcome_events", [])) if decision else set()
@@ -728,6 +730,27 @@ def cmd_digest(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_ultra(args: argparse.Namespace) -> int:
+    """``route ultra "<goal>"``, ``route ultra status [RUN_ID]`` or ``route ultra cancel RUN_ID``."""
+    from .ultra import run_ultra, ultra_cancel, ultra_status
+
+    words = list(args.goal)
+    if words and words[0] == "status":
+        if len(words) > 2:
+            raise ValueError("usage: route ultra status [RUN_ID]")
+        return ultra_status(words[1] if len(words) == 2 else None)
+    if words and words[0] == "cancel":
+        if len(words) != 2:
+            raise ValueError("usage: route ultra cancel RUN_ID")
+        return ultra_cancel(words[1])
+    goal = " ".join(words).strip()
+    if not goal:
+        raise ValueError('route ultra needs a goal: route ultra "<goal>"')
+    return run_ultra(goal, repo=args.repo, base=args.base, context=args.context, session=args.session,
+                     max_units=args.max_units, max_parallel=args.max_parallel, plan_only=args.plan_only,
+                     allow_lower=args.allow_lower, json_out=args.json_out, host=args.host)
+
+
 def _parser(prog: str) -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog=prog)
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
@@ -786,7 +809,27 @@ def _parser(prog: str) -> argparse.ArgumentParser:
     state = settle.add_mutually_exclusive_group()
     state.add_argument("--merged", action="store_true", help="record that the diff was accepted")
     state.add_argument("--abandoned", "--rewritten", action="store_true", help="abandoned or rewritten: score 0")
+    # route ultra grades the units of the swarm it ran; hidden because nothing else should.
+    settle.add_argument("--within-swarm", dest="within_swarm", default=None, help=argparse.SUPPRESS)
     settle.set_defaults(func=cmd_outcome, shape=None, tier=None, arm=None, score=None, outcome=None)
+
+    u = sub.add_parser("ultra", help="plan, build, review, fix and integrate a goal on the best models with quota")
+    u.add_argument("goal", nargs="*", help='the goal as one argument; or "status [RUN_ID]" / "cancel RUN_ID"')
+    u.add_argument("--repo", default=".", help="repository to build in (default: current directory)")
+    u.add_argument("--base", default="HEAD", help="revision the units and ultra/<run-id> start from")
+    u.add_argument("--context", choices=["brief", "digest"], default="brief",
+                   help="what workers get beyond the goal: brief (nothing) or digest (this conversation "
+                        "minus tool output; refused when it looks private)")
+    u.add_argument("--session", default=os.environ.get("CLAUDE_CODE_SESSION_ID"),
+                   help="session to digest (default: CLAUDE_CODE_SESSION_ID, i.e. this one)")
+    u.add_argument("--max-units", type=_positive_int, default=10, metavar="N")
+    u.add_argument("--max-parallel", type=_positive_int, default=6, metavar="N")
+    u.add_argument("--plan-only", action="store_true", help="plan and choose arms, dispatch nothing")
+    u.add_argument("--allow-lower-models", dest="allow_lower", action="store_true",
+                   help="let Sonnet/Kimi-class arms in when no Fable/Opus/Codex-class arm has quota")
+    u.add_argument("--json", dest="json_out", action="store_true", help="print summary.json instead of summary.md")
+    u.add_argument("--host", choices=["claude", "codex"], default=os.environ.get("ROUTE_HOST", "claude"))
+    u.set_defaults(func=cmd_ultra)
 
     r = sub.add_parser("reseed", help="move live cells' priors to the current rule table, keeping observations")
     r.add_argument("--dry-run", action="store_true", help="show what would change without writing")
@@ -902,7 +945,7 @@ def _ttl_arg(text: str) -> int:
 
 
 _SUBCOMMANDS = {"task", "stats", "outcome", "settle", "reseed", "federate", "benchmark", "ship",
-                "swarm", "swarm-log", "swarms", "digest"}
+                "swarm", "swarm-log", "swarms", "digest", "ultra"}
 
 
 def _run(argv: list[str] | None, *, auto: bool) -> int:
@@ -943,6 +986,11 @@ def main(argv: list[str] | None = None) -> int:
 
 def main_auto(argv: list[str] | None = None) -> int:
     return _run(argv if argv is not None else sys.argv[1:], auto=True)
+
+
+def main_ultra(argv: list[str] | None = None) -> int:
+    """The ``ultra`` console script: exactly ``route ultra ...``."""
+    return _run(["ultra", *(argv if argv is not None else sys.argv[1:])], auto=False)
 
 
 if __name__ == "__main__":

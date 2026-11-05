@@ -135,6 +135,8 @@ class Pool:
     #: The dispatch is the Claude Code CLI (``claude``/``claude-work``), so it
     #: can resume a forked parent session and take a per-swarm a-mail MCP config.
     claude_cli: bool = False
+    #: Override inferred provider lineage when a custom arm needs independent review.
+    family: str = ""
 
     def __post_init__(self) -> None:
         if self.endpoint:
@@ -157,6 +159,28 @@ class Pool:
         if shape.startswith("batch:") and self.batch_dispatch:
             return self.batch_dispatch, True
         return self.dispatch, False
+
+
+def pool_family(pool: Pool) -> str:
+    """Keep model lineage across account names and router/cloud vendor prefixes."""
+    if pool.family:
+        return pool.family
+    name, model = pool.name.lower(), pool.model.name.lower()
+    words = set(re.findall(r"[a-z0-9]+", model))
+    if name.startswith("claude") or words & {"anthropic", "claude"}:
+        return "anthropic"
+    if (name == "codex" or words & {"openai", "gpt", "codex", "o"}
+            or any(re.fullmatch(r"o\d+", word) for word in words)):
+        return "openai"
+    if name.startswith("kimi") or words & {"moonshot", "moonshotai", "kimi"}:
+        return "moonshot"
+    if name.startswith("deepseek") or "deepseek" in words:
+        return "deepseek"
+    if pool.cost == "local":
+        return "local"
+    if name == "free":
+        return "free"
+    return "other"
 
 
 def _default_pools() -> dict[str, Pool]:
@@ -292,6 +316,7 @@ def load_pools(path: str | Path | None = None) -> dict[str, Pool]:
             quota_scope=str(spec.get("quota_scope", "")),
             prior_like=str(spec.get("prior_like", "")),
             claude_cli=bool(spec.get("claude_cli", False)),
+            family=str(spec.get("family", "")),
         )
         if pools[name].prior_like and pools[name].prior_like == name:
             raise ValueError(f"pools.toml: {name} cannot take its priors from itself")

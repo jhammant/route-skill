@@ -102,12 +102,14 @@ def parse_weekly(agent, providers, *, now: datetime | None = None) -> dict[str, 
         windows[provider] = {"percentUsed": percent, "resetsInMinutes": minutes}
 
     if isinstance(agent, dict) and agent.get("ok"):
-        add("claude", agent.get("weekly"))
+        # The agent view is the host account's unless a claude-work session tagged it.
+        account = agent.get("account") or "claude"
+        add(account, agent.get("weekly"))
         # Per-model windows (Fable) are keyed "claude:Fable", never "claude":
         # one model's week must not stand in for the whole account's.
         for window in agent.get("scoped") or []:
             if isinstance(window, dict) and window.get("label"):
-                add(f"claude:{window['label']}", window)
+                add(f"{account}:{window['label']}", window)
     if isinstance(providers, list):
         for provider in providers:
             if not isinstance(provider, dict) or not provider.get("ok") or not provider.get("id"):

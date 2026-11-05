@@ -13,6 +13,7 @@ import argparse
 import json
 import os
 import shlex
+import signal
 import subprocess
 import sys
 import time
@@ -401,6 +402,15 @@ def with_network(template: str) -> str:
     return template.replace("codex exec", f"codex exec {CODEX_NETWORK}", 1)
 
 
+def _kill_delegate(proc: subprocess.Popen) -> None:
+    """Kill a tracked delegate with everything it spawned: it leads its own session."""
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except OSError:
+        pass  # Not a leader after all, or already gone: the leader itself still gets killed.
+    proc.kill()
+
+
 def _dispatch(template: str | list[str], task: str, *, target: str | None = None,
               stdin: bool = False, cwd: str | Path | None = None,
               env: dict[str, str] | None = None, log: str | Path | None = None,
@@ -418,12 +428,17 @@ def _dispatch(template: str | list[str], task: str, *, target: str | None = None
             argv.append(task)
     started = time.monotonic()
     try:
-        # A delegated agent must see itself as host if it invokes route again.
+        # A delegated agent must see itself as host if it invokes route again,
+        # and know it is a worker so it never fans out or prompts on its own.
         child_env = dict(os.environ)
         child_env.update(env or {})
+        child_env["ROUTE_WORKER"] = "1"
         if target in ("claude", "codex"):
             child_env["ROUTE_HOST"] = target
-        kwargs = {"input": task, "text": True} if stdin else {}
+        # A delegate that does not take its task on stdin gets /dev/null there:
+        # `codex exec` reads "additional input" from any open stdin and would
+        # otherwise wait forever on the parent's pipe or terminal.
+        kwargs = {"input": task, "text": True} if stdin else {"stdin": subprocess.DEVNULL}
         if cwd is not None:
             kwargs["cwd"] = cwd
         if timeout is not None:
@@ -437,14 +452,17 @@ def _dispatch(template: str | list[str], task: str, *, target: str | None = None
             else:
                 input_text = kwargs.pop("input", None)
                 wait_timeout = kwargs.pop("timeout", None)
-                if stdin:
-                    kwargs["stdin"] = subprocess.PIPE
-                with subprocess.Popen(argv, env=child_env, **kwargs) as proc:
+                # A tracked delegate is headless: it leads its own session so a
+                # cancel can stop it with every shell and test runner it spawned
+                # (killpg), without reaching the user's shell, and it never waits
+                # on the terminal.
+                kwargs["stdin"] = subprocess.PIPE if stdin else subprocess.DEVNULL
+                with subprocess.Popen(argv, env=child_env, start_new_session=True, **kwargs) as proc:
                     try:
                         on_start(proc.pid)
                         proc.communicate(input=input_text, timeout=wait_timeout)
                     except BaseException:
-                        proc.kill()
+                        _kill_delegate(proc)
                         proc.communicate()
                         raise
     except subprocess.TimeoutExpired:
@@ -477,7 +495,9 @@ def cmd_outcome(args: argparse.Namespace) -> int:
     stats = Stats()
     decision = _outcome_decision(args, stats)
     decision_id = decision.get("decision_id") if decision else None
-    if decision and decision.get("swarm"):
+    # A swarm settles its units as one weighted trial; only the orchestrator that ran
+    # that swarm (route ultra, naming it) may grade them again afterwards.
+    if decision and decision.get("swarm") and decision["swarm"] != getattr(args, "within_swarm", None):
         raise ValueError(f"decision {decision_id} was settled as part of swarm {decision['swarm']}")
     shape, tier, arm = args.shape, args.tier, args.arm
     already = set(decision.get("outcome_events", [])) if decision else set()
@@ -488,8 +508,11 @@ def cmd_outcome(args: argparse.Namespace) -> int:
         previous = decision.get("final_score") if decision else None
         if previous is None:
             previous = 1.0 if "accepted" in already else 0.0
+        # A swarm records its units as one trial; regrading one unit moves that
+        # trial by the unit's share of it (--weight), never by a whole reward.
+        weight = getattr(args, "weight", 1.0)
         record_score(router, shape, tier, arm, score, previous_score=previous,
-                     impression_recorded=_has_trial(decision))
+                     impression_recorded=_has_trial(decision), weight=weight)
         events = ["graded"]
         if args.abandoned:
             events.append("failed")
@@ -497,7 +520,7 @@ def cmd_outcome(args: argparse.Namespace) -> int:
             # Merge is acceptance metadata; its reward is already in score.
             for event in OUTCOME_EVENTS["accepted"]:
                 if event not in already and event != "accepted":
-                    router.reward(shape, tier, arm, event)
+                    router.reward(shape, tier, arm, event, by=weight)
             events.extend(OUTCOME_EVENTS["accepted"])
         if decision:
             stats.annotate(decision_id, events=events, final_score=score, impression_recorded=True,
@@ -726,6 +749,27 @@ def cmd_digest(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_ultra(args: argparse.Namespace) -> int:
+    """``route ultra "<goal>"``, ``route ultra status [RUN_ID]`` or ``route ultra cancel RUN_ID``."""
+    from .ultra import run_ultra, ultra_cancel, ultra_status
+
+    words = list(args.goal)
+    if words and words[0] == "status":
+        if len(words) > 2:
+            raise ValueError("usage: route ultra status [RUN_ID]")
+        return ultra_status(words[1] if len(words) == 2 else None)
+    if words and words[0] == "cancel":
+        if len(words) != 2:
+            raise ValueError("usage: route ultra cancel RUN_ID")
+        return ultra_cancel(words[1])
+    goal = " ".join(words).strip()
+    if not goal:
+        raise ValueError('route ultra needs a goal: route ultra "<goal>"')
+    return run_ultra(goal, repo=args.repo, base=args.base, context=args.context, session=args.session,
+                     max_units=args.max_units, max_parallel=args.max_parallel, plan_only=args.plan_only,
+                     allow_lower=args.allow_lower, json_out=args.json_out, host=args.host)
+
+
 def _parser(prog: str) -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog=prog)
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
@@ -784,7 +828,28 @@ def _parser(prog: str) -> argparse.ArgumentParser:
     state = settle.add_mutually_exclusive_group()
     state.add_argument("--merged", action="store_true", help="record that the diff was accepted")
     state.add_argument("--abandoned", "--rewritten", action="store_true", help="abandoned or rewritten: score 0")
+    # route ultra grades the units of the swarm it ran; hidden because nothing else should.
+    settle.add_argument("--within-swarm", dest="within_swarm", default=None, help=argparse.SUPPRESS)
+    settle.add_argument("--weight", type=_weight_arg, default=1.0, help=argparse.SUPPRESS)
     settle.set_defaults(func=cmd_outcome, shape=None, tier=None, arm=None, score=None, outcome=None)
+
+    u = sub.add_parser("ultra", help="plan, build, review, fix and integrate a goal on the best models with quota")
+    u.add_argument("goal", nargs="*", help='the goal as one argument; or "status [RUN_ID]" / "cancel RUN_ID"')
+    u.add_argument("--repo", default=".", help="repository to build in (default: current directory)")
+    u.add_argument("--base", default="HEAD", help="revision the units and ultra/<run-id> start from")
+    u.add_argument("--context", choices=["brief", "digest"], default="brief",
+                   help="what workers get beyond the goal: brief (nothing) or digest (this conversation "
+                        "minus tool output; refused when it looks private)")
+    u.add_argument("--session", default=os.environ.get("CLAUDE_CODE_SESSION_ID"),
+                   help="session to digest (default: CLAUDE_CODE_SESSION_ID, i.e. this one)")
+    u.add_argument("--max-units", type=_positive_int, default=10, metavar="N")
+    u.add_argument("--max-parallel", type=_positive_int, default=6, metavar="N")
+    u.add_argument("--plan-only", action="store_true", help="plan and choose arms, dispatch nothing")
+    u.add_argument("--allow-lower-models", dest="allow_lower", action="store_true",
+                   help="let Sonnet/Kimi-class arms in when no Fable/Opus/Codex-class arm has quota")
+    u.add_argument("--json", dest="json_out", action="store_true", help="print summary.json instead of summary.md")
+    u.add_argument("--host", choices=["claude", "codex"], default=os.environ.get("ROUTE_HOST", "claude"))
+    u.set_defaults(func=cmd_ultra)
 
     r = sub.add_parser("reseed", help="move live cells' priors to the current rule table, keeping observations")
     r.add_argument("--dry-run", action="store_true", help="show what would change without writing")
@@ -873,6 +938,17 @@ def _score_arg(text: str) -> float:
         raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
+def _weight_arg(text: str) -> float:
+    """A unit's share of its swarm's aggregate trial: in (0, 1]."""
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError("weight must be a number") from None
+    if not 0 < value <= 1:
+        raise argparse.ArgumentTypeError("weight must be in (0, 1]")
+    return value
+
+
 def _fix_passes_arg(text: str) -> int:
     try:
         value = int(text)
@@ -900,7 +976,7 @@ def _ttl_arg(text: str) -> int:
 
 
 _SUBCOMMANDS = {"task", "stats", "outcome", "settle", "reseed", "federate", "benchmark", "ship",
-                "swarm", "swarm-log", "swarms", "digest"}
+                "swarm", "swarm-log", "swarms", "digest", "ultra"}
 
 
 def _run(argv: list[str] | None, *, auto: bool) -> int:
@@ -941,6 +1017,11 @@ def main(argv: list[str] | None = None) -> int:
 
 def main_auto(argv: list[str] | None = None) -> int:
     return _run(argv if argv is not None else sys.argv[1:], auto=True)
+
+
+def main_ultra(argv: list[str] | None = None) -> int:
+    """The ``ultra`` console script: exactly ``route ultra ...``."""
+    return _run(["ultra", *(argv if argv is not None else sys.argv[1:])], auto=False)
 
 
 if __name__ == "__main__":

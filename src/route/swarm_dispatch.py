@@ -3,16 +3,18 @@
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
 import os
 import re
 import shlex
+import signal
 import subprocess
 import sys
 import threading
 import time
 from collections import Counter, defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -28,22 +30,70 @@ from .storage import atomic_write, state_dir
 from .swarm import plan_swarm, record_swarm_outcome
 from .swarm_channel import Channel, ChannelError, HubPoller, Worker, amail_binary, mcp_runtime, open_channel
 from .swarm_status import SwarmStatus, utc_now
+from .ultra_safety import run_checked
 
 UNIT_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
+#: A caller-chosen run ID (``route ultra`` names its swarm after the run). Path-safe by
+#: construction: one lowercase segment, no dots, no separators.
+SWARM_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,80}$")
+
+
+#: Build artefacts a check leaves behind. A worktree made from a repo with no
+#: .gitignore would otherwise commit them, and three branches each adding a
+#: different ``__pycache__/x.pyc`` cannot merge (add/add on binary files).
+ARTEFACTS: tuple[str, ...] = (
+    "**/__pycache__/**", "**/*.pyc", "**/*.pyo", "**/.pytest_cache/**", "**/.mypy_cache/**",
+    "**/.ruff_cache/**", "**/node_modules/**", "**/.DS_Store", "**/.coverage", "**/.coverage.*",
+    "**/*.egg-info/**",
+)
+
+
+def artefact_pathspecs() -> list[str]:
+    """Pathspec excludes for ARTEFACTS; a repo's own .gitignore still applies on top."""
+    return [f":(exclude,glob){pattern}" for pattern in ARTEFACTS]
+
+
+def stage_argv() -> list[str]:
+    """The ``git add`` that stages everything a worker did except build artefacts."""
+    return ["add", "-A", "--", ".", *artefact_pathspecs()]
+
+
+def is_artefact(path: str) -> bool:
+    """Whether a repo-relative path matches ARTEFACTS (used to settle artefact-only conflicts)."""
+    parts = path.split("/")
+    for pattern in ARTEFACTS:
+        target = pattern[3:]  # strip the leading "**/"
+        if target.endswith("/**"):
+            if any(fnmatch.fnmatchcase(part, target[:-3]) for part in parts[:-1]):
+                return True
+        elif fnmatch.fnmatchcase(parts[-1], target):
+            return True
+    return False
 
 
 def _git(repo: Path, *args: str):
     return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True)
 
 
-def load_manifest(source: str) -> dict:
-    try:
-        manifest = (json.load(sys.stdin) if source == "-" else
-                    json.loads(Path(source).read_text(encoding="utf-8")))
-    except (OSError, ValueError) as exc:
-        raise ValueError(f"cannot read swarm manifest: {exc}") from None
+def load_manifest(source: str | Path | dict) -> dict:
+    """Validate a manifest from a path, ``-`` (stdin) or an in-memory dict.
+
+    A dict is copied, so a programmatic caller keeps its own object unchanged.
+    """
+    if isinstance(source, dict):
+        manifest = dict(source)
+    else:
+        try:
+            manifest = (json.load(sys.stdin) if str(source) == "-" else
+                        json.loads(Path(source).read_text(encoding="utf-8")))
+        except (OSError, ValueError) as exc:
+            raise ValueError(f"cannot read swarm manifest: {exc}") from None
     if not isinstance(manifest, dict):
         raise ValueError("swarm manifest must be a JSON object")
+    preset = manifest.get("swarm_id")
+    if preset is not None and preset != "":
+        if not isinstance(preset, str) or not SWARM_ID.fullmatch(preset):
+            raise ValueError("swarm_id must match [a-z0-9][a-z0-9-]{0,80}")
     name = manifest.get("name")
     if not isinstance(name, str) or not name.strip():
         raise ValueError("swarm name must be non-empty")
@@ -213,9 +263,11 @@ def dispatch_command(assignment: Assignment, worker: Worker | None, directory: P
     if allow_network and assignment.arm == "codex":
         template = cli.with_network(template)
     argv = shlex.split(template)
+    # The worker must know it is one, so it never fans out or prompts on its own.
+    env = {"ROUTE_WORKER": "1"}
     if worker is None:
-        return argv, {}
-    env = worker.environment()
+        return argv, env
+    env.update(worker.environment())
     pool = assignment.ctx.pools.get(assignment.arm)
     claude_cli = assignment.arm == "claude" or bool(pool and pool.claude_cli)
     if assignment.arm == "codex" or claude_cli:
@@ -251,40 +303,148 @@ def _print_assignments(assignments: list[Assignment], held: list[dict]) -> None:
         print(f"{row['id']}\theld for host\t{row['reason']}")
 
 
+#: How long a cancelled swarm gives its delegates to exit on SIGTERM before SIGKILL.
+CANCEL_GRACE_SECONDS = 5.0
+
+
+class Cancellation:
+    """The stop signal for one swarm run, plus the processes it has to stop.
+
+    ``executor.shutdown(cancel_futures=True)`` only drops units that never
+    started; a delegate already running would keep editing, checking and
+    committing after the user interrupted the run. Every live delegate and
+    acceptance check registers its PID here so the runner can kill it and then
+    wait for its thread, so control only returns once nothing is running.
+    """
+
+    def __init__(self) -> None:
+        self.requested = threading.Event()
+        self._lock = threading.Lock()
+        self._pids: dict[str, int] = {}
+
+    def start(self, identity: str, pid: int) -> None:
+        with self._lock:
+            self._pids[identity] = pid
+
+    def finish(self, identity: str) -> None:
+        with self._lock:
+            self._pids.pop(identity, None)
+
+    def signal(self, signum: int) -> None:
+        with self._lock:
+            pids = list(self._pids.values())
+        for pid in pids:
+            signal_tree(pid, signum)
+
+
+def signal_tree(pid: int, signum: int) -> bool:
+    """Signal a process and, when it leads its own process group, the whole group.
+
+    ``cli._dispatch`` starts every tracked delegate in a new session, so its
+    shells and test runners share its group and stop with it. A process that
+    does not lead its group is signalled alone: its group may be the user's
+    shell. Our own group is never signalled. False when the process is gone.
+    """
+    try:
+        pgid = os.getpgid(pid)
+        if pgid == pid and pgid != os.getpgrp():
+            os.killpg(pgid, signum)
+        else:
+            os.kill(pid, signum)
+    except OSError:
+        return False  # Already gone; nothing left to stop.
+    return True
+
+
+def _stop_workers(cancel: Cancellation, executor: ThreadPoolExecutor, futures: list) -> None:
+    """Stop every unit, running or queued, and return only when all threads have ended."""
+    cancel.requested.set()
+    executor.shutdown(wait=False, cancel_futures=True)
+    cancel.signal(signal.SIGTERM)
+    _, pending = wait(futures, timeout=CANCEL_GRACE_SECONDS)
+    if pending:
+        cancel.signal(signal.SIGKILL)
+    executor.shutdown(wait=True)
+
+
+def _acceptance_check(a: Assignment, worktree: Path, output, timeout: float,
+                      cancel: Cancellation, *, safe: bool = False) -> int:
+    """Run the unit's check in its worktree; 124 on timeout, 1 if it cannot start.
+
+    A manifest that asks for ``safe_checks`` (route ultra, whose checks a model
+    wrote) gets them run through ultra_safety: linted, without a shell, without
+    the orchestrator's credentials, and refused (126) when they stray.
+    """
+    identity = a.unit["id"]
+    output.write(f"\nAcceptance check: {a.unit['check']}\n")
+    output.flush()
+    if safe:
+        result = run_checked(a.unit["check"], worktree, timeout=timeout)
+        output.write(result.output)
+        if result.timed_out:
+            output.write("Acceptance check timed out\n")
+        return result.rc
+    try:
+        with subprocess.Popen(a.unit["check"], shell=True, cwd=worktree,
+                              stdout=output, stderr=subprocess.STDOUT) as check:
+            cancel.start(identity, check.pid)
+            try:
+                check.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                check.kill()
+                check.wait()
+                output.write("Acceptance check timed out\n")
+                return 124
+            finally:
+                cancel.finish(identity)
+            return check.returncode
+    except OSError as exc:
+        output.write(f"Acceptance check could not run: {exc}\n")
+        return 1
+
+
 def _run_unit(a: Assignment, manifest: dict, directory: Path, args: argparse.Namespace,
               semaphore: threading.Semaphore, brief: str, argv: list[str], env: dict,
-              address: str | None, cancelled: threading.Event, live_status: SwarmStatus) -> dict:
+              address: str | None, cancel: Cancellation, live_status: SwarmStatus) -> dict:
     identity = a.unit["id"]
     worktree, log = directory / "wt" / identity, directory / "logs" / f"{identity}.log"
+
+    def on_start(pid: int) -> None:
+        cancel.start(identity, pid)
+        live_status.unit(identity, state="running", pid=pid, started_at=utc_now())
+
+    def cancelled(agent_rc: int) -> dict:
+        # The run is being torn down; nothing from this unit is checked or committed.
+        live_status.unit(identity, state="failed", pid=None, agent_rc=agent_rc,
+                         wall_clock_s=round(time.monotonic() - started, 2), finished_at=utc_now())
+        return {}
+
     with semaphore:
-        if cancelled.is_set():
+        if cancel.requested.is_set():
             return {}
         print(f"swarm: {identity} starts on {a.arm}", flush=True)
         started = time.monotonic()
         try:
             agent_rc = cli._dispatch(argv, brief, target=a.arm, stdin=a.ctx.task_on_stdin,
                                      cwd=worktree, env=env, log=log, timeout=args.unit_timeout,
-                                     on_start=lambda pid: live_status.unit(
-                                         identity, state="running", pid=pid, started_at=utc_now()))
+                                     on_start=on_start)
         except BaseException as exc:
+            cancel.finish(identity)
             live_status.unit(identity, state="failed", pid=None,
                              agent_rc=130 if isinstance(exc, KeyboardInterrupt) else 1,
                              wall_clock_s=round(time.monotonic() - started, 2), finished_at=utc_now())
             raise
+        cancel.finish(identity)
+        if cancel.requested.is_set():
+            return cancelled(130)
         live_status.unit(identity, state="checking", pid=None, agent_rc=agent_rc)
         with log.open("a", encoding="utf-8") as output:
-            output.write(f"\nAcceptance check: {a.unit['check']}\n")
-            output.flush()
-            try:
-                check = subprocess.run(a.unit["check"], shell=True, cwd=worktree,
-                                       stdout=output, stderr=subprocess.STDOUT, timeout=args.check_timeout)
-                check_rc = check.returncode
-            except subprocess.TimeoutExpired:
-                agent_rc = check_rc = 124
-                output.write("Acceptance check timed out\n")
-            except OSError as exc:
-                check_rc = 1
-                output.write(f"Acceptance check could not run: {exc}\n")
+            check_rc = _acceptance_check(a, worktree, output, args.check_timeout, cancel,
+                                         safe=bool(manifest.get("safe_checks")))
+        if check_rc == 124:
+            agent_rc = 124
+        if cancel.requested.is_set():
+            return cancelled(130)
         accepted = check_rc == 0 and agent_rc != 124
         committed, commit_error = False, None
         try:
@@ -292,7 +452,7 @@ def _run_unit(a: Assignment, manifest: dict, directory: Path, args: argparse.Nam
             if status.returncode:
                 commit_error = "git status failed"
             elif status.stdout.strip():
-                added = _git(worktree, "add", "-A")
+                added = _git(worktree, *stage_argv())
                 commit = (_git(worktree, "commit", "-m", f"swarm({identity}): {a.arm} result")
                           if added.returncode == 0 else added)
                 committed = commit.returncode == 0
@@ -346,27 +506,48 @@ def _settle(assignments: list[Assignment], results: list[dict], swarm_id: str) -
     return outcomes
 
 
-def run_swarm(args: argparse.Namespace, *, auto: bool) -> int:
-    manifest = load_manifest(args.manifest)
-    manifest["swarm_id"] = f"{manifest['slug']}-{datetime.now(timezone.utc):%Y%m%d%H%M%S}"
-    quota = ({} if args.no_quota else cli.fetch_quota(cache_result=False) if args.plan_only
-             else cli.fetch_quota())
-    assignments, held = assign_units(manifest, args, quota)
-    _print_assignments(assignments, held)
-    if args.plan_only:
-        for a in assignments:
-            print(render_brief(manifest, a, assignments, placeholders=not args.no_amail))
-        return 0
-    if assignments and not auto and not cli._confirm("dispatch this swarm?"):
-        print("not dispatched")
-        return 0
+def swarm_dir(swarm_id: str) -> Path:
+    """Where one swarm's worktrees, briefs, logs, status and summary live."""
+    return (state_dir() / "swarms" / swarm_id).resolve()
+
+
+def _swarm_id(manifest: dict) -> str:
+    """The manifest's preset ID (``route ultra`` names it) or a fresh per-second one."""
+    return manifest.get("swarm_id") or f"{manifest['slug']}-{datetime.now(timezone.utc):%Y%m%d%H%M%S}"
+
+
+@dataclass
+class SwarmRun:
+    """How one swarm run ended: its persisted summary (if any), the state the live
+    status was closed with, the CLI exit code, and the reason the run itself broke."""
+
+    summary: dict | None
+    final_state: str
+    exit_code: int
+    error: str | None = None
+
+
+def _run_swarm(manifest: dict, args: argparse.Namespace, quota: dict, assignments: list[Assignment],
+               held: list[dict], *, print_summary: bool) -> tuple[dict | None, str, int]:
+    """Dispatch, check, commit and settle every assignment; one implementation for CLI and API.
+
+    Returns ``(summary, final_state, exit_code)``: the summary is None when the run
+    never produced one (setup failure, interrupt), and ``final_state`` is what the
+    live status was closed with. Problems are printed, never raised, so both callers
+    see the same log and only differ in how they report the end state; ``error``
+    carries the printed reason when the run itself broke (setup, persistence,
+    channel teardown), as opposed to units merely failing their checks.
+    """
     swarm_id = manifest["swarm_id"]
-    directory = (state_dir() / "swarms" / swarm_id).resolve()
+    directory = swarm_dir(swarm_id)
     channel = poller = None
-    live_status = None
+    live_status = summary = error = None
     final_state, exit_code = "failed", 1
     try:
-        directory.mkdir(parents=True, mode=0o700)  # Refuse same-second ID collisions.
+        try:
+            directory.mkdir(parents=True, mode=0o700)  # Refuse same-second ID collisions.
+        except FileExistsError:
+            raise RuntimeError(f"swarm {swarm_id} already exists at {directory}") from None
         live_status = SwarmStatus(directory, name=manifest["name"], host=args.host,
             repo=manifest["repo"], route_pid=os.getpid(), held=held, units=[{
                 "id": a.unit["id"], "arm": a.arm, "why": a.plan["why"],
@@ -416,17 +597,17 @@ def run_swarm(args: argparse.Namespace, *, auto: bool) -> int:
             poller.start()
         results_by_id = {}
         executor = ThreadPoolExecutor(max_workers=args.max_parallel)
-        cancelled = threading.Event()
+        cancel = Cancellation()
+        futures: list = []
         try:
-            futures = [executor.submit(_run_unit, a, manifest, directory, args, semaphores[a.arm],
-                                       *prepared_unit, cancelled, live_status)
-                       for a, prepared_unit in zip(assignments, prepared)]
+            for a, prepared_unit in zip(assignments, prepared):
+                futures.append(executor.submit(_run_unit, a, manifest, directory, args,
+                                               semaphores[a.arm], *prepared_unit, cancel, live_status))
             for future in as_completed(futures):
                 result = future.result()
                 results_by_id[result["id"]] = result
         except BaseException:
-            cancelled.set()
-            executor.shutdown(wait=False, cancel_futures=True)
+            _stop_workers(cancel, executor, futures)
             raise
         else:
             executor.shutdown(wait=True)
@@ -434,25 +615,22 @@ def run_swarm(args: argparse.Namespace, *, auto: bool) -> int:
             poller.stop()
         results = [results_by_id[a.unit["id"]] for a in assignments]
         outcomes = _settle(assignments, results, swarm_id)
-        summary = {"swarm_id": swarm_id, "name": manifest["name"], "units": results, "held": held,
-                   "outcomes": outcomes, "channel_messages": poller.count if poller else 0,
-                   "channel_log": str(directory / "channel.jsonl") if poller else None,
-                   "hub": channel.hub.address if channel else None}
-        atomic_write(directory / "summary.json", json.dumps(summary, indent=2))
-        print(json.dumps(summary, indent=2), flush=True)
-        for a, result in zip(assignments, results):
-            if result["accepted"]:
-                continue
-            stronger = STRENGTH_ORDER[STRENGTH_ORDER.index(a.arm) + 1:] if a.arm in STRENGTH_ORDER else ()
-            next_arm = next((arm for arm in stronger if arm in a.plan["eligible"]), None)
-            print(f"swarm: {a.unit['id']}: " + (f"consider {next_arm} next" if next_arm else
-                  "no stronger eligible arm") + " (no automatic retry)")
+        report = {"swarm_id": swarm_id, "name": manifest["name"], "units": results, "held": held,
+                  "outcomes": outcomes, "channel_messages": poller.count if poller else 0,
+                  "channel_log": str(directory / "channel.jsonl") if poller else None,
+                  "hub": channel.hub.address if channel else None}
+        atomic_write(directory / "summary.json", json.dumps(report, indent=2))
+        summary = report  # Only a persisted summary counts as the run's result.
+        if print_summary:
+            print(json.dumps(summary, indent=2), flush=True)
+            _print_next_arms(assignments, results)
         exit_code = 0 if all(row["accepted"] for row in results) else 1
         final_state = "done" if exit_code == 0 else "failed"
     except KeyboardInterrupt:
         final_state, exit_code = "interrupted", 130
         print("swarm: interrupted", file=sys.stderr)
     except (OSError, RuntimeError) as exc:
+        error = str(exc)
         print(f"swarm: {exc}", file=sys.stderr)
     finally:
         try:
@@ -466,7 +644,7 @@ def run_swarm(args: argparse.Namespace, *, auto: bool) -> int:
             final_state, exit_code = "interrupted", 130
             print("swarm: interrupted", file=sys.stderr)
         except (OSError, RuntimeError) as exc:
-            final_state, exit_code = "failed", 1
+            final_state, exit_code, error = "failed", 1, str(exc)
             print(f"swarm: {exc}", file=sys.stderr)
         except BaseException:
             final_state, exit_code = "failed", 1
@@ -474,11 +652,72 @@ def run_swarm(args: argparse.Namespace, *, auto: bool) -> int:
         finally:
             if live_status:
                 live_status.finish(final_state, exit_code)
-    return exit_code
+    return SwarmRun(summary, final_state, exit_code, error)
+
+
+def _print_next_arms(assignments: list[Assignment], results: list[dict]) -> None:
+    for a, result in zip(assignments, results):
+        if result["accepted"]:
+            continue
+        stronger = STRENGTH_ORDER[STRENGTH_ORDER.index(a.arm) + 1:] if a.arm in STRENGTH_ORDER else ()
+        next_arm = next((arm for arm in stronger if arm in a.plan["eligible"]), None)
+        print(f"swarm: {a.unit['id']}: " + (f"consider {next_arm} next" if next_arm else
+              "no stronger eligible arm") + " (no automatic retry)")
+
+
+def run_swarm(args: argparse.Namespace, *, auto: bool) -> int:
+    manifest = load_manifest(args.manifest)
+    manifest["swarm_id"] = _swarm_id(manifest)
+    quota = ({} if args.no_quota else cli.fetch_quota(cache_result=False) if args.plan_only
+             else cli.fetch_quota())
+    assignments, held = assign_units(manifest, args, quota)
+    _print_assignments(assignments, held)
+    if args.plan_only:
+        for a in assignments:
+            print(render_brief(manifest, a, assignments, placeholders=not args.no_amail))
+        return 0
+    if assignments and not auto and not cli._confirm("dispatch this swarm?"):
+        print("not dispatched")
+        return 0
+    return _run_swarm(manifest, args, quota, assignments, held, print_summary=True).exit_code
+
+
+def run_swarm_manifest(manifest: dict | str | Path, *, host: str = "claude", max_parallel: int = 4,
+                       unit_timeout: int = 3600, check_timeout: int = 600, no_amail: bool = False,
+                       no_quota: bool = False, allow_network: bool = False, ttl: int = 120) -> dict:
+    """Run a swarm from code, with no prompt, and hand back what summary.json holds.
+
+    ``route ultra`` drives swarms this way. Anything that breaks the run itself
+    (setup, persisting the summary, channel teardown) is a RuntimeError carrying
+    the printed reason, so a summary is only ever returned once it is on disk;
+    units failing their checks are an ordinary result. An interrupt propagates,
+    after every worker has stopped, so the caller can stop its own run too.
+    """
+    # The ``route swarm`` flags, with the ones a programmatic caller never types at rest.
+    args = argparse.Namespace(manifest=None, host=host, pool=None, sensitive=False, plan_only=False,
+                              no_quota=no_quota, allow_network=allow_network, no_amail=no_amail, ttl=ttl,
+                              max_parallel=max_parallel, unit_timeout=unit_timeout, check_timeout=check_timeout)
+    try:
+        loaded = load_manifest(manifest)
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from None
+    loaded["swarm_id"] = _swarm_id(loaded)
+    quota = {} if no_quota else cli.fetch_quota()
+    assignments, held = assign_units(loaded, args, quota)
+    _print_assignments(assignments, held)
+    run = _run_swarm(loaded, args, quota, assignments, held, print_summary=False)
+    if run.final_state == "interrupted":
+        raise KeyboardInterrupt
+    if run.error is not None:
+        raise RuntimeError(f"swarm {loaded['swarm_id']}: {run.error}")
+    if run.summary is None:
+        raise RuntimeError(f"swarm {loaded['swarm_id']} produced no summary; see "
+                           f"{swarm_dir(loaded['swarm_id']) / 'status.json'}")
+    return run.summary
 
 
 def swarm_log(swarm_id: str) -> int:
-    if not re.fullmatch(r"[a-z0-9-]{1,32}-[0-9]{14}", swarm_id):
+    if not SWARM_ID.fullmatch(swarm_id):
         raise ValueError("invalid swarm ID")
     path = state_dir() / "swarms" / swarm_id / "channel.jsonl"
     try:

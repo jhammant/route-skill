@@ -639,20 +639,17 @@ def test_agent_timeout_still_checks_but_cannot_be_accepted(repo, tmp_path, offli
     assert status["units"][0]["pid"] is None
 
 
-def test_acceptance_check_timeout_is_reported(repo, tmp_path, offline, monkeypatch):
-    # Arrange
-    fake, _ = offline
-    def commands(argv, **kwargs):
-        if isinstance(argv, str):
-            raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
-        return fake(argv, **kwargs)
-    monkeypatch.setattr(subprocess, "run", commands)
-    path = manifest_file(repo, tmp_path, [unit("one", pool="codex")])
+def test_acceptance_check_timeout_is_reported(repo, tmp_path, offline):
+    # Arrange: a real check that outlives its budget, so the runner has to kill it.
+    path = manifest_file(repo, tmp_path, [dict(unit("one", pool="codex"), check="sleep 30")])
     # Act
+    started = time.monotonic()
     assert run(path, "--no-amail", "--check-timeout", "1") == 1
     result, _ = summary()
-    # Assert
+    # Assert: reported as a timeout, and the sleeping check did not hold the run up.
     assert result["units"][0]["agent_rc"] == 124 and not result["units"][0]["accepted"]
+    assert time.monotonic() - started < 10
+    assert "Acceptance check timed out" in Path(result["units"][0]["log"]).read_text()
 
 
 def test_rerunning_one_manifest_in_one_repo_gets_fresh_branches(repo, tmp_path, offline, monkeypatch):

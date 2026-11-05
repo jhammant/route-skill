@@ -8,4 +8,4 @@ def test_safe_env_strips_password_key_pat_and_agent_variables():
         "SSH_AUTH_SOCK": "/tmp/agent.sock", "GOOGLE_APPLICATION_CREDENTIALS": "/k.json",
         "PATH": "/usr/bin",
     }
-    assert safe_env(base) == {"PATH": "/usr/bin", "ROUTE_WORKER": "1"}
+    assert safe_env(base) == {"PATH": "/usr/bin", "ROUTE_WORKER": "1", "PYTHONDONTWRITEBYTECODE": "1"}

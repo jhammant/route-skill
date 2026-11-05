@@ -2,8 +2,10 @@
 
 A Claude Code transcript is mostly tool output. Across Jon's twelve largest
 recent sessions, tool results were 91.7% of the text, tool calls 5.7%, and what
-the user and assistant actually said 2.4%. A *digest* keeps the conversation and
-a one-line note per tool call, and drops the tool output: about a tenth of a
+the user and assistant actually said 2.4%. A *digest* keeps the conversation, the
+progress notes said between tool calls (stored only as short thinking-block
+summaries, so detail written mid-turn survives only as that summary), and a
+one-line note per tool call, and drops the tool output: about a tenth of a
 full fork. The worker knows what was discussed and decided, and re-reads any
 file it needs (it gets the current version, not a stale copy).
 
@@ -108,7 +110,11 @@ def turns_from_transcript(path: Path) -> list[Turn]:
                     parts.append(text)
             elif kind == "tool_use" and role == "assistant":
                 parts.append(_tool_line(block))
-            # tool_result, thinking and images are dropped on purpose.
+            elif kind == "thinking" and role == "assistant" and str(block.get("thinking", "")).strip():
+                # What the assistant said between tool calls is stored only as a
+                # short progress note in a thinking block, never as text: keep it.
+                parts.append(str(block["thinking"]).strip())
+            # tool_result, empty thinking blocks and images are dropped on purpose.
         if not parts:
             continue
         text = "\n".join(parts)

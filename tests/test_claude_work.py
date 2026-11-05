@@ -303,3 +303,16 @@ def test_shipped_example_config_loads(tmp_path):
         assert after[1].startswith("--"), template
     assert pools["claude-work-fable"].quota_scope == "Fable"
     assert pools["claude-work-sonnet"].dispatch_for("batch:summarize")[1] is True  # task on stdin
+
+
+def test_digest_keeps_progress_notes_stored_as_thinking(tmp_path):
+    entries = [
+        {"type": "user", "message": {"role": "user", "content": "Go."}},
+        {"type": "assistant", "message": {"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "Work account resets 9 Nov 15:00.", "signature": "x"},
+            {"type": "thinking", "thinking": "", "signature": "y"},
+            {"type": "tool_use", "name": "Bash", "input": {"command": "ls"}},
+        ]}},
+    ]
+    digest = build_digest(_transcript(tmp_path, SESSION, entries), SESSION)
+    assert "Work account resets 9 Nov 15:00." in digest

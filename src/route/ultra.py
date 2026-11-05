@@ -28,11 +28,11 @@ from . import cli
 from .digest import digest_preamble, write_digest
 from .pools import Pool, pool_family, pools_for_host
 from .storage import atomic_write, state_dir
-from .swarm_dispatch import run_swarm_manifest, signal_tree, swarm_dir
+from .swarm_dispatch import is_artefact, run_swarm_manifest, signal_tree, stage_argv, swarm_dir
 from .swarm_status import utc_now
 from .ultra_plan import Plan, PlanError, lint_plan, merge_overlaps, parse_plan, planner_prompt, to_manifest
-from .ultra_review import (Finding, confirm, fix_prompt, needs_review, parse_review, resolved, review_prompt,
-                           unit_diff)
+from .ultra_review import (Finding, confirm, fix_prompt, merge_prompt, needs_review, parse_review, resolved,
+                           review_prompt, unit_diff)
 from .ultra_safety import run_checked, screen_digest
 from .ultra_select import candidates, dispatch_template, pick, review_independence
 
@@ -195,13 +195,41 @@ def _commit_if_changed(worktree: Path, message: str, *, branch: str | None = Non
         raise CommitError(f"git status failed: {status.stderr.strip()}")
     if not status.stdout.strip():
         return False
-    added = _git(worktree, "add", "-A")
+    added = _git(worktree, *stage_argv())
     if added.returncode:
         raise CommitError(f"git add failed: {added.stderr.strip()}")
     commit = _git(worktree, "commit", "-q", "-m", message)
     if commit.returncode:
         raise CommitError(f"git commit failed: {(commit.stderr or commit.stdout).strip()}")
     return True
+
+
+# -- scope ---------------------------------------------------------------------
+
+def _changed_paths(worktree: Path, base_sha: str) -> list[str]:
+    """Repo-relative paths the unit's branch changed since the base (committed work only)."""
+    diff = _git(worktree, "diff", "--name-only", base_sha, "HEAD")
+    if diff.returncode:
+        return []
+    return [line.strip() for line in diff.stdout.splitlines() if line.strip()]
+
+
+def out_of_scope(changed: list[str], touches: list[str], allowed: list[str] = ()) -> list[str]:
+    """Changed paths the plan did not give the unit: a touch that is a directory covers everything
+    under it, and paths ultra itself added (reviewer regression tests) are never counted."""
+    prefixes = tuple(f"{touch.strip('/')}/" for touch in touches if touch.strip("/"))
+    exact = {touch.strip("/") for touch in touches}
+    return [path for path in changed
+            if path not in exact and not path.startswith(prefixes) and path not in set(allowed)]
+
+
+def _record_scope(run: Run, unit: dict, row: dict, base_sha: str) -> list[str]:
+    """Record what a unit changed outside its planned touches; informative, never a failure."""
+    review = run.progress["units"].get(unit["id"], {}).get("review") or {}
+    strayed = out_of_scope(_changed_paths(Path(row["worktree"]), base_sha), unit.get("touches", []),
+                           list(review.get("carried_tests", [])))
+    run.unit(unit["id"], out_of_scope=strayed)
+    return strayed
 
 
 # -- context -------------------------------------------------------------------
@@ -437,7 +465,7 @@ def _check_output(log: str) -> str:
 
 
 def _fix_unit(run: Run, unit: dict, row: dict, confirmed: list[Finding], pools: dict[str, Pool],
-              quota: dict, host: str, allow_lower: bool) -> bool:
+              quota: dict, host: str, allow_lower: bool, base_sha: str = "") -> bool:
     """Up to MAX_FIX_PASSES rounds of fix, re-check and re-confirm; True when the unit is sound.
 
     Every finding that was ever confirmed is re-run after every pass, not only
@@ -467,6 +495,8 @@ def _fix_unit(run: Run, unit: dict, row: dict, confirmed: list[Finding], pools: 
         except CommitError as exc:
             reason = f"fix pass {pass_no} could not be kept: {exc}"
             break
+        if base_sha:
+            _record_scope(run, unit, row, base_sha)
         if result.rc == 0 and not outstanding:
             run.unit(unit_id, state="fixed", reason=None, outstanding=[])
             return True
@@ -497,6 +527,7 @@ def _integrate(run: Run, plan: Plan, rows: dict[str, dict], sound: set[str], rep
         result["error"] = f"could not create {branch}: {added.stderr.strip()}"
         run.save()
         return result
+    units = {unit.id: unit.to_dict() for unit in plan.units}
     for unit in plan.units:
         if unit.id not in sound:
             continue
@@ -505,14 +536,14 @@ def _integrate(run: Run, plan: Plan, rows: dict[str, dict], sound: set[str], rep
             result["error"] = f"integration stopped: {reason}"
             run.unit(unit.id, state="unmerged", reason=reason)
             continue
-        merge = _git(path, "merge", "--no-ff", "-m", f"ultra({run.id}): merge {unit.id}", rows[unit.id]["branch"])
-        if merge.returncode:
-            _git(path, "merge", "--abort")
-            detail = (merge.stdout + merge.stderr).strip().splitlines()
-            run.unit(unit.id, state="conflict", reason="merge conflict: " + (detail[-1] if detail else "")[:200])
+        problem = _merge_unit(run, units[unit.id], rows[unit.id]["branch"], path, branch, base_sha,
+                              pools, quota, host, allow_lower, goal)
+        if problem:
+            run.unit(unit.id, state="conflict", reason=problem[:240])
             continue
         result["merged"].append(unit.id)
         run.unit(unit.id, state="merged")
+    result["unmerged"] = [unit.id for unit in plan.units if unit.id not in result["merged"]]
     if result.get("error"):
         run.save()
         return result
@@ -538,6 +569,100 @@ def _integrate(run: Run, plan: Plan, rows: dict[str, dict], sound: set[str], rep
     result.update(goal_check_passed=check.rc == 0, goal_check_rc=check.rc, goal_check_output=check.output[-4000:])
     run.save()
     return result
+
+
+def _conflicted(path: Path) -> list[str]:
+    """Paths the in-progress merge left unresolved."""
+    listing = _git(path, "diff", "--name-only", "--diff-filter=U")
+    return [line.strip() for line in listing.stdout.splitlines() if line.strip()]
+
+
+_MARKER = re.compile(rb"^(<{7}|={7}|>{7})( |$)", re.M)
+
+
+def _has_markers(path: Path, rels: list[str]) -> list[str]:
+    """Files among ``rels`` that still carry conflict markers (a deleted file is resolved)."""
+    hit = []
+    for rel in rels:
+        data = _read_regular_file(path / rel)
+        if data is not None and _MARKER.search(data):
+            hit.append(rel)
+    return hit
+
+
+def _restore(path: Path, branch: str, before: str) -> None:
+    """Put the integration worktree back where it was before a merge was attempted.
+
+    The reset only happens while the worktree is still on the run's branch: a
+    model that checked out main in it must not have main reset underneath it,
+    and ``_integrate`` stops at the next branch check anyway.
+    """
+    _git(path, "merge", "--abort")
+    if _git(path, "rev-parse", "HEAD").stdout.strip() != before and _on_branch(path, branch) is None:
+        _git(path, "reset", "-q", "--hard", before)
+
+
+def _merge_unit(run: Run, unit: dict, unit_branch: str, path: Path, branch: str, base_sha: str,
+                pools: dict[str, Pool], quota: dict, host: str, allow_lower: bool, goal: str) -> str | None:
+    """Merge one unit branch into the integration worktree; the reason when it could not be.
+
+    Artefact-only conflicts (a worker that committed its ``__pycache__``) are
+    settled by dropping those paths: no model wrote them. A real conflict gets
+    the integrator ONE pass in the live merge; anything short of a clean result
+    with the unit's branch as an ancestor is undone, so the branch never carries
+    half a merge.
+    """
+    unit_id = unit["id"]
+    before = _git(path, "rev-parse", "HEAD").stdout.strip()
+    merge = _git(path, "merge", "--no-ff", "-m", f"ultra({run.id}): merge {unit_id}", unit_branch)
+    if merge.returncode == 0:
+        return None
+    conflicted = _conflicted(path)
+    if not conflicted:
+        _restore(path, branch, before)
+        detail = (merge.stdout + merge.stderr).strip().splitlines()
+        return "merge failed: " + (detail[-1] if detail else "")
+    artefacts = [rel for rel in conflicted if is_artefact(rel)]
+    if artefacts:
+        # Neither side wrote these by hand; the merge goes on without them.
+        _git(path, "rm", "-q", "--cached", "--", *artefacts)
+        for rel in artefacts:
+            (path / rel).unlink(missing_ok=True)
+        run.note(f"{unit_id}: {len(artefacts)} artefact conflict(s) dropped: " + ", ".join(artefacts[:5]))
+    remaining = [rel for rel in conflicted if rel not in artefacts]
+    resolver = None
+    if remaining:
+        resolver = pick("integrator", pools, quota, host=host, allow_lower=allow_lower)
+        if resolver is None:
+            _restore(path, branch, before)
+            return "merge conflict: " + ", ".join(remaining)[:160] + " (no integrator with quota)"
+        run.unit(unit_id, state="resolving", resolver=resolver)
+        run.step("integrating", f"{unit_id} conflicts on {len(remaining)} path(s); one pass by {resolver}")
+        _dispatch(run, resolver, pools, host,
+                  merge_prompt(unit, branch=branch, conflicted=remaining, goal=goal),
+                  path, f"merge-{unit_id}.log", FIX_TIMEOUT)
+        markers = _has_markers(path, remaining)
+        if markers:
+            _restore(path, branch, before)
+            return f"merge conflict: {resolver} left conflict markers in " + ", ".join(markers)[:160]
+    reason = _on_branch(path, branch, base_sha)
+    if reason is None:
+        if _git(path, "rev-parse", "-q", "--verify", "MERGE_HEAD").returncode == 0:
+            # Still mid-merge: stage what was resolved (artefacts excluded) and commit it.
+            _git(path, *stage_argv())
+            if _git(path, "ls-files", "-u").stdout.strip():
+                reason = "paths left unresolved: " + ", ".join(_conflicted(path))[:160]
+            else:
+                who = f" ({resolver} resolved {', '.join(remaining)[:120]})" if resolver else ""
+                commit = _git(path, "commit", "-q", "-m", f"ultra({run.id}): merge {unit_id}{who}")
+                if commit.returncode:
+                    reason = f"git commit failed: {(commit.stderr or commit.stdout).strip()[:160]}"
+        if reason is None and _git(path, "merge-base", "--is-ancestor", unit_branch, "HEAD").returncode:
+            reason = f"{unit_branch} is not in the result"
+    if reason is not None:
+        _restore(path, branch, before)
+        return f"merge conflict: {reason}"
+    return None
 
 
 def _settle(run: Run, rows: dict[str, dict]) -> None:
@@ -586,6 +711,7 @@ def _summary(run: Run, goal: str, plan: Plan | None, arms: dict[str, str], integ
             "advisory_findings": len(review.get("advisory", [])),
             "fix_passes": state.get("fix_passes", 0), "reason": state.get("reason"),
             "branch": state.get("branch"), "settled": state.get("settled"),
+            "out_of_scope": list(state.get("out_of_scope") or []),
         })
     quota = {}
     for provider in sorted(set(usage_before) | set(usage_after)):
@@ -603,8 +729,22 @@ def _summary(run: Run, goal: str, plan: Plan | None, arms: dict[str, str], integ
     }
 
 
+def goal_check_verdict(integration: dict, planned: int) -> str:
+    """What the goal check proved, counting units: a pass on a partial merge is not a pass on the goal."""
+    merged, unmerged = integration.get("merged") or [], integration.get("unmerged") or []
+    if integration.get("goal_check_rc") is None:
+        return "not run"
+    verdict = ("passed" if integration.get("goal_check_passed")
+               else f"FAILED (exit {integration.get('goal_check_rc')})")
+    verdict += f" on {len(merged)} of {planned} units"
+    if unmerged:
+        verdict += f" ({len(unmerged)} not merged: {', '.join(unmerged)})"
+    return verdict
+
+
 def _summary_md(summary: dict) -> str:
     integration = summary["integration"] or {}
+    planned = len((summary.get("plan") or {}).get("units") or summary["units"])
     lines = [f"# ultra {summary['run_id']}", "", f"Goal: {summary['goal']}", "",
              f"Repo: {summary['repo']} at {summary['base']} ({(summary['base_sha'] or '')[:12]})"]
     if summary.get("planner"):
@@ -614,23 +754,30 @@ def _summary_md(summary: dict) -> str:
         lines.append(f"Context: {context['requested']} -> {context['level']}: {context['note']}")
     if integration.get("branch"):
         passed = integration.get("goal_check_passed")
+        unmerged = integration.get("unmerged") or []
         lines += ["", f"Integration branch: {integration['branch']}", f"Worktree: {integration['worktree']}",
-                  f"Goal check `{integration['goal_check']}`: "
-                  + ("passed" if passed else f"FAILED (exit {integration.get('goal_check_rc')})")
+                  f"Goal check `{integration['goal_check']}`: " + goal_check_verdict(integration, planned)
                   + (f"; integration fix pass by {integration['fix']['arm']}" if integration.get("fix") else "")]
         if integration.get("error"):
             lines.append(f"Integration error: {integration['error']}")
+        lines.append("Result: " + (
+            f"complete: all {planned} units merged and the goal check passed" if passed and not unmerged else
+            f"INCOMPLETE: {len(unmerged)} of {planned} units not merged; the goal check only covers the rest"
+            if unmerged else "the goal check failed on the integration branch"))
     if summary["plan_problems"]:
         lines += ["", "Plan problems: " + "; ".join(summary["plan_problems"])]
     if summary["units"]:
-        lines += ["", "| unit | arm | review | confirmed | fix passes | state |", "|---|---|---|---|---|---|"]
+        lines += ["", "| unit | arm | review | confirmed | fix passes | out of scope | state |",
+                  "|---|---|---|---|---|---|---|"]
         for unit in summary["units"]:
             review = (f"{unit['reviewer']} ({unit['independence']})" if unit.get("reviewer") else "-")
             state = unit["state"] + (f": {unit['reason']}" if unit.get("reason") else "")
+            strayed = unit.get("out_of_scope") or []
+            scope = ", ".join(strayed[:4]) + (f" (+{len(strayed) - 4} more)" if len(strayed) > 4 else "") or "-"
             lines.append(f"| {unit['id']} | {unit['arm'] or '-'} | {review} | {unit['confirmed_findings']} "
-                         f"| {unit['fix_passes']} | {state} |")
+                         f"| {unit['fix_passes']} | {scope} | {state} |")
     for row in summary["held"]:
-        lines.append(f"| {row['id']} | held | - | - | - | {row['reason']} |")
+        lines.append(f"| {row['id']} | held | - | - | - | - | {row['reason']} |")
     if summary["quota"]:
         lines += ["", "Quota (percent used, before -> after):"]
         for provider, labels in summary["quota"].items():
@@ -759,6 +906,8 @@ def _execute(run: Run, goal: str, repo: Path, base: str, base_sha: str, context:
                  reason=None if row["accepted"] else f"check failed (agent exit {row['agent_rc']})")
 
     units = {unit.id: unit.to_dict() for unit in plan.units}
+    for unit_id, row in rows.items():
+        _record_scope(run, units[unit_id], row, base_sha)
     reviews: dict[str, list[Finding] | None] = {}
     run.step("reviewing", "")
     for unit_id, row in rows.items():
@@ -768,13 +917,14 @@ def _execute(run: Run, goal: str, repo: Path, base: str, base_sha: str, context:
     sound: set[str] = set()
     for unit_id, row in rows.items():
         if not row["accepted"]:
-            if _fix_unit(run, units[unit_id], row, [], pools, quota, host, allow_lower):
+            if _fix_unit(run, units[unit_id], row, [], pools, quota, host, allow_lower, base_sha):
                 sound.add(unit_id)
             continue
         confirmed = reviews[unit_id]
         if confirmed is None:
             continue  # review failed: nothing is known to fix, and nothing was cleared
-        if not confirmed or _fix_unit(run, units[unit_id], row, confirmed, pools, quota, host, allow_lower):
+        if not confirmed or _fix_unit(run, units[unit_id], row, confirmed, pools, quota, host, allow_lower,
+                                      base_sha):
             sound.add(unit_id)
 
     integration = _integrate(run, plan, rows, sound, repo, base_sha, pools, quota, host, allow_lower, goal)
@@ -870,9 +1020,10 @@ def ultra_status(run_id: str | None = None) -> int:
                   f"\t{row.get('reason') or ''}")
     integration = progress.get("integration") or {}
     if integration.get("branch"):
-        verdict = integration.get("goal_check_passed")
+        planned = len([row for row in progress["units"].values() if row["state"] != "held"])
+        verdict = goal_check_verdict(integration, planned)
         print(f"integration: {integration['branch']}: goal check "
-              + ("passed" if verdict else "pending" if integration.get("goal_check_rc") is None else "failed"))
+              + ("pending" if verdict == "not run" else verdict))
     return 0
 
 
@@ -905,31 +1056,4 @@ def ultra_cancel(run_id: str) -> int:
     atomic_write(ultra_dir(run_id) / "progress.json", json.dumps(progress, indent=2) + "\n")
     print(f"run {run_id} cancelled; stopped {len(stopped)} process(es)"
           + (f"; {len(survivors)} did not confirm exit: {survivors}" if survivors else ""))
-    return 0
-    """Stop a run: its orchestrator first, then every model process it recorded."""
-    progress, reason = _load_progress(run_id)
-    if progress is None:
-        print(f"route ultra cancel: {reason}", file=sys.stderr)
-        return 1
-    if progress["state"] in FINISHED:
-        print(f"run {run_id} already finished: {progress['state']}")
-        return 0
-    pids = [progress.get("pid")] + list(progress.get("pids", []))
-    try:
-        status = json.loads((swarm_dir(run_id) / "status.json").read_text(encoding="utf-8"))
-        pids += [row.get("pid") for row in status.get("units", [])]
-    except (OSError, ValueError, AttributeError):
-        pass
-    stopped = []
-    for pid in pids:
-        if pid == os.getpid() or not _alive(pid):
-            continue
-        try:
-            os.kill(pid, signal.SIGTERM)
-            stopped.append(pid)
-        except OSError:
-            continue
-    progress.update(state="cancelled", exit_code=130, finished_at=utc_now(), updated_at=utc_now(), pids=[])
-    atomic_write(ultra_dir(run_id) / "progress.json", json.dumps(progress, indent=2) + "\n")
-    print(f"run {run_id} cancelled; stopped {len(stopped)} process(es)")
     return 0

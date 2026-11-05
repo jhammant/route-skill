@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
 import os
 import re
@@ -35,6 +36,39 @@ UNIT_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
 #: A caller-chosen run ID (``route ultra`` names its swarm after the run). Path-safe by
 #: construction: one lowercase segment, no dots, no separators.
 SWARM_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,80}$")
+
+
+#: Build artefacts a check leaves behind. A worktree made from a repo with no
+#: .gitignore would otherwise commit them, and three branches each adding a
+#: different ``__pycache__/x.pyc`` cannot merge (add/add on binary files).
+ARTEFACTS: tuple[str, ...] = (
+    "**/__pycache__/**", "**/*.pyc", "**/*.pyo", "**/.pytest_cache/**", "**/.mypy_cache/**",
+    "**/.ruff_cache/**", "**/node_modules/**", "**/.DS_Store", "**/.coverage", "**/.coverage.*",
+    "**/*.egg-info/**",
+)
+
+
+def artefact_pathspecs() -> list[str]:
+    """Pathspec excludes for ARTEFACTS; a repo's own .gitignore still applies on top."""
+    return [f":(exclude,glob){pattern}" for pattern in ARTEFACTS]
+
+
+def stage_argv() -> list[str]:
+    """The ``git add`` that stages everything a worker did except build artefacts."""
+    return ["add", "-A", "--", ".", *artefact_pathspecs()]
+
+
+def is_artefact(path: str) -> bool:
+    """Whether a repo-relative path matches ARTEFACTS (used to settle artefact-only conflicts)."""
+    parts = path.split("/")
+    for pattern in ARTEFACTS:
+        target = pattern[3:]  # strip the leading "**/"
+        if target.endswith("/**"):
+            if any(fnmatch.fnmatchcase(part, target[:-3]) for part in parts[:-1]):
+                return True
+        elif fnmatch.fnmatchcase(parts[-1], target):
+            return True
+    return False
 
 
 def _git(repo: Path, *args: str):
@@ -418,7 +452,7 @@ def _run_unit(a: Assignment, manifest: dict, directory: Path, args: argparse.Nam
             if status.returncode:
                 commit_error = "git status failed"
             elif status.stdout.strip():
-                added = _git(worktree, "add", "-A")
+                added = _git(worktree, *stage_argv())
                 commit = (_git(worktree, "commit", "-m", f"swarm({identity}): {a.arm} result")
                           if added.returncode == 0 else added)
                 committed = commit.returncode == 0

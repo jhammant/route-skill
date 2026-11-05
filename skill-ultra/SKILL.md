@@ -17,8 +17,13 @@ description: Run a goal as your own ultracode with `route ultra`. It plans the g
    different family (Anthropic work goes to OpenAI, and the other way round).
    A finding counts only when running its repro command shows the bug.
 4. Confirmed findings go back for at most two fix passes per unit.
-5. Accepted branches are merged onto `ultra/<run-id>`, the goal check runs
-   there, outcomes are settled for the router, and `summary.md` is written.
+5. Accepted branches are merged onto `ultra/<run-id>`. Build artefacts
+   (`__pycache__`, `*.pyc`, caches, `node_modules`) are never staged, and
+   checks run with `PYTHONDONTWRITEBYTECODE=1`, so they cannot cause add/add
+   conflicts. A conflict on real files gets the integrator model one pass to
+   resolve it; if that fails the unit is marked `conflict` and the merge is
+   undone. Then the goal check runs there, outcomes are settled for the
+   router, and `summary.md` is written.
 
 It never merges into the base branch or main, and never pushes. Merging is the
 user's call.
@@ -99,8 +104,8 @@ stops a run.
 
 | Exit | Meaning |
 |---|---|
-| 0 | The goal check passed on the integration branch. |
-| 1 | Some units or the goal check failed. |
+| 0 | Every unit merged and the goal check passed on the integration branch. |
+| 1 | Some units were not merged (failed, held or conflict), or the goal check failed. |
 | 2 | It could not plan, or no usable model had quota. |
 
 On exit 2, tell the user why and, when no top model had quota, offer
@@ -115,9 +120,13 @@ a worker log only when a unit failed, and then only that unit's log.
 
 Tell the user, in a few lines rather than pasted JSON:
 
-- the integration branch, `ultra/<run-id>`, and whether the goal check passed
-  there;
-- which units passed, and which failed or were held, with the reason;
+- the integration branch, `ultra/<run-id>`, and what the goal check proved:
+  `summary.md` says "passed on N of M units" and lists the units that were not
+  merged. A pass on fewer than all units is NOT the goal passing; say so;
+- which units passed, and which failed, conflicted or were held, with the
+  reason;
+- any paths a unit changed outside its planned `touches` (the "out of scope"
+  column); they do not fail the unit, but the user should look at them;
 - which reviews found real bugs (confirmed by their repro) and whether the
   fixes held; say so when a review was same-family rather than cross-family;
 - quota spent per pool;

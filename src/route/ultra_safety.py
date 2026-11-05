@@ -138,6 +138,9 @@ def safe_env(base: dict[str, str] | None = None) -> dict[str, str]:
         and not key.upper().endswith(("_TOKEN", "_SECRET", "_API_KEY"))
     }
     env["ROUTE_WORKER"] = "1"
+    # A check must not litter the worktree with .pyc files: a worker that commits
+    # them gives every unit branch a different binary at one path, and they conflict.
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
     return env
 
 

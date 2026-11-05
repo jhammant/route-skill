@@ -132,7 +132,8 @@ def test_safe_env_strips_credentials_without_mutating_base():
 
     env = safe_env(base)
 
-    assert env == {"PATH": "/usr/bin", "LANG": "en_US.UTF-8", "ROUTE_WORKER": "1"}
+    assert env == {"PATH": "/usr/bin", "LANG": "en_US.UTF-8", "ROUTE_WORKER": "1",
+                   "PYTHONDONTWRITEBYTECODE": "1"}
     assert all(base[key] == "fake-credential" for key in credentials)
     assert base["ROUTE_WORKER"] == "0"
 
@@ -147,7 +148,7 @@ def test_safe_env_defaults_to_environment(monkeypatch):
     assert env["ULTRA_TEST_VISIBLE"] == "kept"
     assert env["ROUTE_WORKER"] == "1"
     assert os.environ["FOO_API_KEY"] == "fake-credential"
-    assert safe_env({}) == {"ROUTE_WORKER": "1"}
+    assert safe_env({}) == {"ROUTE_WORKER": "1", "PYTHONDONTWRITEBYTECODE": "1"}
 
 
 @pytest.fixture

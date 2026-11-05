@@ -222,3 +222,32 @@ them pass. Then run the acceptance check and every repro yourself and make sure 
 Leave your changes in the working tree (committing is fine too); route records them when the check
 passes. Do not touch files outside this worktree and do not push.""")
     return "\n\n".join(parts) + "\n"
+
+
+def merge_prompt(unit: dict, *, branch: str, conflicted: list[str], goal: str) -> str:
+    """The brief for an integrator asked to resolve one unit's merge conflict by hand.
+
+    The merge is already in progress in its worktree; the integrator only has to
+    settle the listed paths so both sides' intent survives, and must not reach
+    for ``git merge --abort`` or a reset: those undo the work rather than finish it.
+    """
+    paths = "\n".join(f"- {path}" for path in conflicted)
+    return f"""You are integrating one unit of an automated build ("route ultra") on branch {branch}.
+Resolve the merge conflict for unit {unit['id']}: `git merge` of its branch is in progress in this
+worktree and stopped on these paths:
+{paths}
+
+The overall goal:
+{goal.strip()}
+
+The unit's brief (what its branch is meant to add):
+{unit.get('task', '').strip()}
+
+# What to do
+
+Edit each conflicted file so it keeps what the branch already merged AND what this unit adds; remove
+every conflict marker (<<<<<<<, =======, >>>>>>>). Then `git add` the resolved paths. You may
+commit the merge yourself or leave it staged; route commits it. Do NOT run `git merge --abort`,
+`git reset`, `git checkout` of another branch, or anything that pushes. Do not touch files outside
+this worktree. Leave build artefacts (__pycache__, *.pyc, caches) out of the commit.
+"""

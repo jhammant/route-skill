@@ -254,10 +254,19 @@ and append `+surplus:<arm>` or `-pressure:<arm>` to `why` for the chosen arm.
 `surplus_bonus` remains a **deprecated alias with the same signed values** for
 one release. Adjustments affect selection only, never learned counts.
 
-## A second Claude subscription as worker pools
+## Two Claude Code accounts
 
 If you have a second Claude subscription (a work seat, say), its quota can run
-headless workers while your own session stays on your account.
+headless workers while your own session stays on your account. Four pieces fit
+together:
+
+- [claude-work](https://github.com/jhammant/claude-work) runs Claude Code on the
+  second account for one process, without touching your main login.
+- [quotamax](https://github.com/jhammant/quotamax) shows both accounts' usage,
+  including per-model windows such as Fable's.
+- route (this repo) sends each task to whichever account or model has quota.
+- [/ultra](#ultra-your-own-ultracode) plans a job into checked units and runs
+  them across both accounts and Codex on the best models.
 
 Install [claude-work](https://github.com/jhammant/claude-work) first, then:
 

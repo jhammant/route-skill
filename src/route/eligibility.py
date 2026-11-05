@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import functools
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -36,6 +37,17 @@ VETO_TARGET = "claude"
 #: dataClass values: ``open`` (default) or ``sensitive`` (SPEC-ship section 1).
 DATA_OPEN = "open"
 DATA_SENSITIVE = "sensitive"
+
+
+#: Set by claude-work sessions. Inside one, the ``claude`` binary spends the
+#: second subscription, so the host arm is gated on that pool, and the shared
+#: quota cache (owned by the host account's sessions) is read but never written.
+CLAUDE_WORK_ACCOUNT = "CLAUDE_WORK_ACCOUNT"
+
+
+def in_claude_work_session() -> bool:
+    """True inside a claude-work worker: its quota is the second account's."""
+    return os.environ.get(CLAUDE_WORK_ACCOUNT) == "1"
 
 
 class SensitiveRoutingError(Exception):
@@ -248,7 +260,8 @@ def _cached_quota_payloads(timeout: float, *, cache_result: bool = True):
     `quotamax agent` rescans transcripts and can take well over 5 s; when the probe
     timed out the router silently lost all quota awareness (no gating, no surplus or
     pressure adjustment). A five-minute cache keeps routing fast and quota-aware.
-    Only successful probes are cached.
+    Only successful probes are cached, and never by a claude-work session: its
+    ``quotamax agent`` view is the second account's, which would poison the host's.
     """
     from .storage import state_dir
 
@@ -262,7 +275,7 @@ def _cached_quota_payloads(timeout: float, *, cache_result: bool = True):
     with ThreadPoolExecutor(max_workers=2) as pool:
         payloads = list(pool.map(lambda c: _run_json(c, timeout),
             [("quotamax", "agent", "--json"), ("quotamax", "providers", "--json")]))
-    if cache_result and payloads and payloads[0] is not None:
+    if cache_result and not in_claude_work_session() and payloads and payloads[0] is not None:
         try:
             cache.parent.mkdir(parents=True, exist_ok=True)
             cache.write_text(json.dumps({"at": time.time(), "payloads": payloads}))
@@ -340,7 +353,13 @@ QUOTA_PROVIDER: dict[str, str] = {"claude": "claude", "codex": "codex", "kimi": 
 
 
 def quota_provider(arm: str, pools: dict[str, Pool] | None = None) -> str | None:
-    """The quotamax pool an arm spends: its pools.toml ``quota_provider``, else the built-in map."""
+    """The quotamax pool an arm spends: its pools.toml ``quota_provider``, else the built-in map.
+
+    Inside a claude-work session the host arm ``claude`` IS the second account,
+    so it is gated on ``claude-work`` rather than on the host account it never spends.
+    """
+    if arm == VETO_TARGET and in_claude_work_session():
+        return "claude-work"
     pool = (pools or {}).get(arm)
     if pool is not None and pool.quota_provider is not None:
         return pool.quota_provider or None

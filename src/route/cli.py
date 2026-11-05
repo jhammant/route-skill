@@ -418,9 +418,11 @@ def _dispatch(template: str | list[str], task: str, *, target: str | None = None
             argv.append(task)
     started = time.monotonic()
     try:
-        # A delegated agent must see itself as host if it invokes route again.
+        # A delegated agent must see itself as host if it invokes route again,
+        # and know it is a worker so it never fans out or prompts on its own.
         child_env = dict(os.environ)
         child_env.update(env or {})
+        child_env["ROUTE_WORKER"] = "1"
         if target in ("claude", "codex"):
             child_env["ROUTE_HOST"] = target
         kwargs = {"input": task, "text": True} if stdin else {}

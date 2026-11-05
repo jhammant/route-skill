@@ -55,6 +55,7 @@ class Priors:
         # fallback rather than dropping to Beta(unfavoured).
         self.rules: dict[str, tuple[str, ...]] = {}
         self.explicit: dict[str, dict[str, tuple[float, float]]] = {}
+        self.aliases: dict[str, str] = {}
         for key, rule in (data.get("rules") or {}).items():
             key = str(key)
             if isinstance(rule, dict):
@@ -78,10 +79,27 @@ class Priors:
 
     def prior(self, shape: str, tier: str | None, arm: str) -> tuple[float, float]:
         """Beta(a, b) an arm starts from in a cell."""
+        named = self._rule_prior(shape, tier, arm)
+        if named is not None:
+            return named
+        # One hop only: an alias borrows what the rules say about another arm,
+        # never that arm's own alias, so a cycle in pools.toml cannot loop.
+        like = self.aliases.get(arm)
+        borrowed = self._rule_prior(shape, tier, like) if like else None
+        return borrowed if borrowed is not None else tuple(self.unfavoured)
+
+    def _rule_prior(self, shape: str, tier: str | None, arm: str) -> tuple[float, float] | None:
         key = self._key(shape, tier)
         if key and arm in self.explicit.get(key, {}):
             return self.explicit[key][arm]
-        return tuple(self.favoured) if arm in self.favoured_arms(shape, tier) else tuple(self.unfavoured)
+        if arm in self.favoured_arms(shape, tier):
+            return tuple(self.favoured)
+        return None
+
+    def with_aliases(self, aliases: dict[str, str]) -> "Priors":
+        """Arms the rules don't name take another arm's priors (pools.toml ``prior_like``)."""
+        self.aliases = {arm: like for arm, like in aliases.items() if like and like != arm}
+        return self
 
 
 def load_priors(path: str | Path | None = None) -> Priors:

@@ -113,6 +113,33 @@ selected arm. Raw task text never persists in task memory. Federation exports
 shapes, model identities and counts, never task text, hashes, file paths or
 repo names. `route federate export` previews that payload and shares nothing.
 
+## A second Claude subscription, and handoff context
+
+`claude-work` pools (`claude-work`, `claude-work-fable`, `claude-work-sonnet`)
+are headless Claude Code workers on a second subscription. They dispatch
+through `bin/claude-work`, which hands that account's token (stored by
+`claude-work login`) to `claude` for that process only; the main login is
+untouched. Workers start with no MCP servers. quotamax reports the account as
+the `claude-work` pool and its Fable week as `claude-work:Fable`, so a spent
+Fable week removes only the Fable arm. `claude-work-fable` starts unfavoured:
+pin it with `--pool claude-work-fable` for hard units. Config:
+`examples/claude-work-pools.toml`.
+
+`--context` sets what a delegate gets beyond the task text:
+
+- `brief` (default): nothing. Write the scope and the acceptance check into the task.
+- `digest`: this conversation minus tool output (usually 2-10% of it, mid-turn
+  messages included), written owner-only under the state dir and named at the
+  top of the task. Works for every arm. It carries the conversation's text, so
+  pass `--sensitive` when the conversation held private data.
+- `fork`: the whole session via `--resume <id> --fork-session`, Claude Code
+  arms only (others get a digest). Cheap only on the same account and model:
+  the prompt cache is scoped to both, so a fork to `claude-work` bills every
+  token of the session uncached. Use it when the reasoning trail matters.
+
+The session defaults to `CLAUDE_CODE_SESSION_ID` (this one); `--session` picks
+another. `route digest` prints a digest for handing to anything by hand.
+
 ## Swarms
 
 If the plan's `swarm.suggested` is true, or you can see the task splits into

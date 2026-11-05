@@ -1,0 +1,127 @@
+#!/bin/bash
+# claude-work: Claude Code on the second (work) subscription, for this process
+# only. The account's `claude setup-token` token lives in the macOS Keychain and
+# reaches claude through CLAUDE_CODE_OAUTH_TOKEN, so your main login and every
+# other session are untouched. Transcripts land in the usual ~/.claude, which is
+# what lets a worker fork a session (`--resume <id> --fork-session`).
+#
+#   claude-work login [--browser APP | --chrome-profile DIR]
+#                         mint a token and store it (run in a normal terminal tab). By default no
+#                         browser opens: the sign-in URL is printed for you to open wherever the
+#                         work account is signed in, so your main browser profile is never touched.
+#   claude-work status    is a token stored, and how much of the work quota is used?
+#   claude-work logout    delete the stored token
+#   claude-work <args>    anything else runs `claude <args>` on the work account
+set -euo pipefail
+
+SERVICE="${CLAUDE_WORK_KEYCHAIN:-claude-work-oauth}"
+QUOTAMAX="${QUOTAMAX:-quotamax}"
+
+stored_token() { security find-generic-password -s "$SERVICE" -w 2>/dev/null; }
+main_login_fingerprint() {
+  security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null | shasum -a 256 | cut -c1-16
+}
+
+# write_opener PATH APP PROFILE: a $BROWSER script that opens its URL in a Chrome
+# profile, in a named app, or (both empty) only prints it.
+write_opener() {
+  {
+    echo '#!/bin/bash'
+    if [ -n "$3" ]; then
+      printf 'open -na "Google Chrome" --args --profile-directory=%q "$1"\n' "$3"
+    elif [ -n "$2" ]; then
+      printf 'open -a %q "$1"\n' "$2"
+    else
+      echo 'printf "\n  Sign-in URL (open it where the work account is signed in):\n  %s\n\n" "$1"'
+    fi
+  } > "$1"
+  chmod +x "$1"
+}
+
+login() {
+  if [ ! -t 0 ]; then
+    echo "claude-work login needs a real terminal (it opens a browser and asks you to paste)." >&2
+    exit 2
+  fi
+  local app="" profile=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --browser) app="${2:?--browser needs an app name, e.g. Firefox}"; shift 2 ;;
+      --chrome-profile) profile="${2:?--chrome-profile needs a profile directory, e.g. Profile 2}"; shift 2 ;;
+      *) echo "claude-work login: unknown option $1" >&2; exit 2 ;;
+    esac
+  done
+  cat <<'EOF'
+claude-work login
+  1. Open the sign-in URL printed below in the browser where claude.ai is signed in as the
+     WORK account (or a private window: sign in as work there, approve, close it).
+     Check the page names the work account before you approve.
+  2. When it finishes, copy the token it prints (it starts with sk-ant-oat).
+  3. Paste it at the hidden prompt that follows. It goes straight into the Keychain,
+     never to a file or your shell history.
+
+EOF
+  # A throwaway config dir gives this login its own Keychain item name
+  # ("Claude Code-credentials-<hash of the dir>"), so your main login cannot change.
+  local before tmp hash
+  before="$(main_login_fingerprint)"
+  tmp="$(mktemp -d)"
+  hash="$(printf %s "$tmp" | shasum -a 256 | cut -c1-8)"
+  # Claude Code opens URLs with $BROWSER. Point it at a tiny opener so the sign-in
+  # page goes to the work browser/profile, or nowhere (just printed) by default.
+  write_opener "$tmp/open-url" "$app" "$profile"
+  BROWSER="$tmp/open-url" CLAUDE_CONFIG_DIR="$tmp" claude setup-token || true
+  security delete-generic-password -s "Claude Code-credentials-$hash" >/dev/null 2>&1 || true
+  rm -rf "$tmp"
+
+  echo
+  echo "Paste the token at the prompt below, twice (input is hidden):"
+  security add-generic-password -U -s "$SERVICE" -a "$USER" \
+    -l "Claude Code work account (setup-token)" -w
+  case "$(stored_token)" in
+    sk-ant-oat*) echo "Stored in the Keychain as \"$SERVICE\"." ;;
+    *)
+      security delete-generic-password -s "$SERVICE" >/dev/null 2>&1 || true
+      echo "That didn't look like a setup-token token (they start with sk-ant-oat). Nothing kept; run claude-work login again." >&2
+      exit 1 ;;
+  esac
+  if [ "$before" != "$(main_login_fingerprint)" ]; then
+    echo "WARNING: your main Claude Code login changed during this. Run /login in a normal claude session to restore it." >&2
+  fi
+  echo
+  status
+}
+
+status() {
+  if ! stored_token >/dev/null; then
+    echo "claude-work: no token stored. Run: claude-work login"
+    return 1
+  fi
+  echo "claude-work: token stored (Keychain \"$SERVICE\"). Taking a fresh quota reading..."
+  "$QUOTAMAX" probe claude-work
+  echo
+  echo "main account, for comparison (a different account shows different numbers and reset times):"
+  "$QUOTAMAX" agent --json 2>/dev/null | python3 -I -c '
+import json, sys
+d = json.load(sys.stdin)
+w = d.get("weekly") or {}
+print(f"  weekly: {w.get(\"percentUsed\")}% used, resets in {round((w.get(\"resetsInMinutes\") or 0) / 1440, 1)}d")
+' || true
+}
+
+case "${1:-}" in
+  login) shift; login "$@" ;;
+  status) status ;;
+  logout)
+    security delete-generic-password -s "$SERVICE" >/dev/null 2>&1 && echo "claude-work: token deleted." || echo "claude-work: no token stored." ;;
+  *)
+    if ! TOKEN="$(stored_token)"; then
+      echo "claude-work: no token stored. Run: claude-work login" >&2
+      exit 1
+    fi
+    # Credentials that outrank an OAuth token would silently pick another account.
+    unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
+    export CLAUDE_CODE_OAUTH_TOKEN="$TOKEN"
+    export CLAUDE_WORK_ACCOUNT=1
+    exec claude "$@" ;;
+esac

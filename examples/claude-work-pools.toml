@@ -1,0 +1,54 @@
+# A second Claude subscription as worker pools. Copy to ~/.config/route/pools.toml
+# (replace HOME with your home directory) after `claude-work login` has stored a token.
+#
+# Every arm dispatches through bin/claude-work, which runs `claude` with that
+# account's token for that process only. Workers start with no MCP servers
+# (worker-mcp.json is {"mcpServers": {}}); without that each one would start
+# every server in your config. Swarm members still get their a-mail server.
+# --mcp-config takes several values, so an option must follow it, never {task}.
+#
+# quota_provider = "claude-work" is the pool quotamax reports for this account;
+# quota_scope gates the Fable arm on the Fable week as well; prior_like starts
+# an arm where another arm's rule-table priors are, and evidence moves it on.
+
+[pools.claude-work]
+shapes = ["coding:implement", "coding:refactor", "coding:debug", "coding:review", "research", "writing"]
+remote = true
+cost = "included"
+strength = 6
+dispatch = "HOME/.local/bin/claude-work --strict-mcp-config --mcp-config HOME/.config/route/worker-mcp.json --print --permission-mode auto --model claude-opus-5-5 {task}"
+model = { name = "claude-opus-5-5" }
+parallel_limit = 4
+quota_provider = "claude-work"
+prior_like = "claude"
+claude_cli = true
+
+# Fable costs 2.5x Opus per token and has its own weekly cap, so it starts
+# unfavoured: reach it with `--pool claude-work-fable` for the hard units, or
+# let the bandit find where it pays off.
+[pools.claude-work-fable]
+shapes = ["coding:implement", "coding:refactor", "coding:debug", "research"]
+remote = true
+cost = "included"
+strength = 7
+dispatch = "HOME/.local/bin/claude-work --strict-mcp-config --mcp-config HOME/.config/route/worker-mcp.json --print --permission-mode auto --model claude-fable-5-1 {task}"
+model = { name = "claude-fable-5-1" }
+parallel_limit = 2
+quota_provider = "claude-work"
+quota_scope = "Fable"
+claude_cli = true
+
+# Mechanical work (tests, reviews, summaries) on Sonnet, starting where Kimi
+# does in the rule table. Batch prompts travel on stdin.
+[pools.claude-work-sonnet]
+shapes = ["coding:test", "coding:review", "batch:summarize", "batch:extract", "writing"]
+remote = true
+cost = "included"
+strength = 5
+dispatch = "HOME/.local/bin/claude-work --strict-mcp-config --mcp-config HOME/.config/route/worker-mcp.json --print --permission-mode auto --model claude-sonnet-5-5 {task}"
+batch_dispatch = "HOME/.local/bin/claude-work --strict-mcp-config --mcp-config HOME/.config/route/worker-mcp.json --print --model claude-sonnet-5-5"
+model = { name = "claude-sonnet-5-5" }
+parallel_limit = 4
+quota_provider = "claude-work"
+prior_like = "kimi"
+claude_cli = true

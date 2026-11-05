@@ -254,6 +254,41 @@ and append `+surplus:<arm>` or `-pressure:<arm>` to `why` for the chosen arm.
 `surplus_bonus` remains a **deprecated alias with the same signed values** for
 one release. Adjustments affect selection only, never learned counts.
 
+## A second Claude subscription as worker pools
+
+If you have a second Claude subscription (a work seat, say), its quota can run
+headless workers while your own session stays on your account.
+
+```bash
+claude-work login      # mint a setup-token for that account; stored in the Keychain
+claude-work status     # fresh quota reading for it, next to your main account's
+route "write the tests for src/parse.py" --pool claude-work-sonnet
+route "fix the flaky retry" --context digest     # the worker gets this conversation, minus tool output
+```
+
+`bin/claude-work` passes the token to `claude` through `CLAUDE_CODE_OAUTH_TOKEN`
+for that process only, so the main login never changes. It shares `~/.claude`,
+which is what lets a worker fork a session.
+
+A setup-token has the `user:inference` scope only, which the usage endpoint
+refuses. quotamax instead reads the account from the `rate_limit_event` that a
+~500-token Haiku probe reports (detached, at most every ten minutes). The
+account is the `claude-work` pool; its Fable week is the separate key
+`claude-work:Fable`, so a spent Fable week removes `claude-work-fable` and
+leaves the other arms. `examples/claude-work-pools.toml` defines three arms
+(Opus, Fable, Sonnet) with `quota_provider`, `quota_scope`, `prior_like` and
+`claude_cli`. Workers start with no MCP servers; swarm members still get
+their a-mail server.
+
+### Handoff context: brief, digest, fork
+
+Across twelve large real sessions, tool output was 91.7% of the transcript and
+what was actually said was 2.4%. So `--context digest` hands a delegate the
+conversation and one line per tool call, and drops the output: the worker
+knows what was decided and re-reads current files itself. `--context fork`
+resumes the whole session, for Claude Code arms only; it is cheap only on the
+same account and model, because the prompt cache is scoped to both.
+
 ## Swarms: cross-model, and they talk
 
 When work splits into independent pieces, give each piece its own acceptance

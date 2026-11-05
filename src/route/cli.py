@@ -13,6 +13,7 @@ import argparse
 import json
 import os
 import shlex
+import signal
 import subprocess
 import sys
 import time
@@ -401,6 +402,15 @@ def with_network(template: str) -> str:
     return template.replace("codex exec", f"codex exec {CODEX_NETWORK}", 1)
 
 
+def _kill_delegate(proc: subprocess.Popen) -> None:
+    """Kill a tracked delegate with everything it spawned: it leads its own session."""
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except OSError:
+        pass  # Not a leader after all, or already gone: the leader itself still gets killed.
+    proc.kill()
+
+
 def _dispatch(template: str | list[str], task: str, *, target: str | None = None,
               stdin: bool = False, cwd: str | Path | None = None,
               env: dict[str, str] | None = None, log: str | Path | None = None,
@@ -439,14 +449,17 @@ def _dispatch(template: str | list[str], task: str, *, target: str | None = None
             else:
                 input_text = kwargs.pop("input", None)
                 wait_timeout = kwargs.pop("timeout", None)
-                if stdin:
-                    kwargs["stdin"] = subprocess.PIPE
-                with subprocess.Popen(argv, env=child_env, **kwargs) as proc:
+                # A tracked delegate is headless: it leads its own session so a
+                # cancel can stop it with every shell and test runner it spawned
+                # (killpg), without reaching the user's shell, and it never waits
+                # on the terminal.
+                kwargs["stdin"] = subprocess.PIPE if stdin else subprocess.DEVNULL
+                with subprocess.Popen(argv, env=child_env, start_new_session=True, **kwargs) as proc:
                     try:
                         on_start(proc.pid)
                         proc.communicate(input=input_text, timeout=wait_timeout)
                     except BaseException:
-                        proc.kill()
+                        _kill_delegate(proc)
                         proc.communicate()
                         raise
     except subprocess.TimeoutExpired:
@@ -492,8 +505,11 @@ def cmd_outcome(args: argparse.Namespace) -> int:
         previous = decision.get("final_score") if decision else None
         if previous is None:
             previous = 1.0 if "accepted" in already else 0.0
+        # A swarm records its units as one trial; regrading one unit moves that
+        # trial by the unit's share of it (--weight), never by a whole reward.
+        weight = getattr(args, "weight", 1.0)
         record_score(router, shape, tier, arm, score, previous_score=previous,
-                     impression_recorded=_has_trial(decision))
+                     impression_recorded=_has_trial(decision), weight=weight)
         events = ["graded"]
         if args.abandoned:
             events.append("failed")
@@ -501,7 +517,7 @@ def cmd_outcome(args: argparse.Namespace) -> int:
             # Merge is acceptance metadata; its reward is already in score.
             for event in OUTCOME_EVENTS["accepted"]:
                 if event not in already and event != "accepted":
-                    router.reward(shape, tier, arm, event)
+                    router.reward(shape, tier, arm, event, by=weight)
             events.extend(OUTCOME_EVENTS["accepted"])
         if decision:
             stats.annotate(decision_id, events=events, final_score=score, impression_recorded=True,
@@ -811,6 +827,7 @@ def _parser(prog: str) -> argparse.ArgumentParser:
     state.add_argument("--abandoned", "--rewritten", action="store_true", help="abandoned or rewritten: score 0")
     # route ultra grades the units of the swarm it ran; hidden because nothing else should.
     settle.add_argument("--within-swarm", dest="within_swarm", default=None, help=argparse.SUPPRESS)
+    settle.add_argument("--weight", type=_weight_arg, default=1.0, help=argparse.SUPPRESS)
     settle.set_defaults(func=cmd_outcome, shape=None, tier=None, arm=None, score=None, outcome=None)
 
     u = sub.add_parser("ultra", help="plan, build, review, fix and integrate a goal on the best models with quota")
@@ -916,6 +933,17 @@ def _score_arg(text: str) -> float:
         return validate_score(float(text))
     except ValueError as exc:
         raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
+def _weight_arg(text: str) -> float:
+    """A unit's share of its swarm's aggregate trial: in (0, 1]."""
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError("weight must be a number") from None
+    if not 0 < value <= 1:
+        raise argparse.ArgumentTypeError("weight must be in (0, 1]")
+    return value
 
 
 def _fix_passes_arg(text: str) -> int:

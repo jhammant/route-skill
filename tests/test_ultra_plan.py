@@ -179,6 +179,7 @@ def test_manifest_pins_each_unit_to_its_arm_and_drops_held_units():
     manifest = to_manifest(plan, repo="/repo", base="abc", swarm_id="run-1",
                            arms={"alpha": "claude-work", "beta": "codex"})
     assert manifest == {"name": "Build", "repo": "/repo", "base": "abc", "shared": "S", "swarm_id": "run-1",
+                        "safe_checks": True,
                         "units": [
                             {"id": "alpha", "task": "A", "check": "pytest -q tests/a.py", "pool": "claude-work",
                              "shape": "coding:implement", "tier": "hard"},

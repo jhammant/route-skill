@@ -291,6 +291,37 @@ knows what was decided and re-reads current files itself. `--context fork`
 resumes the whole session, for Claude Code arms only; it is cheap only on the
 same account and model, because the prompt cache is scoped to both.
 
+## /ultra: your own ultracode
+
+Give it a goal and a check for the whole goal; it does the rest without asking.
+
+```bash
+route ultra "Add rate limiting to src/api/, stdlib only. Goal check: pytest -q tests/api" --json
+```
+
+1. A top model plans the goal into independent units, each with its own check.
+2. The units run as a swarm (below) on the best models in whichever pools have
+   quota: Fable, Opus, the second Claude account, Codex, and your own account
+   when it has headroom. Sonnet and Kimi join only with `--allow-lower-models`,
+   and only when nothing better has quota.
+3. A model from a different family reviews each non-trivial accepted unit. A
+   finding counts only when its repro command shows the bug, and each unit
+   gets at most two fix passes.
+4. Accepted branches merge onto `ultra/<run-id>` and the goal check runs there.
+5. Outcomes are settled for the router, and `summary.md` names the branch, the
+   units that passed, the bugs the reviews confirmed, the quota spent per pool
+   and the merge command.
+
+It never merges into your base branch or main, and never pushes. Checks run
+without a shell, and only test runners are allowed in them. `--plan-only`
+shows the plan, `--context digest` hands the workers this conversation, and
+`route ultra status` and `route ultra cancel <run-id>` watch and stop a run.
+Each run's state lives in `ROUTE_STATE_DIR/ultra/<run-id>/`. Exit 0 means the
+goal check passed, 1 that a unit or the goal check failed, and 2 that it could
+not plan or no usable model had quota. `ultra` is the same command. For
+`/ultra` in Claude Code, link the skill:
+`ln -s "$PWD/skill-ultra" "$HOME/.claude/skills/ultra"`.
+
 ## Swarms: cross-model, and they talk
 
 When work splits into independent pieces, give each piece its own acceptance

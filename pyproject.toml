@@ -22,6 +22,7 @@ dev = ["pytest"]
 [project.scripts]
 route = "route.cli:main"
 auto = "route.cli:main_auto"
+ultra = "route.cli:main_ultra"
 
 [tool.hatch.metadata]
 allow-direct-references = true

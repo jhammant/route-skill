@@ -30,20 +30,34 @@ from .swarm_channel import Channel, ChannelError, HubPoller, Worker, amail_binar
 from .swarm_status import SwarmStatus, utc_now
 
 UNIT_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
+#: A caller-chosen run ID (``route ultra`` names its swarm after the run). Path-safe by
+#: construction: one lowercase segment, no dots, no separators.
+SWARM_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,80}$")
 
 
 def _git(repo: Path, *args: str):
     return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True)
 
 
-def load_manifest(source: str) -> dict:
-    try:
-        manifest = (json.load(sys.stdin) if source == "-" else
-                    json.loads(Path(source).read_text(encoding="utf-8")))
-    except (OSError, ValueError) as exc:
-        raise ValueError(f"cannot read swarm manifest: {exc}") from None
+def load_manifest(source: str | Path | dict) -> dict:
+    """Validate a manifest from a path, ``-`` (stdin) or an in-memory dict.
+
+    A dict is copied, so a programmatic caller keeps its own object unchanged.
+    """
+    if isinstance(source, dict):
+        manifest = dict(source)
+    else:
+        try:
+            manifest = (json.load(sys.stdin) if str(source) == "-" else
+                        json.loads(Path(source).read_text(encoding="utf-8")))
+        except (OSError, ValueError) as exc:
+            raise ValueError(f"cannot read swarm manifest: {exc}") from None
     if not isinstance(manifest, dict):
         raise ValueError("swarm manifest must be a JSON object")
+    preset = manifest.get("swarm_id")
+    if preset is not None and preset != "":
+        if not isinstance(preset, str) or not SWARM_ID.fullmatch(preset):
+            raise ValueError("swarm_id must match [a-z0-9][a-z0-9-]{0,80}")
     name = manifest.get("name")
     if not isinstance(name, str) or not name.strip():
         raise ValueError("swarm name must be non-empty")
@@ -213,9 +227,11 @@ def dispatch_command(assignment: Assignment, worker: Worker | None, directory: P
     if allow_network and assignment.arm == "codex":
         template = cli.with_network(template)
     argv = shlex.split(template)
+    # The worker must know it is one, so it never fans out or prompts on its own.
+    env = {"ROUTE_WORKER": "1"}
     if worker is None:
-        return argv, {}
-    env = worker.environment()
+        return argv, env
+    env.update(worker.environment())
     pool = assignment.ctx.pools.get(assignment.arm)
     claude_cli = assignment.arm == "claude" or bool(pool and pool.claude_cli)
     if assignment.arm == "codex" or claude_cli:
@@ -346,27 +362,35 @@ def _settle(assignments: list[Assignment], results: list[dict], swarm_id: str) -
     return outcomes
 
 
-def run_swarm(args: argparse.Namespace, *, auto: bool) -> int:
-    manifest = load_manifest(args.manifest)
-    manifest["swarm_id"] = f"{manifest['slug']}-{datetime.now(timezone.utc):%Y%m%d%H%M%S}"
-    quota = ({} if args.no_quota else cli.fetch_quota(cache_result=False) if args.plan_only
-             else cli.fetch_quota())
-    assignments, held = assign_units(manifest, args, quota)
-    _print_assignments(assignments, held)
-    if args.plan_only:
-        for a in assignments:
-            print(render_brief(manifest, a, assignments, placeholders=not args.no_amail))
-        return 0
-    if assignments and not auto and not cli._confirm("dispatch this swarm?"):
-        print("not dispatched")
-        return 0
+def swarm_dir(swarm_id: str) -> Path:
+    """Where one swarm's worktrees, briefs, logs, status and summary live."""
+    return (state_dir() / "swarms" / swarm_id).resolve()
+
+
+def _swarm_id(manifest: dict) -> str:
+    """The manifest's preset ID (``route ultra`` names it) or a fresh per-second one."""
+    return manifest.get("swarm_id") or f"{manifest['slug']}-{datetime.now(timezone.utc):%Y%m%d%H%M%S}"
+
+
+def _run_swarm(manifest: dict, args: argparse.Namespace, quota: dict, assignments: list[Assignment],
+               held: list[dict], *, print_summary: bool) -> tuple[dict | None, str, int]:
+    """Dispatch, check, commit and settle every assignment; one implementation for CLI and API.
+
+    Returns ``(summary, final_state, exit_code)``: the summary is None when the run
+    never produced one (setup failure, interrupt), and ``final_state`` is what the
+    live status was closed with. Problems are printed, never raised, so both callers
+    see the same log and only differ in how they report the end state.
+    """
     swarm_id = manifest["swarm_id"]
-    directory = (state_dir() / "swarms" / swarm_id).resolve()
+    directory = swarm_dir(swarm_id)
     channel = poller = None
-    live_status = None
+    live_status = summary = None
     final_state, exit_code = "failed", 1
     try:
-        directory.mkdir(parents=True, mode=0o700)  # Refuse same-second ID collisions.
+        try:
+            directory.mkdir(parents=True, mode=0o700)  # Refuse same-second ID collisions.
+        except FileExistsError:
+            raise RuntimeError(f"swarm {swarm_id} already exists at {directory}") from None
         live_status = SwarmStatus(directory, name=manifest["name"], host=args.host,
             repo=manifest["repo"], route_pid=os.getpid(), held=held, units=[{
                 "id": a.unit["id"], "arm": a.arm, "why": a.plan["why"],
@@ -439,14 +463,9 @@ def run_swarm(args: argparse.Namespace, *, auto: bool) -> int:
                    "channel_log": str(directory / "channel.jsonl") if poller else None,
                    "hub": channel.hub.address if channel else None}
         atomic_write(directory / "summary.json", json.dumps(summary, indent=2))
-        print(json.dumps(summary, indent=2), flush=True)
-        for a, result in zip(assignments, results):
-            if result["accepted"]:
-                continue
-            stronger = STRENGTH_ORDER[STRENGTH_ORDER.index(a.arm) + 1:] if a.arm in STRENGTH_ORDER else ()
-            next_arm = next((arm for arm in stronger if arm in a.plan["eligible"]), None)
-            print(f"swarm: {a.unit['id']}: " + (f"consider {next_arm} next" if next_arm else
-                  "no stronger eligible arm") + " (no automatic retry)")
+        if print_summary:
+            print(json.dumps(summary, indent=2), flush=True)
+            _print_next_arms(assignments, results)
         exit_code = 0 if all(row["accepted"] for row in results) else 1
         final_state = "done" if exit_code == 0 else "failed"
     except KeyboardInterrupt:
@@ -474,11 +493,69 @@ def run_swarm(args: argparse.Namespace, *, auto: bool) -> int:
         finally:
             if live_status:
                 live_status.finish(final_state, exit_code)
+    return summary, final_state, exit_code
+
+
+def _print_next_arms(assignments: list[Assignment], results: list[dict]) -> None:
+    for a, result in zip(assignments, results):
+        if result["accepted"]:
+            continue
+        stronger = STRENGTH_ORDER[STRENGTH_ORDER.index(a.arm) + 1:] if a.arm in STRENGTH_ORDER else ()
+        next_arm = next((arm for arm in stronger if arm in a.plan["eligible"]), None)
+        print(f"swarm: {a.unit['id']}: " + (f"consider {next_arm} next" if next_arm else
+              "no stronger eligible arm") + " (no automatic retry)")
+
+
+def run_swarm(args: argparse.Namespace, *, auto: bool) -> int:
+    manifest = load_manifest(args.manifest)
+    manifest["swarm_id"] = _swarm_id(manifest)
+    quota = ({} if args.no_quota else cli.fetch_quota(cache_result=False) if args.plan_only
+             else cli.fetch_quota())
+    assignments, held = assign_units(manifest, args, quota)
+    _print_assignments(assignments, held)
+    if args.plan_only:
+        for a in assignments:
+            print(render_brief(manifest, a, assignments, placeholders=not args.no_amail))
+        return 0
+    if assignments and not auto and not cli._confirm("dispatch this swarm?"):
+        print("not dispatched")
+        return 0
+    _, _, exit_code = _run_swarm(manifest, args, quota, assignments, held, print_summary=True)
     return exit_code
 
 
+def run_swarm_manifest(manifest: dict | str | Path, *, host: str = "claude", max_parallel: int = 4,
+                       unit_timeout: int = 3600, check_timeout: int = 600, no_amail: bool = False,
+                       no_quota: bool = False, allow_network: bool = False, ttl: int = 120) -> dict:
+    """Run a swarm from code, with no prompt, and hand back what summary.json holds.
+
+    ``route ultra`` drives swarms this way. Anything that stops the run short of a
+    summary is a RuntimeError carrying the printed reason; an interrupt propagates
+    so the caller can stop its own run too.
+    """
+    # The ``route swarm`` flags, with the ones a programmatic caller never types at rest.
+    args = argparse.Namespace(manifest=None, host=host, pool=None, sensitive=False, plan_only=False,
+                              no_quota=no_quota, allow_network=allow_network, no_amail=no_amail, ttl=ttl,
+                              max_parallel=max_parallel, unit_timeout=unit_timeout, check_timeout=check_timeout)
+    try:
+        loaded = load_manifest(manifest)
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from None
+    loaded["swarm_id"] = _swarm_id(loaded)
+    quota = {} if no_quota else cli.fetch_quota()
+    assignments, held = assign_units(loaded, args, quota)
+    _print_assignments(assignments, held)
+    summary, final_state, _ = _run_swarm(loaded, args, quota, assignments, held, print_summary=False)
+    if final_state == "interrupted":
+        raise KeyboardInterrupt
+    if summary is None:
+        raise RuntimeError(f"swarm {loaded['swarm_id']} produced no summary; see "
+                           f"{swarm_dir(loaded['swarm_id']) / 'status.json'}")
+    return summary
+
+
 def swarm_log(swarm_id: str) -> int:
-    if not re.fullmatch(r"[a-z0-9-]{1,32}-[0-9]{14}", swarm_id):
+    if not SWARM_ID.fullmatch(swarm_id):
         raise ValueError("invalid swarm ID")
     path = state_dir() / "swarms" / swarm_id / "channel.jsonl"
     try:

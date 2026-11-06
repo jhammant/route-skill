@@ -1,6 +1,6 @@
 ---
 name: ultra
-description: Run a goal as your own ultracode with `route ultra`. It plans the goal into independent units with checks, builds them in parallel on the best models in whichever pools have quota, has a different model family review each one, fixes confirmed bugs, merges onto an ultra/<run-id> branch and runs a check for the whole goal. It never merges into your branch and never pushes. Use when the user types /ultra, says "ultra this", "run this with ultra" or "my own ultracode", or wants a multi-model build of a goal without approving each step. Also use it for multi-agent research, with `route ultra --research`, when the user says "ultra research", "/ultra --research" or "research this with ultra", or asks for a broad investigation that would otherwise fan out into many agents; it answers read-only on the second account first and writes one cited report.
+description: Run a goal as your own ultracode with `route ultra`. It plans the goal into independent units with checks, builds them in parallel on the best models in whichever pools have quota, has a different model family review each one, fixes confirmed bugs, merges onto an ultra/<run-id> branch and runs a check for the whole goal. It never merges into your branch and never pushes. Use when the user types /ultra, says "ultra this", "run this with ultra" or "my own ultracode", or wants a multi-model build of a goal without approving each step. Also use it for multi-agent research, with `route ultra --research`, when the user says "ultra research", "/ultra --research" or "research this with ultra", or asks for a broad investigation that would otherwise fan out into many agents; it answers read-only on the second account first and writes one cited report. Also use it for analysis teams, with `route ultra --team`, for app reviews, website audits, go-live checks, decisions, due diligence and code audits, when the user says "review my app", "audit this site", "is this ready to go live", "ultra team" or "get a team on this", or wants several expert views on one question; analysts on different models work independently, cross-examine each other's claims and write one report.
 ---
 
 # /ultra — your own ultracode, on the best models with quota
@@ -227,10 +227,135 @@ and `summary.json` sit next to it). Open a part's log,
 4. If `summary.md` has a porcelain warning (`--repo` changed during the run),
    say so and list the paths. The run never reverts them; don't either.
 
+## Teams
+
+`route ultra --team [LAYOUT] "<question>"` puts a question to a team of
+analysts, each with its own role and lens. They work independently and
+read-only on the best arms with quota, every third one on a different model
+family; their findings are merged into claims, verifiers from another family
+try to refute each claim, critic rounds add the angles nobody covered, and a
+synthesizer writes one report. Nothing is built unless you add `--fix`.
+
+Use it when the user wants a review, an audit or a decision looked at from
+several sides, not just answered: that is what the cross-examination is for.
+
+### Choose a layout
+
+| The user's ask | Layout |
+|---|---|
+| a website or landing page | `website-audit` |
+| an iOS or Android app, or its store listing | `app-review` |
+| launching or shipping: "is this ready to go live" | `go-live` |
+| a codebase: bugs, security, quality | `code-audit` |
+| a system design, a rewrite or a migration | `architecture` |
+| a product launch, pricing or positioning | `launch` |
+| "should we ...?" | `decision` |
+| investing in or acquiring a company | `due-diligence` |
+| a broad question that needs sources | `deep-research` |
+| an outage or a production bug | `incident` |
+| a post, article or announcement | `post-review` |
+| none of these | `--team` with no layout: a planner designs the team |
+
+`route ultra teams` (`--json` for the full definitions) lists every layout,
+including the user's own; check it when the user names one you don't know.
+
+### Write the question and the targets
+
+The question is the brief, as in research mode: what to look at, what a good
+answer contains, what to leave out. Then the targets:
+
+- `--url URL` for each page, site or store listing, repeated for several.
+  `website-audit` is about a URL, so always pass one.
+- `--repo PATH` for the source. Analysts can read it, and `--fix` builds on it.
+
+```bash
+ultra --team website-audit --url https://example.com "Audit the marketing site before launch"
+ultra --team go-live --repo . --fix "Is this ready to go live?"
+```
+
+With no layout, the question goes straight after `--team`. That works only
+when the question is not itself a layout name.
+
+### Run it
+
+Exactly like build mode: the Bash tool with `run_in_background` and the
+longest timeout (7200000 ms). Don't poll; you are told when it exits.
+
+```bash
+route ultra --team <layout> "<question>" --url <url> --json
+```
+
+- Intensity is automatic: full, standard or lean, from how much of the second
+  account's week would otherwise go unused. Pass `--thorough` only when the
+  user asks for the most thorough review and `--lean` when they want it cheap.
+  `--team-size N` keeps the layout's first N analysts and `--rounds N` sets the
+  critic rounds (0 for none).
+- `--plan-only` only when the user wants to see the team first.
+- `--context`, `--session`, `--max-parallel N` and `--allow-lower-models` as
+  in research mode.
+
+Analysts run under research mode's rules: no Edit, Write or NotebookEdit,
+Codex read-only, only the MCP servers in `research.toml`, and a porcelain
+warning when `--repo` changed. A Claude analyst still has a shell, so `--repo`
+is not write-protected even without `--fix`. `route ultra status` and
+`route ultra cancel <run-id>` work as in section 3.
+
+| Exit | Meaning |
+|---|---|
+| 0 | Every remote analyst answered and the report was written; with `--fix`, the build also exited 0. |
+| 1 | An analyst failed or was held, or the `--fix` build failed; the report is still written. |
+| 2 | Empty question, unknown layout, no team could be designed, or no usable arm. |
+
+On exit 1, report anyway. On exit 2 for an unknown layout, stderr lists the
+valid names and nothing ran: rerun with the right one. On any other exit 2,
+tell the user why and, when no top model had quota, offer
+`--allow-lower-models`.
+
+### Report back
+
+Read only `summary.md` (`plan.json`, `analysts/<id>.json`, `claims.json` and
+`verdicts.json` sit next to it). Open an analyst's log only when it failed.
+Then tell the user, in this order and in a few lines each:
+
+1. The verdict: the scorecard, GO or NO-GO, release readiness or the
+   recommendation, whatever shape the layout's report has.
+2. The blockers, each with its fix.
+3. The contested points from `## Contested`, with both sides.
+4. The `## For your session` items, answered here: app-review's GUI walkthrough
+   on the simulator, anything that needs the claude.ai connectors or Claude in
+   Chrome. Do them before you reply and say if they change the verdict.
+5. Analysts that failed or were held, with the reason from the `## Run`
+   footer, and the claims under `## Not cross-examined`, which nobody checked.
+
+Keep the citations, resolving each `[analyst-id:S1]` from `## Sources`. A
+"tracker missing" or "tag not firing" finding may only mean this Mac blocks
+trackers at DNS; say so and suggest checking from another network.
+
+### Offer --fix
+
+When the layout supports it (`website-audit`, `app-review`, `go-live`,
+`code-audit`, `incident`), the user has a repo and the report found code
+blockers, offer a rerun with `--repo PATH --fix`. The synthesizer turns the
+code blockers and high-severity findings into a build goal and a goal check
+(which must pass the same lint as build checks), and `route ultra` builds it
+on an `ultra/<run-id>` branch. Report the branch and the merge command from
+`summary.md`, as in section 4. It never merges, never pushes and never
+deploys, and you don't either.
+
+### Custom layouts
+
+Users add their own layouts to `~/.config/route/teams.toml`, in the same shape
+as the built-ins (title, description, targets, fix, report and 3 to 8 analysts
+with id, role, lens, brief, tier and where); the README has an example. A user
+layout with a built-in's name replaces it. If the user keeps asking for the
+same kind of team, offer to write one.
+
 ## When not to use it
 
 - Sequential work, or one small change: use /route or /auto.
 - A question one search answers: answer it here, without `--research`.
+- A question with one right answer and no sides to weigh: `--research`, not
+  `--team`.
 - Private or sensitive data: use `/route --sensitive`.
 - When the user wants to approve dispatch: use /route, or `route swarm`, which
   asks once for the whole swarm.

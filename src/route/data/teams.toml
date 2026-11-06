@@ -79,8 +79,8 @@ Pipe the output through `jq` or python and keep only the fields you need. Never 
 - the top opportunities with their estimated savings: render-blocking-resources, unused-javascript, uses-optimized-images, modern-image-formats, uses-text-compression and uses-long-cache-ttl.
 Scores vary between runs, so run each page three times and report the median run.
 If Lighthouse cannot run (no Chrome, or npx fails), fall back to the PageSpeed Insights API:
-`curl -s 'https://www.googleapis.com/pagespeedonline/v5/runPagespeed?url=<url>&strategy=mobile'`
-URL-encode <url>, and append `&category=ACCESSIBILITY&category=BEST_PRACTICES&category=SEO`, because by default it returns performance only. Its lighthouseResult has the same audits. Its loadingExperience and originLoadingExperience hold real-user (CrUX) field data when the site has enough traffic.
+`curl -s 'https://www.googleapis.com/pagespeedonline/v5/runPagespeed?url=<url>&strategy=mobile&category=PERFORMANCE&category=ACCESSIBILITY&category=BEST_PRACTICES&category=SEO'`
+URL-encode <url>. Keep all four category parameters, PERFORMANCE included: with no category the API returns performance only, but once any category is named it returns only the ones named. Its lighthouseResult has the same audits. Its loadingExperience and originLoadingExperience hold real-user (CrUX) field data when the site has enough traffic.
 Report the Core Web Vitals in numbers against Google's thresholds: LCP is good at 2.5 s or less, INP at 200 ms or less, and CLS at 0.1 or less. INP exists only in field data (INTERACTION_TO_NEXT_PAINT in loadingExperience). A lab run has no INP, so give TBT as its proxy, and label which numbers are lab and which are field.
 The fix: the specific resource (its URL and size) and what to do with it.
 '''
@@ -331,7 +331,7 @@ where = "remote"
 brief = '''
 Scan --repo for crash and hang risks. Rank them by how likely they are to fire, times how many users reach that code. Launch and core-flow paths come first.
 - Swift:
-  - force unwraps and forced casts: `grep -rnE 'try!|as! |fatalError\(|[A-Za-z0-9_)\]]!([.,)\] ]|$)' --include=*.swift <repo>`, and implicitly unwrapped `var ...: Type!`.
+  - force unwraps and forced casts: `grep -rnE 'try!|as! |fatalError\(|[]A-Za-z0-9_)]!([].,)[ ]|$)' --include=*.swift <repo>`, and implicitly unwrapped `var ...: Type!`.
   - main-thread work: `DispatchQueue.main.sync`, `Data(contentsOf:` or `String(contentsOf:` on the main thread, heavy work in `body`, `viewDidLoad` or `init`, and JSON decoding or image resizing on the main actor.
   - leaks: unbounded `Timer`s or observers, and closures in long-lived objects that capture self strongly (retain cycles).
 - Kotlin or Java: `!!`, `runBlocking` on the main thread, network or disk on the main thread, `lateinit` used before init, and leaked Activity contexts.
@@ -491,8 +491,8 @@ brief = '''
 Find secrets committed to the repo (including its history) or shipped to the client. Report each one as file:line, or commit:file:line, with its KIND (for example "Stripe live secret key" or "AWS access key ID"). NEVER report, print, copy or save the secret value itself, not even partly masked. Keep values out of your own command output too: print locations only.
 - If gitleaks is installed, run `gitleaks git --redact --no-banner <repo>`. Older versions use `gitleaks detect --redact --source <repo>`. --redact keeps the values out of the output.
 - Otherwise, grep, and print only locations:
-  - working tree: `git -C <repo> grep -nIE '<pattern>' | cut -d: -f1,2`.
-  - history: list the commits that ever added or removed a match with `git -C <repo> log --all --format=%H -G'<pattern>'`. For each one, run `git -C <repo> grep -nIE '<pattern>' <commit> | cut -d: -f1-3`. If that commit deleted the match, use `git -C <repo> show --stat <commit>` to find the file.
+  - working tree: `git -C <repo> grep -nIE -e '<pattern>' | cut -d: -f1,2`.
+  - history: list the commits that ever added or removed a match with `git -C <repo> log --all --format=%H -G'<pattern>'`. For each one, run `git -C <repo> grep -nIE -e '<pattern>' <commit> | cut -d: -f1-3`. Keep the -e: without it, a pattern that starts with - (such as the private-key one) is read as an option, and the grep fails with no locations. If that commit deleted the match, use `git -C <repo> show --stat <commit>` to find the file.
 - Patterns, with the kind each one finds:
   - `AKIA[0-9A-Z]{16}`: AWS access key ID.
   - `(sk|rk)_live_[0-9A-Za-z]{20,}`: Stripe live secret or restricted key.

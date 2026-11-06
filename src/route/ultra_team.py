@@ -42,10 +42,16 @@ from .ultra_research import (
     READ_ONLY_RULES,
     REPORT_BEGIN,
     REPORT_END,
+    WHERE_RULES,
+    SourceIds,
+    agent_cwd,
     dispatch,
+    dispatch_checked,
     git_porcelain,
     quota_table,
+    renames_text,
     research_mcp_config,
+    source_renames,
     sources_section,
     stop_parts,
     supported,
@@ -146,7 +152,17 @@ class Intensity:
     verifiers: int
     rounds: int
     max_claims: int
+    #: The reason alone, without the name: ``label`` is the one place that joins them.
     why: str
+
+    @property
+    def label(self) -> str:
+        """``full (87% of the week's quota is spare: 8% used, 59% elapsed)``: printed once, everywhere."""
+        return f"{self.name} ({self.why})"
+
+    def to_dict(self) -> dict:
+        return {"name": self.name, "team_size": self.team_size, "verifiers": self.verifiers, "rounds": self.rounds,
+                "max_claims": self.max_claims, "why": self.why, "label": self.label}
 
 
 @dataclass
@@ -169,16 +185,21 @@ class Analysis:
     summary: str
     findings: list[Finding] = field(default_factory=list)
     gaps: list[str] = field(default_factory=list)
+    #: ``{"finding": "F2", "from": "S1", "to": "S3", "ref": ...}`` per source id the parser had to rename.
+    renamed: list[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:
-        return {"summary": self.summary, "findings": [f.to_dict() for f in self.findings], "gaps": list(self.gaps)}
+        return {"summary": self.summary, "findings": [f.to_dict() for f in self.findings], "gaps": list(self.gaps),
+                "renamed": list(self.renamed)}
 
     @property
     def sources(self) -> list[dict]:
         """Every source any finding cites, in order, one entry per id.
 
-        ``parse_analysis`` rejects an id reused for a different ref, so one
-        id is one reference here and ``[analyst:S1]`` resolves to it alone.
+        ``parse_analysis`` renames an id reused for a different ref (see
+        ``renamed``), so one id is one reference here and ``[analyst:S1]``
+        resolves to it alone; the same ref cited twice under one id is one
+        entry.
         """
         seen: dict[str, dict] = {}
         for finding in self.findings:
@@ -347,26 +368,26 @@ def team_intensity(window: dict | None, headroom: str | None, override: str | No
     bonus is. An override always wins; constrained headroom always leans.
     """
     if override in ("full", "lean"):
-        return _intensity(override, f"{override}: requested (--{'thorough' if override == 'full' else 'lean'})")
+        return _intensity(override, f"requested (--{'thorough' if override == 'full' else 'lean'})")
     if override not in (None, "", "standard"):
         raise ValueError(f"unknown intensity: {override!r}")
     if headroom in ("low", "constrained", "critical"):
-        return _intensity("lean", f"lean: headroom is {headroom}")
+        return _intensity("lean", f"headroom is {headroom}")
     window = window or {}
     used, resets = window.get("percentUsed"), window.get("resetsInMinutes")
     if not (_finite(used) and _finite(resets)):
-        return _intensity("standard", "standard: no weekly window to pace against")
+        return _intensity("standard", "no weekly window to pace against")
     elapsed = WEEK_MINUTES - resets
     if elapsed <= 0:
-        return _intensity("standard", "standard: the weekly window has just reset")
+        return _intensity("standard", "the weekly window has just reset")
     spare = max(0.0, min(1.0, 1 - (used / 100) / (elapsed / WEEK_MINUTES)))
-    percent = (f"{spare * 100:.0f}% of the week's quota is spare ({used:.0f}% used, "
-               f"{elapsed / WEEK_MINUTES:.0%} elapsed)")
+    percent = (f"{spare * 100:.0f}% of the week's quota is spare: {used:.0f}% used, "
+               f"{elapsed / WEEK_MINUTES:.0%} elapsed")
     if spare >= 0.5:
-        return _intensity("full", f"full: {percent}")
+        return _intensity("full", percent)
     if spare >= 0.15:
-        return _intensity("standard", f"standard: {percent}")
-    return _intensity("lean", f"lean: {percent}")
+        return _intensity("standard", percent)
+    return _intensity("lean", percent)
 
 
 # -- arms ------------------------------------------------------------------------
@@ -513,10 +534,9 @@ def team_prompt(question: str, *, team_size: int, targets: str, context_note: st
 Design a team of {MIN_ANALYSTS} to {team_size} analysts who each look at the question from ONE angle, in
 priority order (the most important first: a smaller budget keeps the first ones). Each analyst runs
 alone in the background with web search and fetch, a shell, {_mcp_note(list(mcp_names))}, and read
-access to the targets. An analyst that needs claude.ai connectors (Gmail, Calendar, Drive), Claude in
-Chrome, a GUI walkthrough, or this Mac CANNOT run in the background: give it "where": "session" so the
-user's own session does it afterwards. Mark "tier": "hard" only for the analyst that needs the
-strongest model.
+access to the targets. {WHERE_RULES}
+An analyst that needs one of those gets "where": "session" so the user's own session does it
+afterwards. Mark "tier": "hard" only for the analyst that needs the strongest model.
 
 Each analyst: {ANALYST_SCHEMA}
 - "id": lowercase letters, digits and hyphens, at most 41 characters, unique.
@@ -648,7 +668,12 @@ def critic_prompt(question: str, analysts: list[Analyst], claims: list[Claim], *
 
 Name the angles the team MISSED that would change the answer: at most {cap} new analysts, each with a
 new unique id, a role, a lens and a complete brief ({ANALYST_SCHEMA}). An empty list means the
-coverage is good enough. Print ONLY this, as the last thing, nothing after it:
+coverage is good enough.
+
+{WHERE_RULES}
+Give an analyst "where": "session" only for one of those needs; everything else is "remote".
+
+Print ONLY this, as the last thing, nothing after it:
 
 {CRITIC_BEGIN}
 {{"missing": []}}
@@ -777,10 +802,11 @@ def parse_analysis(text: str) -> Analysis:
     """The last marked JSON object in an analyst's output, every field present and checked.
 
     Strict on purpose: a finding without its evidence, sources, id or fix
-    (null when there is none) is an incomplete answer, and the run retries
-    it on the next arm rather than filling the gaps in. One source id must
-    name one reference across the whole analysis, or ``[analyst:S1]`` in
-    the report could point at either.
+    (null when there is none) is an incomplete answer, and the run repairs
+    it, then retries it on the next arm, rather than filling the gaps in.
+    One source id must name one reference across the whole analysis, or
+    ``[analyst:S1]`` in the report could point at either; an id reused for
+    a different ref is renamed (``SourceIds``), never a reason to fail.
     """
     raw = _json_block(text, ANALYSIS_BEGIN, ANALYSIS_END, TeamAnalysisError, "analysis")
     for key in ("summary", "findings", "gaps"):
@@ -793,7 +819,8 @@ def parse_analysis(text: str) -> Analysis:
     if not isinstance(findings, list):
         raise TeamAnalysisError("'findings' must be a list")
     rows: list[Finding] = []
-    refs: dict[str, str] = {}
+    ids = SourceIds()
+    renamed: list[dict] = []
     for index, item in enumerate(findings):
         where = f"finding {index}"
         if not isinstance(item, dict):
@@ -819,16 +846,15 @@ def parse_analysis(text: str) -> Analysis:
             raise TeamAnalysisError(f"{where}: 'fix' must be a string or null")
         sources = _sources(item["sources"], where, TeamAnalysisError)
         for src in sources:
-            known = refs.setdefault(src["id"], src["ref"])
-            if known != src["ref"]:
-                raise TeamAnalysisError(f"{where}: source id {src['id']!r} is already used for {known!r}; "
-                                        f"give {src['ref']!r} its own id")
+            change = ids.claim(src)
+            if change is not None:
+                renamed.append({"finding": identity, **change})
         rows.append(Finding(id=identity, claim=claim, evidence=evidence, sources=sources,
                             confidence=item["confidence"], severity=item["severity"], fix=fix or None))
     gaps = raw["gaps"]
     if not isinstance(gaps, list) or not all(isinstance(gap, str) for gap in gaps):
         raise TeamAnalysisError("'gaps' must be a list of strings")
-    return Analysis(summary=summary, findings=rows, gaps=list(gaps))
+    return Analysis(summary=summary, findings=rows, gaps=list(gaps), renamed=renamed)
 
 
 def parse_verdict(text: str) -> dict:
@@ -884,38 +910,42 @@ def parse_fix(text: str) -> tuple[dict | None, str | None]:
 # -- analysts --------------------------------------------------------------------
 
 def _run_analyst(run: ultra.Run, analyst: Analyst, arm: str, pools: dict[str, Pool], quota: dict, host: str,
-                 allow_lower: bool, prompt: str, cwd: Path, mcp_config: Path | None,
+                 allow_lower: bool, prompt: str, repo: Path | None, own_dir: Path, mcp_config: Path | None,
                  cancel: threading.Event | None = None) -> dict:
-    """One analyst on its arm, retried once on the next candidate; what happened, for progress."""
+    """One analyst on its arm, repaired once there, then retried once on the next candidate.
+
+    The working directory is chosen per attempt (``agent_cwd``): Claude in
+    ``repo`` when given, Codex always in ``own_dir``.
+    """
     tried: list[str] = []
     failures: list[str] = []
     while arm is not None and not (cancel is not None and cancel.is_set()):
         tried.append(arm)
         with LOCK:
             run.unit(analyst.id, arm=arm, state="running", attempts=list(tried))
-        log = f"analyst-{analyst.id}.log" if len(tried) == 1 else f"analyst-{analyst.id}-{len(tried)}.log"
-        rc, text = dispatch(run, arm, pools, host, prompt, cwd, log, ANALYST_TIMEOUT, mcp_config)
-        try:
-            if rc == 124:
-                raise TeamAnalysisError("timed out")
-            analysis = parse_analysis(text)
-        except TeamAnalysisError as exc:
+        stem = f"analyst-{analyst.id}" if len(tried) == 1 else f"analyst-{analyst.id}-{len(tried)}"
+        analysis, repaired, why = dispatch_checked(
+            run, arm, pools, host, prompt, agent_cwd(arm, pools, host, repo, own_dir), stem, ANALYST_TIMEOUT,
+            mcp_config, parse=parse_analysis, error=TeamAnalysisError, begin=ANALYSIS_BEGIN, end=ANALYSIS_END,
+            header=f"Analyst id: {analyst.id}", cancel=cancel)
+        if analysis is None:
             if cancel is not None and cancel.is_set():
                 with LOCK:
                     run.unit(analyst.id, arm=arm, state="interrupted", reason="run interrupted", attempts=list(tried))
                 return {"id": analyst.id, "state": "interrupted", "arm": arm, "analysis": None,
                         "reason": "run interrupted", "attempts": tried}
-            failures.append(f"{arm}: {exc}" + (f" (exit {rc})" if rc not in (0, 124) else ""))
+            failures.append(f"{arm}: {why}")
             arm = (worker_arm(pools, quota, tier=analyst.tier, host=host, allow_lower=allow_lower, exclude=set(tried))
                    if len(tried) < 2 else None)
             continue
         atomic_write(run.dir / "analysts" / f"{analyst.id}.json",
-                     json.dumps({**analyst.to_dict(), "arm": arm, "attempts": tried, **analysis.to_dict()},
-                                indent=2) + "\n")
+                     json.dumps({**analyst.to_dict(), "arm": arm, "attempts": tried, "repaired": repaired,
+                                 **analysis.to_dict()}, indent=2) + "\n")
         with LOCK:
             run.unit(analyst.id, arm=arm, state="analysed", reason=None, attempts=list(tried),
-                     findings=len(analysis.findings))
-        return {"id": analyst.id, "state": "analysed", "arm": arm, "analysis": analysis, "attempts": tried}
+                     findings=len(analysis.findings), repaired=repaired)
+        return {"id": analyst.id, "state": "analysed", "arm": arm, "analysis": analysis, "attempts": tried,
+                "repaired": repaired}
     reason = "; ".join(failures) or "no arm"
     with LOCK:
         run.unit(analyst.id, arm=tried[-1] if tried else None, state="failed", reason=reason, attempts=list(tried))
@@ -957,13 +987,10 @@ class _Context:
     def targets(self) -> str:
         return targets_text(self.urls, self.repo)
 
-    def work_dir(self, kind: str, name: str) -> Path:
-        """The repo when given, else an empty directory of the run's own: agents never share scratch."""
-        if self.repo is not None:
-            return self.repo
-        path = self.run.dir / kind / name
-        path.mkdir(parents=True, exist_ok=True)
-        return path
+    def work_dir(self, kind: str, name: str, arm: str) -> Path:
+        """Where ``arm`` runs this step: Codex in an empty directory of the run's own (``kind/name``),
+        a Claude arm in the repo when given, else in that directory too; agents never share scratch."""
+        return agent_cwd(arm, self.pools, self.host, self.repo, self.run.dir / kind / name)
 
     def integrator(self) -> str | None:
         arm = pick("integrator", self.pools, self.quota, host=self.host, allow_lower=self.allow_lower)
@@ -1005,7 +1032,7 @@ def _analyse(ctx: _Context, analysts: list[Analyst], arms: dict[str, str | None]
         prompt = analyst_prompt(ctx.question, analyst, targets=ctx.targets, context_note=ctx.context_note,
                                 mcp_names=ctx.mcp_names)
         jobs.append((analyst.id, (ctx.run, analyst, arm, ctx.pools, ctx.quota, ctx.host, ctx.allow_lower, prompt,
-                                  ctx.work_dir("analysts", analyst.id), ctx.mcp_config)))
+                                  ctx.repo, ctx.run.dir / "analysts" / analyst.id, ctx.mcp_config)))
     ctx.run.step("analysing", f"{len(jobs)} analyst(s), up to {ctx.max_parallel} in parallel")
     return _parallel(ctx, jobs, _run_analyst) if jobs else {}
 
@@ -1074,7 +1101,7 @@ def _examine(ctx: _Context, claims: list[Claim], author_arms: dict[str, str | No
         prompt = verifier_prompt(ctx.question, claim, targets=ctx.targets, mcp_names=ctx.mcp_names)
         for index, (arm, independence) in enumerate(pairs, start=1):
             jobs.append((f"{claim.id}-{index}", (ctx.run, claim, index, arm, independence, ctx.pools, ctx.host, prompt,
-                                                 ctx.work_dir("verify", f"{claim.id}-{index}"), ctx.mcp_config)))
+                                                 ctx.work_dir("verify", f"{claim.id}-{index}", arm), ctx.mcp_config)))
     if jobs:
         ctx.run.step("cross-examining", f"{len(pending)} claim(s), {len(jobs)} verifier run(s)")
         results = _parallel(ctx, jobs, _run_verifier)
@@ -1098,7 +1125,7 @@ def _critic(ctx: _Context, analysts: list[Analyst], claims: list[Claim], round_n
     ctx.run.step("critic", f"round {round_no} by {arm}")
     rc, text = dispatch(ctx.run, arm, ctx.pools, ctx.host, critic_prompt(ctx.question, analysts, surviving,
                                                                         cap=CRITIC_CAP),
-                        ctx.work_dir("critic", f"round-{round_no}"), f"critic-{round_no}.log", CRITIC_TIMEOUT,
+                        ctx.work_dir("critic", f"round-{round_no}", arm), f"critic-{round_no}.log", CRITIC_TIMEOUT,
                         ctx.mcp_config)
     missing = parse_critic(text) if rc != 124 else None
     if missing is None:
@@ -1178,9 +1205,9 @@ def _summary_md(summary: dict, body: str, claims: list[Claim], session: list[Ana
     lines += ["", "## Run", "", f"- Run: {summary['run_id']}",
               f"- Layout: {summary['layout'] or 'planner-designed'}" + (f" ({summary['title']})" if summary.get("title")
                                                                         else ""),
-              f"- Intensity: {intensity.get('name', '-')} (team {intensity.get('team_size')}, "
+              f"- Intensity: {intensity.get('label', '-')}; team {intensity.get('team_size')}, "
               f"{intensity.get('verifiers')} verifier(s) per claim, {intensity.get('rounds')} critic round(s), "
-              f"{intensity.get('max_claims')} claims examined); {intensity.get('why', '')}"]
+              f"{intensity.get('max_claims')} claims examined"]
     team = []
     for row in summary["analysts"]:
         state = row["state"]
@@ -1203,6 +1230,9 @@ def _summary_md(summary: dict, body: str, claims: list[Claim], session: list[Ana
     failed = [f"{row['id']} ({row.get('reason')})" for row in summary["analysts"] if row["state"] == "failed"]
     if failed:
         lines.append("- Failed analysts: " + "; ".join(failed))
+    repaired = [f"{row['id']} ({row.get('arm')})" for row in summary["analysts"] if row.get("repaired")]
+    if repaired:
+        lines.append("- Repaired on the same arm: " + "; ".join(repaired))
     if summary["held"]:
         lines.append("- Held analysts: " + "; ".join(f"{row['id']} ({row['reason']})" for row in summary["held"]))
     mcp = summary["mcp_servers"]
@@ -1216,6 +1246,8 @@ def _summary_md(summary: dict, body: str, claims: list[Claim], session: list[Ana
     if summary["porcelain_changes"]:
         lines += ["- WARNING: the repository changed during the run (git status --porcelain differs; "
                   "ultra never reverts):"] + [f"  - {line}" for line in summary["porcelain_changes"]]
+    if summary.get("source_renames"):
+        lines.append("- Source ids renamed: " + renames_text(summary["source_renames"]))
     if summary["quota"]:
         lines.append("- Quota (percent used, before -> after):")
         for provider, labels in summary["quota"].items():
@@ -1247,7 +1279,7 @@ def _report(ctx: _Context, body: str, claims: list[Claim], analysts: list[Analys
         rows.append({"id": unit_id, "state": state["state"], "arm": state.get("arm"), "where": state.get("where"),
                      "tier": state.get("tier"), "role": analyst.role if analyst else None,
                      "reason": state.get("reason"), "attempts": state.get("attempts", []),
-                     "findings": state.get("findings")})
+                     "findings": state.get("findings"), "repaired": state.get("repaired", False)})
     session = [analyst for analyst in analysts if analyst.where == "session"]
     summary = {
         "run_id": run.id, "question": ctx.question, "mode": "team", "layout": layout.name if layout else None,
@@ -1257,6 +1289,7 @@ def _report(ctx: _Context, body: str, claims: list[Claim], analysts: list[Analys
         "critic_rounds": run.progress.get("critic_rounds", 0), "held": run.progress.get("held", []),
         "plan_problems": run.progress.get("plan_problems", []), "mcp_servers": dict(mcp_info),
         "porcelain_changes": list(porcelain), "quota": quota_table(usage_before, usage_after),
+        "source_renames": source_renames({key: analysis.renamed for key, analysis in analyses.items()}),
         "urls": list(ctx.urls), "repo": str(ctx.repo) if ctx.repo else None, "fix": fix,
         "exit_code": exit_code, "run_dir": str(run.dir), "context": run.progress.get("context"),
         "notes": run.progress.get("notes", []),
@@ -1360,10 +1393,10 @@ def _print_plan(analysts: list[Analyst], arms: dict[str, str | None], held: list
     if json_out:
         print(json.dumps({"layout": layout.name if layout else None, "title": title,
                           "analysts": [a.to_dict() for a in analysts], "arms": arms, "held": held,
-                          "intensity": intensity.__dict__}, indent=2))
+                          "intensity": intensity.to_dict()}, indent=2))
         return
     print(f"team: {title or '(untitled)'} ({len(analysts)} analysts; {layout.name if layout else 'planner-designed'})")
-    print(f"intensity: {intensity.name}: {intensity.why}")
+    print(f"intensity: {intensity.label}")
     print("analyst\twhere\ttier\tarm\trole")
     for analyst in analysts:
         arm = arms.get(analyst.id) or ("-" if analyst.where == "session" else "held")
@@ -1405,8 +1438,9 @@ def _plan_team(ctx: _Context, team_size: int) -> tuple[str, str, list[Analyst], 
         text_prompt = prompt if attempt == 1 else prompt + (
             "\n\n# Problems with your previous team (fix all of them)\n\n"
             + "\n".join(f"- {problem}" for problem in problems) + "\n")
-        rc, text = dispatch(run, planner, ctx.pools, ctx.host, text_prompt, ctx.work_dir("plan", f"attempt-{attempt}"),
-                            f"plan-{attempt}.log", PLANNER_TIMEOUT, ctx.mcp_config)
+        rc, text = dispatch(run, planner, ctx.pools, ctx.host, text_prompt,
+                            ctx.work_dir("plan", f"attempt-{attempt}", planner), f"plan-{attempt}.log",
+                            PLANNER_TIMEOUT, ctx.mcp_config)
         try:
             if rc == 124:
                 raise TeamPlanError("planner timed out")
@@ -1523,7 +1557,7 @@ def _execute(run: ultra.Run, question: str, layout: TeamLayout | None, urls: tup
         intensity = replace(intensity, team_size=max(1, team_size), why=intensity.why + f"; --team-size {team_size}")
     if rounds is not None:
         intensity = replace(intensity, rounds=max(0, rounds), why=intensity.why + f"; --rounds {rounds}")
-    run.progress["intensity"] = dict(intensity.__dict__)
+    run.progress["intensity"] = intensity.to_dict()
     ctx = _Context(run, question, pools, quota, host, allow_lower, repo, urls, context_note, mcp_config,
                    list(mcp_info["loaded"]), max_parallel, intensity)
 
@@ -1551,7 +1585,7 @@ def _execute(run: ultra.Run, question: str, layout: TeamLayout | None, urls: tup
     _assign(ctx, analysts, arms)
     plan = {"layout": layout.name if layout else None, "title": title, "report": report_shape,
             "analysts": [a.to_dict() for a in analysts], "arms": arms, "held": run.progress["held"],
-            "intensity": dict(intensity.__dict__), "urls": list(urls), "repo": str(repo) if repo else None}
+            "intensity": intensity.to_dict(), "urls": list(urls), "repo": str(repo) if repo else None}
     atomic_write(run.dir / "plan.json", json.dumps(plan, indent=2) + "\n")
     if plan_only:
         _print_plan(analysts, arms, run.progress["held"], intensity, title, layout, json_out)
@@ -1620,8 +1654,9 @@ def _execute(run: ultra.Run, question: str, layout: TeamLayout | None, urls: tup
         prompt = synthesis_prompt(question, title=title, report_shape=report_shape, surviving=surviving,
                                   refuted=refuted, unexamined=unexamined, session=session_analysts,
                                   fix_block=want_fix, repo=repo, notes=notes)
-        rc, synthesis_text = dispatch(run, synthesizer, pools, host, prompt, run.dir, "synthesis.log",
-                                      SYNTHESIS_TIMEOUT, mcp_config)
+        rc, synthesis_text = dispatch(run, synthesizer, pools, host, prompt,
+                                      agent_cwd(synthesizer, pools, host, run.dir, run.dir / "synthesis"),
+                                      "synthesis.log", SYNTHESIS_TIMEOUT, mcp_config)
         try:
             body = _marked_block(synthesis_text, REPORT_BEGIN, REPORT_END, TeamReportError) if rc == 0 else None
         except TeamReportError:

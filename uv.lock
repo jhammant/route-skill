@@ -96,6 +96,11 @@ dev = [
     { name = "pytest" },
 ]
 
+[package.dev-dependencies]
+dev = [
+    { name = "pytest" },
+]
+
 [package.metadata]
 requires-dist = [
     { name = "banditry", git = "https://github.com/jhammant/banditry" },
@@ -103,6 +108,9 @@ requires-dist = [
     { name = "tomli", marker = "python_full_version < '3.11'" },
 ]
 provides-extras = ["dev"]
+
+[package.metadata.requires-dev]
+dev = [{ name = "pytest" }]
 
 [[package]]
 name = "tomli"

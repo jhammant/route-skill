@@ -19,6 +19,9 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest"]
 
+[dependency-groups]
+dev = ["pytest"]
+
 [project.scripts]
 route = "route.cli:main"
 auto = "route.cli:main_auto"
@@ -32,3 +35,4 @@ packages = ["src/route"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["src"]

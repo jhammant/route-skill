@@ -575,9 +575,12 @@ where = "remote"
 ```
 
 **Read-only.** Analysts, verifiers and critics run exactly like research
-agents: the same disallowed tools and Codex sandbox, the same `research.toml`
-MCP allowlist, and the same porcelain warning when `--repo` changes during the
-run. Only `--fix` writes, and only on its own branch.
+agents: the same disallowed tools and Codex sandbox and the same `research.toml`
+MCP allowlist. A Claude analyst still has a shell, and a shell can write, so
+`--repo` is not write-protected even without `--fix`: the run compares
+`git status --porcelain` before and after and warns in `summary.md` about any
+working-tree change it sees. It never reverts one. `--fix` is the only step
+meant to write, and it builds on its own branch.
 
 **Tracker checks and DNS.** Analysts fetch from this machine's network. If it
 blocks trackers at DNS (Pi-hole, NextDNS, a router ad-blocker, some VPNs),

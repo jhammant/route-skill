@@ -1,6 +1,6 @@
 ---
 name: ultra
-description: Run a goal as your own ultracode with `route ultra`. It plans the goal into independent units with checks, builds them in parallel on the best models in whichever pools have quota, has a different model family review each one, fixes confirmed bugs, merges onto an ultra/<run-id> branch and runs a check for the whole goal. It never merges into your branch and never pushes. Use when the user types /ultra, says "ultra this", "run this with ultra" or "my own ultracode", or wants a multi-model build of a goal without approving each step. Also use it for multi-agent research, with `route ultra --research`, when the user says "ultra research", "/ultra --research" or "research this with ultra", or asks for a broad investigation that would otherwise fan out into many agents; it answers read-only on the second account first and writes one cited report. Also use it for analysis teams, with `route ultra --team`: app reviews, website audits, go-live checks, decisions, due diligence and code audits, when the user says "review my app", "audit this site", "is this ready to go live", "ultra team" or "get a team on this", or wants several expert views on one question; analysts on different models work independently, cross-examine each other's claims and write one report.
+description: Run a goal as your own ultracode with `route ultra`. It plans the goal into independent units with checks, builds them in parallel on the best models in whichever pools have quota, has a different model family review each one, fixes confirmed bugs, merges onto an ultra/<run-id> branch and runs a check for the whole goal. It never merges into your branch and never pushes. Use when the user types /ultra, says "ultra this", "run this with ultra" or "my own ultracode", or wants a multi-model build of a goal without approving each step. Also use it for multi-agent research, with `route ultra --research`, when the user says "ultra research", "/ultra --research" or "research this with ultra", or asks for a broad investigation that would otherwise fan out into many agents; it answers read-only on the second account first and writes one cited report. Also use it for analysis teams, with `route ultra --team`, for app reviews, website audits, go-live checks, decisions, due diligence and code audits, when the user says "review my app", "audit this site", "is this ready to go live", "ultra team" or "get a team on this", or wants several expert views on one question; analysts on different models work independently, cross-examine each other's claims and write one report.
 ---
 
 # /ultra — your own ultracode, on the best models with quota
@@ -296,7 +296,8 @@ route ultra --team <layout> "<question>" --url <url> --json
 
 Analysts run under research mode's rules: no Edit, Write or NotebookEdit,
 Codex read-only, only the MCP servers in `research.toml`, and a porcelain
-warning when `--repo` changed. `route ultra status` and
+warning when `--repo` changed. A Claude analyst still has a shell, so `--repo`
+is not write-protected even without `--fix`. `route ultra status` and
 `route ultra cancel <run-id>` work as in section 3.
 
 | Exit | Meaning |

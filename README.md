@@ -333,6 +333,316 @@ check failed, and 2 that it could not plan or no usable model had quota. `ultra`
 `/ultra` in Claude Code, link the skill:
 `ln -s "$PWD/skill-ultra" "$HOME/.claude/skills/ultra"`.
 
+### Research mode
+
+`--research` points ultra at a question instead of a goal. Nothing is built or
+merged; you get a report with citations.
+
+```bash
+route ultra --research "Compare Postgres hosting for an EU B2B app: PITR, RLS, residency, price at 200 GB" --json
+```
+
+1. A top model plans the question into independent sub-questions.
+2. Background agents on the best models with quota answer each one read-only,
+   with web search and fetch, a shell, the MCP servers allowlisted in
+   `research.toml`, and read access to `--repo` when you pass one.
+3. A synthesizer merges the answers into one report and cites each claim
+   (`[part-id:S1]`), resolved in its `## Sources` list.
+
+`ultra --research "<question>"` is the same command. Flags:
+
+- `--repo PATH`: the repo the question is about; agents can read it.
+- `--context brief|digest` and `--session ID`: as for build runs.
+- `--max-parts N` (default 6) caps the sub-questions; `--max-parallel N`
+  (default 6) caps how many run at once.
+- `--plan-only` shows the split and stops.
+- `--allow-lower-models` lets lower-ranked Claude arms such as Sonnet in when
+  nothing better has quota. Research only drives `claude`, `claude-work` and
+  `codex`, so a Kimi arm is skipped even with this flag.
+- `--json` prints the result as JSON.
+
+`--base` and `--max-units` are ignored with `--research`.
+
+**Read-only.** Claude arms run in `--repo` with
+`--disallowedTools Edit Write NotebookEdit` and a strict MCP config that holds
+only the allowlisted servers, so they are read-only by instruction. Codex arms
+run `codex exec --sandbox workspace-write -c sandbox_workspace_write.network_access=true`:
+the network is on, so curl, `npx -y lighthouse` and the PageSpeed API work.
+Each Codex part runs in its own empty directory under the run directory, never
+inside `--repo`, and its prompt names the absolute `--repo` path to read from,
+so Codex can never write to `--repo`. A Claude agent still has a shell, and a
+shell can write, so with `--repo` the run compares `git status --porcelain`
+before and after and warns in `summary.md` about any working-tree change it
+sees. It never reverts one: that's your call.
+
+**MCP allowlist.** Background agents get no MCP servers unless you name them
+in `~/.config/route/research.toml` (`ROUTE_CONFIG_DIR` overrides the directory):
+
+```toml
+mcp_servers = ["context7", "deepwiki"]
+```
+
+Their definitions are copied from the top-level `mcpServers` of
+`~/.claude.json` (`ROUTE_CLAUDE_JSON` overrides the path) into
+`research-mcp.json` in the run directory, mode 0600, and deleted when the run
+ends. **List only read-only servers.** The disallowed tools cover Claude's own
+file tools, not MCP tools: a server that can send mail, post, write tickets or
+push code will do it if an agent asks.
+
+**What stays with your session.** Background agents run on this Mac with web
+search and fetch and a full shell, so they can run headless browsers
+(`npx -y lighthouse`, `npx -y playwright` scripts, headless Chrome), download
+and read HTML, JavaScript bundles, `robots.txt` and sitemaps, query DNS and
+TLS, and read public documents and policies. Session work is only what needs
+your session itself:
+
+- claude.ai connectors (Gmail, Calendar, Drive), which the second account's
+  inference-only token doesn't have;
+- a signed-in browser or account (Claude in Chrome, logged-in dashboards);
+- the Mac's screen, simulator or physical devices.
+
+Session work costs your own account, so the planner keeps a part remote
+whenever it can run in the background. Parts that need the session are not sent
+out: `summary.md` lists them under `## For your session`, and the session that
+started the run answers them. /ultra does that for you.
+
+Each run lives in `ROUTE_STATE_DIR/ultra/<run-id>/`, like a build run:
+`plan.json` (the parts), `parts/<id>.json` (each answer), `parts/<id>/` (a
+Codex part's working directory), `summary.md` and `summary.json`, with logs in
+`logs/`. `summary.md` always has `## For your session` and `## Sources`, and a
+`## Run` footer with the run id, the arm per part, failed or held parts, the
+MCP servers loaded and the quota per pool before and after. An answer whose
+marked JSON block is malformed goes back to the same arm with the validation
+error first (`logs/part-<id>-repair.log`); a repaired part is marked repaired
+in the footer and in `summary.json`. Only when there is no block, the arm timed
+out or the repair fails does the next arm redo the part. A source id an answer
+reuses for a different ref is renamed to the next free id (`S<max+1>`) and
+listed in the footer, rather than failing the part. `route ultra status` and
+`route ultra cancel <run-id>` work the same for research runs.
+
+| Exit | Meaning |
+|---|---|
+| 0 | Every remote part was answered and the report written. |
+| 1 | Some remote part failed or was held; the report is still written. |
+| 2 | Empty question, it could not plan, or no usable model for any remote part. |
+
+Session parts never affect the exit code.
+
+### Spending the second account first
+
+Among equally ranked arms, ultra now prefers the account whose weekly quota
+would otherwise expire unused. It uses the same projected-surplus signal as
+`route` (see [Balance surplus quota and pressure](#balance-surplus-quota-and-pressure),
+including `[surplus] k`), and an account running ahead of its pace goes last.
+Rank still wins: a Fable arm beats any Opus- or Codex-class arm whatever their
+quota, an arm with `ok` headroom still goes before one with `low`, and
+`critical` headroom still removes an arm. With no weekly data the order is
+unchanged.
+
+So use /ultra for builds and `/ultra --research` for research rather than the
+built-in ultracode: its workflow agents always bill the session's own account,
+while ultra spends the second account first.
+
+### Teams
+
+`--team` puts a question to a team of analysts, each with its own role and
+lens: an app review, a website audit, a go-live check, a decision. You get one
+report whose claims models from another family have tried to refute. Nothing is
+built unless you add `--fix`.
+
+```text
+route ultra --team [LAYOUT] "<question>" [--url URL ...] [--repo PATH]
+    [--team-size N] [--rounds N] [--thorough | --lean] [--fix]
+    [--context brief|digest] [--session ID] [--max-parallel N]
+    [--plan-only] [--allow-lower-models] [--json]
+```
+
+1. A layout names the analysts. `--team` with no layout has a top model design
+   the team for the question.
+2. The analysts work independently and in parallel, read-only, on the best arms
+   with quota. A `hard` analyst gets the top-ranked arm (Fable when it has
+   quota), and every third analyst runs on a different model family from the
+   team's main arm, so one model's blind spots don't become the team's.
+3. Findings are merged into claims across analysts: the same point from two
+   analysts becomes one claim with both as supporters and every source kept.
+4. Cross-examination: verifiers from a different family from the claim's author
+   try to refute each claim. A strict majority upholds or refutes it; a tie or
+   an "uncertain" majority leaves it contested.
+5. Critic rounds look for angles the team missed and add them.
+6. A synthesizer writes one report, shaped by the layout (a scorecard, a GO or
+   NO-GO, a memo). After it come `## Contested` (both sides of each), `## Refuted`,
+   `## Not cross-examined` (only when claims went past the cap),
+   `## For your session`, `## Sources`, which resolves each `[analyst-id:S1]`,
+   and a `## Run` footer with the team, the arm per analyst, the intensity and
+   the quota per pool before and after.
+
+`--team` alone means the planner designs the team: `route ultra --team "<question>"`.
+argparse can't tell a layout from a question there, so that works only when the
+question is not itself a layout name. `ultra --team ...` is the same command.
+
+| Layout | Targets | `--fix` | Analysts, then the report |
+|---|---|---|---|
+| `website-audit` | url | yes | SEO and indexing, performance (Lighthouse or PageSpeed), accessibility, conversion copy, security and domain, analytics and consent, mobile and links; a 0-10 scorecard per area, then fixes ranked |
+| `app-review` | any | yes | onboarding and core flows, UX and accessibility, performance and crash risk, privacy and permissions, store-guideline compliance, store listing, public reviews, a GUI walkthrough in your session; a release-readiness verdict, then issues ranked by rejection risk |
+| `go-live` | any | yes | deploy and infrastructure, secrets, legal, payments, store submission, analytics and SEO, email deliverability, load, support and status; GO or NO-GO, blockers first, each with exact steps and an owner |
+| `code-audit` | repo | yes | correctness, security, performance, maintainability, tests, operations; findings by severity with `file:line` and a repro |
+| `architecture` | repo | no | simplicity, scale, failure modes, cost, migration path; the options compared and a recommendation |
+| `launch` | any | no | target user, competitors, pricing, positioning, distribution, timing; go or no-go with the fixes that would change it |
+| `decision` | any | no | advocate, sceptic, cost, risk, alternatives, who it affects; a recommendation with the strongest case against |
+| `due-diligence` | any | no | market, competitors, numbers sceptic, customer voice, regulatory, red team; an investment-style memo |
+| `deep-research` | any | no | primary sources, contrarian, latest developments, practitioner, numbers; a cited literature review |
+| `incident` | any | yes | hypothesis generator, log reader, recent-changes bisector, red team; the most likely root cause, how to prove it, the fix |
+| `post-review` | any | no | target reader, editor, fact-checker, sceptic; the edited draft and a claim-by-claim check |
+
+`route ultra teams` lists the layouts (`--json` for the full definitions).
+Analysts are listed in priority order, and a team smaller than its layout keeps
+the first N, so pass `--team-size` when you want all of them. `--plan-only`
+shows the team, its arms and the intensity, then stops. `--context`,
+`--session`, `--max-parallel N` (default 6), `--allow-lower-models` and
+`--json` work as in research mode.
+
+**website-audit** takes the site as `--url`, once per page you care about.
+Each analyst looks at it through one lens and the report scores every area 0 to
+10, then ranks the fixes. Add `--repo` and `--fix` to have the code fixes built.
+
+```bash
+ultra --team website-audit --url https://example.com "Audit the marketing site before launch"
+ultra --team website-audit --url https://example.com --url https://example.com/pricing "Why does pricing convert so badly?"
+```
+
+**app-review** takes the app's source as `--repo` and its store listing as
+`--url`. Seven analysts work in the background: onboarding and core flows, UX
+and accessibility, performance and crash risk, privacy and permissions,
+store-guideline compliance, the store listing and public reviews. The GUI
+walkthrough needs the simulator, which only your session has, so it is listed
+under `## For your session` and /ultra does it there. The report opens with a
+release-readiness verdict and ranks the issues by how likely each is to get the
+build rejected.
+
+```bash
+ultra --team app-review --repo . --url https://apps.apple.com/app/id1234567890 "Is 2.0 ready for App Store review?"
+```
+
+**go-live** asks whether a product can ship today: deploy and infrastructure,
+secrets, legal, payments, store submission, analytics and SEO, email
+deliverability, load, support and status. It answers GO or NO-GO, blockers
+first, each with the exact steps and an owner. With `--fix` the code blockers
+are built as well.
+
+```bash
+ultra --team go-live --repo . --fix "Is this ready to go live?"
+```
+
+**Intensity.** How much a team spends depends on how much of the week's quota
+would otherwise go unused. Spare is `1 - used / elapsed`, both as fractions of
+the week, on the second account's weekly window: 20% used three and a half days
+in leaves 60% spare.
+
+| Intensity | Analysts | Verifiers per claim | Critic rounds | Claims examined | When |
+|---|---|---|---|---|---|
+| full | 8 | 3 | 2 | 20 | at least 50% spare |
+| standard | 5 | 1 | 1 | 12 | 15% spare or more, or no weekly data |
+| lean | 3 | 1 | 0 | 8 | under 15% spare, or headroom `low` or `constrained` |
+
+Unlike the router's surplus bonus, it keeps spending in the last two days of
+the week: quota about to expire unused is exactly what a team should spend.
+`--thorough` forces full and `--lean` forces lean; `--team-size N` and
+`--rounds N` (0 skips the critic) override those numbers. Claims past the cap
+are listed under `## Not cross-examined`.
+
+**`--fix`** works only with a layout whose `fix = true` and a `--repo` that is
+a git work tree. The synthesizer writes a build goal and a goal check covering
+the code blockers and high-severity findings. The check must pass the same lint
+as a build run's checks (test runners only, no shell), and then `route ultra`
+builds the goal on an `ultra/<run-id>` branch. The report names the branch and
+the merge command. It never merges, never pushes and never deploys.
+
+**Custom layouts** go in `~/.config/route/teams.toml` (`ROUTE_CONFIG_DIR`
+overrides the directory), in the same shape as the built-in ones. A user layout
+with a built-in's name replaces it. A layout needs 3 to 8 analysts with unique
+ids (lowercase letters, digits and hyphens); `tier` is `moderate` or `hard`,
+`where` is `remote` or `session` (a session analyst is handed back to you
+rather than sent out), and `targets` is `url`, `repo` or `any`.
+
+Keep `session` for what only your session has, the same rule research mode
+and the team planner and critic follow:
+claude.ai connectors (Gmail, Calendar, Drive),
+a signed-in browser or account (Claude in Chrome, logged-in dashboards),
+or the Mac's screen, simulator or physical devices. Analysts in the background
+can run headless browsers (`npx -y lighthouse`, `npx -y playwright` scripts),
+so a Lighthouse or crawl lens stays `remote`.
+
+```toml
+[layouts.pricing-page]
+title = "Pricing page review"
+description = "Does the pricing page sell, and what would make it sell better"
+targets = "url"
+fix = false
+report = "A verdict on whether the page sells, then changes ranked by likely revenue impact"
+
+[[layouts.pricing-page.analysts]]
+id = "buyer"
+role = "First-time buyer"
+lens = "Can I tell what I get and what it costs within ten seconds?"
+brief = "Read the page as a prospect who has never heard of the product. Quote every sentence that confuses you."
+tier = "moderate"
+where = "remote"
+
+[[layouts.pricing-page.analysts]]
+id = "competitors"
+role = "Competitor analyst"
+lens = "How do the plans and prices compare with the three closest competitors?"
+brief = "Find the three closest competitors' pricing pages and compare them plan by plan, with links and the date checked."
+tier = "moderate"
+where = "remote"
+
+[[layouts.pricing-page.analysts]]
+id = "sceptic"
+role = "Sceptic"
+lens = "What would make a buyer leave without paying?"
+brief = "Argue against every claim on the page. Flag anything unverifiable or likely to lead to a refund."
+tier = "hard"
+where = "remote"
+```
+
+**Read-only.** Analysts, verifiers, critics and the planner run exactly like
+research agents: the same disallowed tools, the same `research.toml` MCP
+allowlist, and Codex with `--sandbox workspace-write` and
+`-c sandbox_workspace_write.network_access=true`. Codex never runs inside
+`--repo`: each dispatch gets its own empty directory under the run directory
+(`analysts/<id>/`, `verify/<claim>-<n>/`, `critic/round-<n>/`,
+`plan/attempt-<n>/`), and the prompt's targets name the absolute `--repo` path
+to read from, so Codex never has write access to `--repo`. A Claude analyst
+still has a shell, and a shell can write, so `--repo` is not write-protected
+even without `--fix`: the run compares `git status --porcelain` before and
+after and warns in `summary.md` about any working-tree change it sees. It never
+reverts one. `--fix` is the only step meant to write, and it builds on its own
+branch.
+
+**Tracker checks and DNS.** Analysts fetch from this machine's network. If it
+blocks trackers at DNS (Pi-hole, NextDNS, a router ad-blocker, some VPNs),
+analytics and consent tags fail to resolve, and a website-audit or go-live
+report can say a tracker is missing or broken when visitors load it fine.
+Check such a finding from another network before acting on it.
+
+Each run lives in `ROUTE_STATE_DIR/ultra/<run-id>/`: `plan.json` (the team,
+its arms and the intensity), `analysts/<id>.json`, `claims.json`,
+`verdicts.json`, `summary.md` and `summary.json` (`"mode": "team"`), with logs
+in `logs/`. An analyst's malformed answer is repaired as in research mode
+(`logs/analyst-<id>-repair.log`, marked repaired in `## Run`) before another
+arm redoes it, and a source id an analyst reuses for a different ref is renamed
+to `S<max+1>` and listed under `## Run` instead of failing the analyst.
+`route ultra status` and `route ultra cancel <run-id>` work the same for team
+runs. `--research` and `--team` together are an error.
+
+| Exit | Meaning |
+|---|---|
+| 0 | Every remote analyst answered and the report was written; with `--fix`, the build also exited 0. |
+| 1 | An analyst failed or was held, or the `--fix` build failed; the report is still written. |
+| 2 | Empty question, unknown layout, no team could be designed, or no usable arm. |
+
+Session analysts never affect the exit code.
+
 ## Swarms: cross-model, and they talk
 
 When work splits into independent pieces, give each piece its own acceptance

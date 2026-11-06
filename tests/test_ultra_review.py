@@ -161,7 +161,10 @@ def test_confirm_with_a_pytest_repro_flips_once_the_bug_is_fixed(worktree, tmp_p
     directory, _ = worktree
     binary_dir = tmp_path / "bin"
     binary_dir.mkdir()
-    (binary_dir / "python3").symlink_to(sys.executable)
+    # A shim, not a symlink: a symlinked venv interpreter loses its venv (and pytest) under uv.
+    shim = binary_dir / "python3"
+    shim.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
+    shim.chmod(0o755)
     monkeypatch.setenv("PATH", f"{binary_dir}{os.pathsep}{os.environ['PATH']}")
     repro = finding("pytest shows it", "python3 -m pytest -q tests/test_fixed.py")
     # Act

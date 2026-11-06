@@ -754,6 +754,15 @@ def cmd_ultra(args: argparse.Namespace) -> int:
     from .ultra import run_ultra, ultra_cancel, ultra_status
 
     words = list(args.goal)
+    if words and words[0] == "teams":
+        if len(words) > 1:
+            raise ValueError("usage: route ultra teams [--json]")
+        from .ultra_team import list_teams
+
+        return list_teams(args.json_out)
+    if args.research is not None and words:
+        # Checked before status/cancel: `ultra cancel RUN --research q` must not cancel anything.
+        raise ValueError("--research takes the question as its own argument; drop the positional words")
     if words and words[0] == "status":
         if len(words) > 2:
             raise ValueError("usage: route ultra status [RUN_ID]")
@@ -762,10 +771,33 @@ def cmd_ultra(args: argparse.Namespace) -> int:
         if len(words) != 2:
             raise ValueError("usage: route ultra cancel RUN_ID")
         return ultra_cancel(words[1])
+    if args.research is not None and args.team is not None:
+        raise ValueError("--research and --team cannot be combined: one question, one mode")
+    if args.research is not None:
+        from .ultra_research import run_research
+
+        return run_research(args.research, repo=args.repo, context=args.context, session=args.session,
+                            max_parts=args.max_parts, max_parallel=args.max_parallel, plan_only=args.plan_only,
+                            allow_lower=args.allow_lower, json_out=args.json_out, host=args.host)
+    if args.team is not None:
+        from .ultra_team import load_layouts, run_team
+
+        # argparse cannot tell `--team LAYOUT "question"` from `--team "question"`: a known layout
+        # name is a layout; otherwise, with no positional words, the value is the question itself.
+        layout: str | None = args.team or None
+        question = " ".join(words).strip()
+        if layout is not None and layout not in load_layouts() and not words:
+            question, layout = layout, None
+        return run_team(question, layout=layout, urls=tuple(args.urls or ()), repo=args.repo,
+                        team_size=args.team_size, rounds=args.rounds, intensity=args.intensity, fix=args.fix,
+                        context=args.context, session=args.session, max_parallel=args.max_parallel,
+                        plan_only=args.plan_only, allow_lower=args.allow_lower, json_out=args.json_out,
+                        host=args.host)
     goal = " ".join(words).strip()
     if not goal:
         raise ValueError('route ultra needs a goal: route ultra "<goal>"')
-    return run_ultra(goal, repo=args.repo, base=args.base, context=args.context, session=args.session,
+    return run_ultra(goal, repo=args.repo if args.repo is not None else ".", base=args.base,
+                     context=args.context, session=args.session,
                      max_units=args.max_units, max_parallel=args.max_parallel, plan_only=args.plan_only,
                      allow_lower=args.allow_lower, json_out=args.json_out, host=args.host)
 
@@ -834,8 +866,32 @@ def _parser(prog: str) -> argparse.ArgumentParser:
     settle.set_defaults(func=cmd_outcome, shape=None, tier=None, arm=None, score=None, outcome=None)
 
     u = sub.add_parser("ultra", help="plan, build, review, fix and integrate a goal on the best models with quota")
-    u.add_argument("goal", nargs="*", help='the goal as one argument; or "status [RUN_ID]" / "cancel RUN_ID"')
-    u.add_argument("--repo", default=".", help="repository to build in (default: current directory)")
+    u.add_argument("goal", nargs="*", help='the goal as one argument; or "status [RUN_ID]" / "cancel RUN_ID" / '
+                                             '"teams"; with --team, the question')
+    u.add_argument("--research", metavar="QUESTION", default=None,
+                   help="answer a question instead of building a goal: read-only agents research the parts "
+                        "in parallel and one report is written (--base and --max-units are ignored)")
+    u.add_argument("--team", nargs="?", const="", default=None, metavar="LAYOUT",
+                   help='review a target with a team of read-only analysts: "--team LAYOUT \'question\'" uses '
+                        'a layout (see "route ultra teams"), "--team \'question\'" lets a planner design the team; '
+                        "claims are cross-examined by another model family and one report is written")
+    u.add_argument("--url", dest="urls", action="append", metavar="URL", default=None,
+                   help="--team: a URL the analysts review (repeatable)")
+    u.add_argument("--team-size", dest="team_size", type=_positive_int, default=None, metavar="N",
+                   help="--team: keep the first N analysts of the layout (or ask the planner for N)")
+    u.add_argument("--rounds", type=_non_negative_int, default=None, metavar="N",
+                   help="--team: critic rounds that may add missing analysts (0 allowed)")
+    intensity = u.add_mutually_exclusive_group()
+    intensity.add_argument("--thorough", dest="intensity", action="store_const", const="full", default=None,
+                           help="--team: the full team, three verifiers per claim, two critic rounds")
+    intensity.add_argument("--lean", dest="intensity", action="store_const", const="lean",
+                           help="--team: three analysts, one verifier per claim, no critic")
+    u.add_argument("--fix", action="store_true",
+                   help="--team: hand the code blockers to a build run on a branch (layouts with fix = true, "
+                        "--repo must be a git work tree); never merges or pushes")
+    u.add_argument("--repo", default=None,
+                   help="repository to build in (default: current directory); with --research or --team, a "
+                        "directory the agents may read (default: none)")
     u.add_argument("--base", default="HEAD", help="revision the units and ultra/<run-id> start from")
     u.add_argument("--context", choices=["brief", "digest"], default="brief",
                    help="what workers get beyond the goal: brief (nothing) or digest (this conversation "
@@ -843,6 +899,8 @@ def _parser(prog: str) -> argparse.ArgumentParser:
     u.add_argument("--session", default=os.environ.get("CLAUDE_CODE_SESSION_ID"),
                    help="session to digest (default: CLAUDE_CODE_SESSION_ID, i.e. this one)")
     u.add_argument("--max-units", type=_positive_int, default=10, metavar="N")
+    u.add_argument("--max-parts", type=_positive_int, default=6, metavar="N",
+                   help="--research: at most this many sub-questions")
     u.add_argument("--max-parallel", type=_positive_int, default=6, metavar="N")
     u.add_argument("--plan-only", action="store_true", help="plan and choose arms, dispatch nothing")
     u.add_argument("--allow-lower-models", dest="allow_lower", action="store_true",
@@ -966,6 +1024,16 @@ def _positive_int(text: str) -> int:
     except ValueError:
         pass
     raise argparse.ArgumentTypeError("must be a positive integer")
+
+
+def _non_negative_int(text: str) -> int:
+    try:
+        value = int(text)
+        if value >= 0:
+            return value
+    except ValueError:
+        pass
+    raise argparse.ArgumentTypeError("must be zero or a positive integer")
 
 
 def _ttl_arg(text: str) -> int:

@@ -183,17 +183,22 @@ route ultra --research "<question>" --json
 - `--repo PATH` when the question is about a repo; the agents can read it.
 - `--plan-only` only when the user wants to see the split first.
 - `--max-parts N` (default 6), `--max-parallel N` (default 6),
-  `--allow-lower-models`; `--context` and `--session` as in section 2.
+  `--allow-lower-models` (lower Claude arms such as Sonnet; Kimi can't run
+  research); `--context` and `--session` as in section 2.
   `--base` and `--max-units` are ignored.
 
 `route ultra status` and `route ultra cancel <run-id>` work as in section 3.
 
-Background agents can't edit: Claude arms run without Edit, Write and
-NotebookEdit, and Codex in a read-only sandbox. `research.toml` (in
-`~/.config/route/`, `mcp_servers = ["name", ...]`) lists the MCP servers from
-`~/.claude.json` they may use. It must only contain read-only servers: the
-disallowed tools don't stop an MCP tool that sends, posts or writes. If the
-user asks to add a server, check that first.
+Claude arms run without Edit, Write and NotebookEdit, and Codex in a
+read-only sandbox, but a Claude agent still has a shell, and a shell can
+write. So `--repo` is not write-protected: the run compares
+`git status --porcelain` before and after and only warns about a change in
+`summary.md`, afterwards; it neither prevents nor reverts it.
+
+`research.toml` (in `~/.config/route/`, `mcp_servers = ["name", ...]`) lists
+the MCP servers from `~/.claude.json` background agents may use. It must only
+contain read-only servers: the disallowed tools don't stop an MCP tool that
+sends, posts or writes. If the user asks to add a server, check that first.
 
 | Exit | Meaning |
 |---|---|

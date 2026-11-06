@@ -356,7 +356,9 @@ route ultra --research "Compare Postgres hosting for an EU B2B app: PITR, RLS, r
 - `--max-parts N` (default 6) caps the sub-questions; `--max-parallel N`
   (default 6) caps how many run at once.
 - `--plan-only` shows the split and stops.
-- `--allow-lower-models` lets Sonnet and Kimi in when nothing better has quota.
+- `--allow-lower-models` lets lower-ranked Claude arms such as Sonnet in when
+  nothing better has quota. Research only drives `claude`, `claude-work` and
+  `codex`, so a Kimi arm is skipped even with this flag.
 - `--json` prints the result as JSON.
 
 `--base` and `--max-units` are ignored with `--research`.

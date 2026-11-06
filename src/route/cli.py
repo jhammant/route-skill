@@ -762,10 +762,19 @@ def cmd_ultra(args: argparse.Namespace) -> int:
         if len(words) != 2:
             raise ValueError("usage: route ultra cancel RUN_ID")
         return ultra_cancel(words[1])
+    if args.research is not None:
+        if words:
+            raise ValueError("--research takes the question as its own argument; drop the positional words")
+        from .ultra_research import run_research
+
+        return run_research(args.research, repo=args.repo, context=args.context, session=args.session,
+                            max_parts=args.max_parts, max_parallel=args.max_parallel, plan_only=args.plan_only,
+                            allow_lower=args.allow_lower, json_out=args.json_out, host=args.host)
     goal = " ".join(words).strip()
     if not goal:
         raise ValueError('route ultra needs a goal: route ultra "<goal>"')
-    return run_ultra(goal, repo=args.repo, base=args.base, context=args.context, session=args.session,
+    return run_ultra(goal, repo=args.repo if args.repo is not None else ".", base=args.base,
+                     context=args.context, session=args.session,
                      max_units=args.max_units, max_parallel=args.max_parallel, plan_only=args.plan_only,
                      allow_lower=args.allow_lower, json_out=args.json_out, host=args.host)
 
@@ -835,7 +844,12 @@ def _parser(prog: str) -> argparse.ArgumentParser:
 
     u = sub.add_parser("ultra", help="plan, build, review, fix and integrate a goal on the best models with quota")
     u.add_argument("goal", nargs="*", help='the goal as one argument; or "status [RUN_ID]" / "cancel RUN_ID"')
-    u.add_argument("--repo", default=".", help="repository to build in (default: current directory)")
+    u.add_argument("--research", metavar="QUESTION", default=None,
+                   help="answer a question instead of building a goal: read-only agents research the parts "
+                        "in parallel and one report is written (--base and --max-units are ignored)")
+    u.add_argument("--repo", default=None,
+                   help="repository to build in (default: current directory); with --research, a directory "
+                        "the agents may read (default: none)")
     u.add_argument("--base", default="HEAD", help="revision the units and ultra/<run-id> start from")
     u.add_argument("--context", choices=["brief", "digest"], default="brief",
                    help="what workers get beyond the goal: brief (nothing) or digest (this conversation "
@@ -843,6 +857,8 @@ def _parser(prog: str) -> argparse.ArgumentParser:
     u.add_argument("--session", default=os.environ.get("CLAUDE_CODE_SESSION_ID"),
                    help="session to digest (default: CLAUDE_CODE_SESSION_ID, i.e. this one)")
     u.add_argument("--max-units", type=_positive_int, default=10, metavar="N")
+    u.add_argument("--max-parts", type=_positive_int, default=6, metavar="N",
+                   help="--research: at most this many sub-questions")
     u.add_argument("--max-parallel", type=_positive_int, default=6, metavar="N")
     u.add_argument("--plan-only", action="store_true", help="plan and choose arms, dispatch nothing")
     u.add_argument("--allow-lower-models", dest="allow_lower", action="store_true",

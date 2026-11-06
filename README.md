@@ -333,6 +333,93 @@ check failed, and 2 that it could not plan or no usable model had quota. `ultra`
 `/ultra` in Claude Code, link the skill:
 `ln -s "$PWD/skill-ultra" "$HOME/.claude/skills/ultra"`.
 
+### Research mode
+
+`--research` points ultra at a question instead of a goal. Nothing is built or
+merged; you get a report with citations.
+
+```bash
+route ultra --research "Compare Postgres hosting for an EU B2B app: PITR, RLS, residency, price at 200 GB" --json
+```
+
+1. A top model plans the question into independent sub-questions.
+2. Background agents on the best models with quota answer each one read-only,
+   with web search and fetch, a shell, the MCP servers allowlisted in
+   `research.toml`, and read access to `--repo` when you pass one.
+3. A synthesizer merges the answers into one report and cites each claim
+   (`[part-id:S1]`), resolved in its `## Sources` list.
+
+`ultra --research "<question>"` is the same command. Flags:
+
+- `--repo PATH`: the repo the question is about; agents can read it.
+- `--context brief|digest` and `--session ID`: as for build runs.
+- `--max-parts N` (default 6) caps the sub-questions; `--max-parallel N`
+  (default 6) caps how many run at once.
+- `--plan-only` shows the split and stops.
+- `--allow-lower-models` lets lower-ranked Claude arms such as Sonnet in when
+  nothing better has quota. Research only drives `claude`, `claude-work` and
+  `codex`, so a Kimi arm is skipped even with this flag.
+- `--json` prints the result as JSON.
+
+`--base` and `--max-units` are ignored with `--research`.
+
+**Read-only.** Claude arms run with `--disallowedTools Edit Write NotebookEdit`
+and a strict MCP config that holds only the allowlisted servers; Codex runs
+with `--sandbox read-only`. A shell can still write, so with `--repo` the run
+compares `git status --porcelain` before and after and warns in `summary.md`
+about any working-tree change it sees. It never reverts one: that's your call.
+
+**MCP allowlist.** Background agents get no MCP servers unless you name them
+in `~/.config/route/research.toml` (`ROUTE_CONFIG_DIR` overrides the directory):
+
+```toml
+mcp_servers = ["context7", "deepwiki"]
+```
+
+Their definitions are copied from the top-level `mcpServers` of
+`~/.claude.json` (`ROUTE_CLAUDE_JSON` overrides the path) into
+`research-mcp.json` in the run directory, mode 0600, and deleted when the run
+ends. **List only read-only servers.** The disallowed tools cover Claude's own
+file tools, not MCP tools: a server that can send mail, post, write tickets or
+push code will do it if an agent asks.
+
+**What stays with your session.** The second account's token is
+inference-only, so its agents have no claude.ai connectors (Gmail, Calendar,
+Drive), no Claude in Chrome and no access to this Mac. Parts that need any of
+those are not sent out: `summary.md` lists them under `## For your session`,
+and the session that started the run answers them. /ultra does that for you.
+
+Each run lives in `ROUTE_STATE_DIR/ultra/<run-id>/`, like a build run:
+`plan.json` (the parts), `parts/<id>.json` (each answer), `summary.md` and
+`summary.json`, with logs in `logs/`. `summary.md` always has
+`## For your session` and `## Sources`, and a footer with the run id, the arm
+per part, failed or held parts, the MCP servers loaded and the quota per pool
+before and after. `route ultra status` and `route ultra cancel <run-id>` work
+the same for research runs.
+
+| Exit | Meaning |
+|---|---|
+| 0 | Every remote part was answered and the report written. |
+| 1 | Some remote part failed or was held; the report is still written. |
+| 2 | Empty question, it could not plan, or no usable model for any remote part. |
+
+Session parts never affect the exit code.
+
+### Spending the second account first
+
+Among equally ranked arms, ultra now prefers the account whose weekly quota
+would otherwise expire unused. It uses the same projected-surplus signal as
+`route` (see [Balance surplus quota and pressure](#balance-surplus-quota-and-pressure),
+including `[surplus] k`), and an account running ahead of its pace goes last.
+Rank still wins: a Fable arm beats any Opus- or Codex-class arm whatever their
+quota, an arm with `ok` headroom still goes before one with `low`, and
+`critical` headroom still removes an arm. With no weekly data the order is
+unchanged.
+
+So use /ultra for builds and `/ultra --research` for research rather than the
+built-in ultracode: its workflow agents always bill the session's own account,
+while ultra spends the second account first.
+
 ## Swarms: cross-model, and they talk
 
 When work splits into independent pieces, give each piece its own acceptance

@@ -1,6 +1,6 @@
 ---
 name: ultra
-description: Run a goal as your own ultracode with `route ultra`. It plans the goal into independent units with checks, builds them in parallel on the best models in whichever pools have quota, has a different model family review each one, fixes confirmed bugs, merges onto an ultra/<run-id> branch and runs a check for the whole goal. It never merges into your branch and never pushes. Use when the user types /ultra, says "ultra this", "run this with ultra" or "my own ultracode", or wants a multi-model build of a goal without approving each step.
+description: Run a goal as your own ultracode with `route ultra`. It plans the goal into independent units with checks, builds them in parallel on the best models in whichever pools have quota, has a different model family review each one, fixes confirmed bugs, merges onto an ultra/<run-id> branch and runs a check for the whole goal. It never merges into your branch and never pushes. Use when the user types /ultra, says "ultra this", "run this with ultra" or "my own ultracode", or wants a multi-model build of a goal without approving each step. Also use it for multi-agent research, with `route ultra --research`, when the user says "ultra research", "/ultra --research" or "research this with ultra", or asks for a broad investigation that would otherwise fan out into many agents; it answers read-only on the second account first and writes one cited report.
 ---
 
 # /ultra — your own ultracode, on the best models with quota
@@ -12,7 +12,8 @@ description: Run a goal as your own ultracode with `route ultra`. It plans the g
    quota: the second Claude account (the `claude-work` arms), Codex, and this
    account (`claude`) when it has headroom. Only Fable, Opus and Codex-level
    models take part. Sonnet and Kimi join only with `--allow-lower-models`,
-   and only when nothing better is left.
+   and only when nothing better is left. Among equal models it spends the
+   second account first: the one whose weekly quota would otherwise go unused.
 3. Each non-trivial unit that passes its check is reviewed by a model from a
    different family (Anthropic work goes to OpenAI, and the other way round).
    A finding counts only when running its repro command shows the bug.
@@ -137,9 +138,99 @@ Outcomes are already settled: don't run `route settle` on the units. Failed
 units are not retried automatically; suggest a narrower goal or a rerun when
 more quota is free.
 
+## Research mode
+
+`route ultra --research "<question>"` answers a question instead of building
+a goal. A planner splits it into independent parts; background agents on the
+best models with quota answer each one read-only, with web search and fetch,
+a shell, the MCP servers in `research.toml` and read access to `--repo` when
+given; a synthesizer merges the answers into one cited report. Nothing is
+committed or merged.
+
+Use it for non-code questions with several independent threads: comparisons,
+surveys, due diligence, "find out everything about X". Prefer it to fanning
+out your own subagents or the built-in ultracode, which bill this account.
+
+### Write the question
+
+The question is the brief, as in section 1:
+
+- **Scope**: what to find out, and for which period, region, product or
+  company.
+- **A good answer**: what it must contain, such as a comparison table, numbers
+  with dates, or a recommendation.
+- **Sources**: which to prefer (primary docs, filings, standards, the repo
+  itself) and which to distrust.
+- **Exclusions**: what to leave out.
+
+```text
+Compare Supabase, Neon and PlanetScale for a multi-tenant B2B app hosted in
+the EU, as of November 2026: price at 50 GB and 200 GB, point-in-time
+recovery, row-level security, data residency, SOC 2. End with a one-paragraph
+recommendation. Prefer vendor docs and pricing pages over blog posts; leave
+out self-hosted options.
+```
+
+### Run it
+
+Exactly like build mode: the Bash tool with `run_in_background` and the
+longest timeout (7200000 ms). Don't poll.
+
+```bash
+route ultra --research "<question>" --json
+```
+
+- `--repo PATH` when the question is about a repo; the agents can read it.
+- `--plan-only` only when the user wants to see the split first.
+- `--max-parts N` (default 6), `--max-parallel N` (default 6),
+  `--allow-lower-models` (lower Claude arms such as Sonnet; Kimi can't run
+  research); `--context` and `--session` as in section 2.
+  `--base` and `--max-units` are ignored.
+
+`route ultra status` and `route ultra cancel <run-id>` work as in section 3.
+
+Claude arms run without Edit, Write and NotebookEdit, and Codex in a
+read-only sandbox, but a Claude agent still has a shell, and a shell can
+write. So `--repo` is not write-protected: the run compares
+`git status --porcelain` before and after and only warns about a change in
+`summary.md`, afterwards; it neither prevents nor reverts it.
+
+`research.toml` (in `~/.config/route/`, `mcp_servers = ["name", ...]`) lists
+the MCP servers from `~/.claude.json` background agents may use. It must only
+contain read-only servers: the disallowed tools don't stop an MCP tool that
+sends, posts or writes. If the user asks to add a server, check that first.
+
+| Exit | Meaning |
+|---|---|
+| 0 | Every remote part was answered and the report written. |
+| 1 | Some remote part failed or was held; the report is still written. |
+| 2 | Empty question, it could not plan, or no usable model for any remote part. |
+
+Session parts never affect the exit code. On exit 1, report anyway. On exit 2,
+tell the user why and, when no top model had quota, offer
+`--allow-lower-models`. Don't rerun on your own.
+
+### Report back
+
+Read only `summary.md` in the run directory (`plan.json`, `parts/<id>.json`
+and `summary.json` sit next to it). Open a part's log,
+`logs/part-<id>.log`, only when that part failed. Then:
+
+1. Answer every item under `## For your session` here. Those parts need what
+   only this session has: the claude.ai connectors (Gmail, Calendar, Drive),
+   Claude in Chrome and this Mac. The second account's token is
+   inference-only, so the background agents have none of them.
+2. Give the user ONE merged answer: the report and your session answers
+   together, not two reports. Keep the citations, resolving each
+   `[part-id:S1]` from the `## Sources` list into a title and link.
+3. Name the parts that failed or were held, with the reason from the footer.
+4. If `summary.md` has a porcelain warning (`--repo` changed during the run),
+   say so and list the paths. The run never reverts them; don't either.
+
 ## When not to use it
 
 - Sequential work, or one small change: use /route or /auto.
+- A question one search answers: answer it here, without `--research`.
 - Private or sensitive data: use `/route --sensitive`.
 - When the user wants to approve dispatch: use /route, or `route swarm`, which
   asks once for the whole swarm.

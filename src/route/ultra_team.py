@@ -175,7 +175,11 @@ class Analysis:
 
     @property
     def sources(self) -> list[dict]:
-        """Every source any finding cites, in order, one entry per id."""
+        """Every source any finding cites, in order, one entry per id.
+
+        ``parse_analysis`` rejects an id reused for a different ref, so one
+        id is one reference here and ``[analyst:S1]`` resolves to it alone.
+        """
         seen: dict[str, dict] = {}
         for finding in self.findings:
             for src in finding.sources:
@@ -408,23 +412,34 @@ def _rank(value: str, order: tuple[str, ...]) -> int:
     return order.index(value) if value in order else len(order)
 
 
+#: Words that flip a claim's meaning; two findings only merge when they agree on polarity.
+NEGATION = re.compile(r"\b(?:not|no|never|none|nothing|neither|nor|cannot|without|lacks?|fails?)\b|n't\b",
+                      re.IGNORECASE)
+
+
+def _negated(text: str) -> bool:
+    return NEGATION.search(text) is not None
+
+
 def merge_findings(analyses: dict[str, Analysis]) -> list[Claim]:
     """Near-duplicate findings across analysts become one claim with every supporter and source.
 
     Greedy in analyst order: a finding joins the first claim whose word set
-    overlaps it at least ``JACCARD``, else starts a new one. The merged claim
-    keeps the highest severity and confidence, every source (tagged with its
-    analyst so ``[analyst:S1]`` still resolves) and the first fix offered.
+    overlaps it at least ``JACCARD`` and whose polarity matches (a claim that
+    something does NOT hold never corroborates the claim that it does), else
+    starts a new one. The merged claim keeps the highest severity and
+    confidence, every source (tagged with its analyst so ``[analyst:S1]``
+    still resolves) and the first fix offered.
     """
     claims: list[Claim] = []
-    words: list[frozenset[str]] = []
+    words: list[tuple[frozenset[str], bool]] = []
     for analyst_id, analysis in analyses.items():
         for finding in analysis.findings:
             tagged = [{"analyst": analyst_id, "id": src.get("id"), "ref": src.get("ref"), "note": src.get("note", "")}
                       for src in finding.sources]
-            mine = _words(finding.claim)
-            for claim, known in zip(claims, words):
-                if _jaccard(mine, known) >= JACCARD:
+            mine, polarity = _words(finding.claim), _negated(finding.claim)
+            for claim, (known, known_polarity) in zip(claims, words):
+                if polarity == known_polarity and _jaccard(mine, known) >= JACCARD:
                     if analyst_id not in claim.supporters:
                         claim.supporters.append(analyst_id)
                     claim.sources.extend(src for src in tagged if src not in claim.sources)
@@ -441,7 +456,7 @@ def merge_findings(analyses: dict[str, Analysis]) -> list[Claim]:
                                     supporters=[analyst_id], sources=tagged,
                                     evidence=[f"{analyst_id}: {finding.evidence.strip()}"] if finding.evidence.strip()
                                     else [], fix=finding.fix, confidence=finding.confidence, author=analyst_id))
-                words.append(mine)
+                words.append((mine, polarity))
     return claims
 
 
@@ -755,58 +770,89 @@ def _sources(raw: object, where: str, error: type[ValueError]) -> list[dict]:
     return [dict(source) for source in raw]
 
 
+FINDING_KEYS = ("id", "claim", "evidence", "sources", "confidence", "severity", "fix")
+
+
 def parse_analysis(text: str) -> Analysis:
-    """The last marked JSON object in an analyst's output, every field checked."""
+    """The last marked JSON object in an analyst's output, every field present and checked.
+
+    Strict on purpose: a finding without its evidence, sources, id or fix
+    (null when there is none) is an incomplete answer, and the run retries
+    it on the next arm rather than filling the gaps in. One source id must
+    name one reference across the whole analysis, or ``[analyst:S1]`` in
+    the report could point at either.
+    """
     raw = _json_block(text, ANALYSIS_BEGIN, ANALYSIS_END, TeamAnalysisError, "analysis")
-    summary = raw.get("summary")
+    for key in ("summary", "findings", "gaps"):
+        if key not in raw:
+            raise TeamAnalysisError(f"'{key}' is missing")
+    summary = raw["summary"]
     if not isinstance(summary, str) or not summary.strip():
         raise TeamAnalysisError("'summary' must be a non-empty string")
-    findings = raw.get("findings")
+    findings = raw["findings"]
     if not isinstance(findings, list):
         raise TeamAnalysisError("'findings' must be a list")
     rows: list[Finding] = []
+    refs: dict[str, str] = {}
     for index, item in enumerate(findings):
         where = f"finding {index}"
         if not isinstance(item, dict):
             raise TeamAnalysisError(f"{where}: must be an object")
-        claim = item.get("claim")
+        missing = [key for key in FINDING_KEYS if key not in item]
+        if missing:
+            raise TeamAnalysisError(f"{where}: missing {', '.join(repr(key) for key in missing)}")
+        identity = item["id"]
+        if not isinstance(identity, str) or not identity.strip():
+            raise TeamAnalysisError(f"{where}: 'id' must be a non-empty string")
+        claim = item["claim"]
         if not isinstance(claim, str) or not claim.strip():
             raise TeamAnalysisError(f"{where}: 'claim' must be a non-empty string")
-        evidence = item.get("evidence", "")
-        if not isinstance(evidence, str):
-            raise TeamAnalysisError(f"{where}: 'evidence' must be a string")
-        if item.get("confidence") not in CONFIDENCE:
+        evidence = item["evidence"]
+        if not isinstance(evidence, str) or not evidence.strip():
+            raise TeamAnalysisError(f"{where}: 'evidence' must be a non-empty string")
+        if item["confidence"] not in CONFIDENCE:
             raise TeamAnalysisError(f"{where}: 'confidence' must be one of {', '.join(CONFIDENCE)}")
-        if item.get("severity") not in SEVERITIES:
+        if item["severity"] not in SEVERITIES:
             raise TeamAnalysisError(f"{where}: 'severity' must be one of {', '.join(SEVERITIES)}")
-        fix = item.get("fix")
+        fix = item["fix"]
         if fix is not None and not isinstance(fix, str):
             raise TeamAnalysisError(f"{where}: 'fix' must be a string or null")
-        identity = item.get("id", f"F{index + 1}")
-        if not isinstance(identity, str):
-            raise TeamAnalysisError(f"{where}: 'id' must be a string")
-        rows.append(Finding(id=identity, claim=claim, evidence=evidence,
-                            sources=_sources(item.get("sources", []), where, TeamAnalysisError),
+        sources = _sources(item["sources"], where, TeamAnalysisError)
+        for src in sources:
+            known = refs.setdefault(src["id"], src["ref"])
+            if known != src["ref"]:
+                raise TeamAnalysisError(f"{where}: source id {src['id']!r} is already used for {known!r}; "
+                                        f"give {src['ref']!r} its own id")
+        rows.append(Finding(id=identity, claim=claim, evidence=evidence, sources=sources,
                             confidence=item["confidence"], severity=item["severity"], fix=fix or None))
-    gaps = raw.get("gaps", [])
+    gaps = raw["gaps"]
     if not isinstance(gaps, list) or not all(isinstance(gap, str) for gap in gaps):
         raise TeamAnalysisError("'gaps' must be a list of strings")
     return Analysis(summary=summary, findings=rows, gaps=list(gaps))
 
 
 def parse_verdict(text: str) -> dict:
-    """A verifier's verdict; anything unusable counts as 'uncertain' with the reason recorded."""
+    """A verifier's verdict; anything unusable counts as 'uncertain' with the reason recorded.
+
+    A decisive verdict needs the whole envelope: the verdict word, a
+    non-empty reason and a list of sources. A bare ``{"verdict": "refuted"}``
+    cannot eliminate a claim.
+    """
     try:
         raw = _json_block(text, VERDICT_BEGIN, VERDICT_END, TeamReportError, "verdict")
     except TeamReportError as exc:
         return {"verdict": "uncertain", "reason": f"unparseable verdict: {exc}", "sources": []}
-    verdict = raw.get("verdict")
-    reason = raw.get("reason")
-    sources = raw.get("sources", [])
-    return {"verdict": verdict if verdict in VERDICTS else "uncertain",
-            "reason": reason.strip() if isinstance(reason, str) and reason.strip()
-            else (f"no reason given (verdict {verdict!r})"),
-            "sources": [dict(src) for src in sources if isinstance(src, dict)] if isinstance(sources, list) else []}
+    verdict, reason, sources = raw.get("verdict"), raw.get("reason"), raw.get("sources")
+    problems = []
+    if verdict not in VERDICTS:
+        problems.append(f"'verdict' must be one of {', '.join(VERDICTS)}, not {verdict!r}")
+    if not isinstance(reason, str) or not reason.strip():
+        problems.append("'reason' must be a non-empty string")
+    if not isinstance(sources, list) or not all(isinstance(src, dict) for src in sources):
+        problems.append("'sources' must be a list of objects")
+    if problems:
+        return {"verdict": "uncertain", "reason": "malformed verdict: " + "; ".join(problems), "sources": []}
+    return {"verdict": verdict, "reason": reason.strip(), "sources": [dict(src) for src in sources]}
 
 
 def parse_critic(text: str) -> list[Analyst] | None:
@@ -944,6 +990,11 @@ def _parallel(ctx: _Context, jobs: list[tuple[str, tuple]], worker) -> dict[str,
     return results
 
 
+def _answered_arms(results: dict[str, dict]) -> dict[str, str | None]:
+    """{analyst id: the arm whose analysis was accepted}; a retry's arm, not the planned one."""
+    return {key: row["arm"] for key, row in results.items() if row["state"] == "analysed"}
+
+
 def _analyse(ctx: _Context, analysts: list[Analyst], arms: dict[str, str | None]) -> dict[str, dict]:
     """Every remote analyst with an arm, in parallel; {id: result}."""
     jobs = []
@@ -960,26 +1011,49 @@ def _analyse(ctx: _Context, analysts: list[Analyst], arms: dict[str, str | None]
 
 
 def _verifier_arms(ctx: _Context, author_arm: str | None, count: int) -> list[tuple[str, str]]:
-    """``count`` (arm, independence) pairs: other families first, the author's own family after."""
+    """``count`` (arm, independence) pairs: every vote from another family while one has quota.
+
+    ``author_arm`` is the arm that actually delivered the claim's analysis
+    (a retry may have moved it), so independence is measured against the
+    model that wrote the claim. The author's own family is only a fallback
+    for when no other family is usable: a second Anthropic vote is still an
+    Anthropic vote, so it never fills a slot a cross-family arm could.
+    """
     family = pool_family(ctx.pools[author_arm]) if author_arm in ctx.pools else None
     cross = _usable(ctx.pools, ctx.quota, host=ctx.host, allow_lower=ctx.allow_lower,
                     exclude_families={family} if family else frozenset())
-    same = [arm for arm in _usable(ctx.pools, ctx.quota, host=ctx.host, allow_lower=ctx.allow_lower)
-            if arm not in cross]
-    ordered = [(arm, "cross-family") for arm in cross] + [(arm, "same-family") for arm in same]
+    if cross:
+        ordered = [(arm, "cross-family") for arm in cross]
+    else:
+        ordered = [(arm, "same-family") for arm in
+                   _usable(ctx.pools, ctx.quota, host=ctx.host, allow_lower=ctx.allow_lower)]
     if not ordered:
         return []
     return [ordered[index % len(ordered)] for index in range(count)]
 
 
-def _examine(ctx: _Context, claims: list[Claim], arms: dict[str, str | None], cache: dict[frozenset, Claim]) -> None:
-    """Cross-examine the top claims in place; verdicts already given (by word set) are kept."""
+def _claim_key(claim: Claim) -> str:
+    """What a verifier was shown: the claim, its severity, supporters, evidence and sources.
+
+    A cached verdict is only reused for a claim with the same material; a
+    critic-round analyst that adds a reproduction, a source or a higher
+    severity makes it a different claim to examine.
+    """
+    return json.dumps([sorted(_words(claim.text)), claim.severity, sorted(claim.supporters), list(claim.evidence),
+                       [(src.get("analyst"), src.get("id"), src.get("ref")) for src in claim.sources]])
+
+
+def _examine(ctx: _Context, claims: list[Claim], author_arms: dict[str, str | None], cache: dict[str, Claim]) -> None:
+    """Cross-examine the top claims in place; a verdict already given on the same material is kept.
+
+    ``author_arms`` maps each analyst to the arm that delivered its analysis.
+    """
     budget = ctx.intensity.max_claims
     ordered = _examination_order(claims)
     jobs = []
     pending: dict[str, Claim] = {}
     for claim in ordered:
-        key = _words(claim.text)
+        key = _claim_key(claim)
         if key in cache:
             done = cache[key]
             claim.verdicts, claim.verdict, claim.examined, claim.independence = \
@@ -991,7 +1065,7 @@ def _examine(ctx: _Context, claims: list[Claim], arms: dict[str, str | None], ca
             claim.verdict = NOT_EXAMINED
             continue
         budget -= 1
-        pairs = _verifier_arms(ctx, arms.get(claim.author), ctx.intensity.verifiers)
+        pairs = _verifier_arms(ctx, author_arms.get(claim.author), ctx.intensity.verifiers)
         if not pairs:
             claim.verdict = NOT_EXAMINED
             ctx.run.note(f"claim {claim.id}: no usable verifier has quota")
@@ -1011,7 +1085,7 @@ def _examine(ctx: _Context, claims: list[Claim], arms: dict[str, str | None], ca
         claim.examined = True
         claim.independence = "cross-family" if claim.verdicts and \
             all(row["independence"] == "cross-family" for row in claim.verdicts) else "same-family"
-        cache[_words(claim.text)] = claim
+        cache[_claim_key(claim)] = claim
 
 
 def _critic(ctx: _Context, analysts: list[Analyst], claims: list[Claim], round_no: int) -> list[Analyst] | None:
@@ -1272,6 +1346,10 @@ def _run_fix(ctx: _Context, synthesis_text: str) -> dict:
     goal = block["goal"] + "\n\nGoal check: " + block["goal_check"]
     ctx.run.step("fixing", "build run for the code findings")
     rc = ultra.run_ultra(goal, repo=ctx.repo, base="HEAD", host=ctx.host)
+    if rc == 130:
+        # run_ultra swallows Ctrl-C into its own exit code; the team run was interrupted too.
+        ctx.run.note("fix build interrupted")
+        raise KeyboardInterrupt
     return {"state": "built", "exit_code": rc, "goal": goal, **_find_build(goal, ctx.run.dir)}
 
 
@@ -1492,8 +1570,10 @@ def _execute(run: ultra.Run, question: str, layout: TeamLayout | None, urls: tup
                                      if row["state"] == "analysed"}
     claims = merge_findings(analyses)
     atomic_write(run.dir / "claims.json", json.dumps([c.to_dict() for c in claims], indent=2) + "\n")
-    cache: dict[frozenset, Claim] = {}
-    _examine(ctx, claims, arms, cache)
+    cache: dict[str, Claim] = {}
+    # Verifier independence is judged against the arm that delivered each analysis, not the one
+    # planned for it: a retry may have moved the analyst to another family.
+    _examine(ctx, claims, _answered_arms(results), cache)
 
     rounds_run = 0
     for round_no in range(1, intensity.rounds + 1):
@@ -1512,7 +1592,7 @@ def _execute(run: ultra.Run, question: str, layout: TeamLayout | None, urls: tup
         results.update(_analyse(ctx, missing, more_arms))
         analyses = {key: row["analysis"] for key, row in results.items() if row["state"] == "analysed"}
         claims = merge_findings(analyses)
-        _examine(ctx, claims, arms, cache)
+        _examine(ctx, claims, _answered_arms(results), cache)
     run.progress["critic_rounds"] = rounds_run
     atomic_write(run.dir / "claims.json", json.dumps([c.to_dict() for c in claims], indent=2) + "\n")
     atomic_write(run.dir / "verdicts.json", json.dumps(

@@ -11,6 +11,8 @@ quota is monkeypatched.
 from __future__ import annotations
 
 import json
+import shlex
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -201,7 +203,7 @@ def test_parse_answer_renames_a_shared_id_and_keeps_a_same_ref_reuse():
     assert [src["id"] for src in clashing.sources] == ["S1", "S2"]
     assert clashing.renamed == [{"from": "S1", "to": "S2", "ref": "https://b.test"}]
     assert clashing.to_dict()["renamed"] == clashing.renamed and clashing.answer == "a [S1]"
-    assert same.renamed == [] and [src["id"] for src in same.sources] == ["S1", "S1"]
+    assert same.renamed == [] and [src["id"] for src in same.sources] == ["S1"]
 
 
 def test_team_run_records_renames_in_the_analyst_file_and_the_footer(fake):
@@ -462,6 +464,23 @@ def test_part_prompt_names_the_repo_only_when_given():
 
     assert "- Repository (read access): /tmp/some-repo" in with_repo
     assert "Repository (read access)" not in without
+
+
+@pytest.mark.parametrize("options", [
+    "-sread-only", "--sandbox=read-only -c foo=bar", "--cd /elsewhere", "--cd=/elsewhere", "-C /elsewhere",
+    "-C/elsewhere", "-s danger-full-access --cd=/elsewhere",
+])
+def test_codex_template_drops_every_sandbox_and_working_root_spelling(fake, options):
+    """A second sandbox option makes Codex refuse the command; ``--cd`` would move it out of the directory
+    ``agent_cwd`` isolates it in (into --repo, writable). Both are the run's to set, so the template's go."""
+    pools = pools_for_host(load_pools(), "claude")
+    pools["codex"] = replace(pools["codex"], dispatch=f"codex exec {options} {{task}}")
+
+    command = shlex.split(ultra_research.research_template("codex", pools, host="claude"))
+
+    kept = ["-c", "foo=bar"] if "foo=bar" in options else []
+    assert command == ["codex", "exec", "--sandbox", "workspace-write", "-c",
+                       "sandbox_workspace_write.network_access=true", "--skip-git-repo-check", *kept, "{task}"]
 
 
 def test_codex_planner_and_synthesizer_run_in_their_own_directories(fake, monkeypatch):

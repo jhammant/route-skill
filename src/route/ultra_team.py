@@ -927,7 +927,7 @@ def _run_analyst(run: ultra.Run, analyst: Analyst, arm: str, pools: dict[str, Po
         analysis, repaired, why = dispatch_checked(
             run, arm, pools, host, prompt, agent_cwd(arm, pools, host, repo, own_dir), stem, ANALYST_TIMEOUT,
             mcp_config, parse=parse_analysis, error=TeamAnalysisError, begin=ANALYSIS_BEGIN, end=ANALYSIS_END,
-            header=f"Analyst id: {analyst.id}")
+            header=f"Analyst id: {analyst.id}", cancel=cancel)
         if analysis is None:
             if cancel is not None and cancel.is_set():
                 with LOCK:

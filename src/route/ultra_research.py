@@ -65,6 +65,9 @@ MCP_FILE = "research-mcp.json"
 CODEX_SKIP_GIT_CHECK = "--skip-git-repo-check"
 #: Codex's read-only sandbox has no network; workspace-write with network on is the least that can research.
 CODEX_SANDBOX = ["--sandbox", "workspace-write", "-c", "sandbox_workspace_write.network_access=true"]
+#: Codex's own spellings of the two options a template may not set (see ``_strip_codex_options``).
+CODEX_SANDBOX_OPTIONS = ("--sandbox", "-s")
+CODEX_CD_OPTIONS = ("--cd", "-C")
 #: ``S<n>`` source ids; the number is what a rename counts up from.
 SOURCE_NUMBER = re.compile(r"S(\d+)")
 #: How long an interrupted run gives its parts to exit on SIGTERM before SIGKILL.
@@ -158,6 +161,10 @@ class SourceIds:
     """
     refs: dict[str, str] = field(default_factory=dict)
     peak: int = 0
+
+    def known(self, source: dict) -> bool:
+        """Whether the source's id already names its (stripped) ref: the same source cited again."""
+        return self.refs.get(source["id"]) == source["ref"].strip()
 
     def claim(self, source: dict) -> dict | None:
         """Register one source, renaming it in place when its id clashes; the rename made, or None."""
@@ -412,9 +419,18 @@ def parse_answer(text: str) -> Answer:
     gaps = raw["gaps"]
     if not isinstance(gaps, list) or not all(isinstance(gap, str) for gap in gaps):
         raise ResearchAnswerError("'gaps' must be a list of strings")
-    rows = [dict(source) for source in sources]
     ids = SourceIds()
-    renamed = [change for change in (ids.claim(source) for source in rows) if change is not None]
+    rows: list[dict] = []
+    renamed: list[dict] = []
+    for source in sources:
+        row = dict(source)
+        repeat = ids.known(row)
+        change = ids.claim(row)
+        if change is not None:
+            renamed.append(change)
+        elif repeat:
+            continue  # the same ref under the same id: one source, cited twice
+        rows.append(row)
     return Answer(answer=answer, sources=rows, confidence=confidence, gaps=list(gaps), renamed=renamed)
 
 
@@ -461,13 +477,8 @@ def research_template(arm: str, pools: dict[str, Pool], *, host: str = "claude",
         block = ["--strict-mcp-config", "--mcp-config", value, "--disallowedTools", "Edit", "Write", "NotebookEdit"]
         return _join([tokens[0], *block, *rest])
     if program == "codex":
-        if "--sandbox" in tokens:
-            at = tokens.index("--sandbox")
-            if at + 1 < len(tokens) and tokens[at + 1] != "{task}":
-                del tokens[at:at + 2]
-            else:
-                del tokens[at]
-        else:
+        tokens, at = _strip_codex_options(tokens)
+        if at is None:
             at = tokens.index("exec") + 1 if "exec" in tokens else 1
         tokens[at:at] = CODEX_SANDBOX
         if CODEX_SKIP_GIT_CHECK not in tokens:
@@ -479,6 +490,40 @@ def research_template(arm: str, pools: dict[str, Pool], *, host: str = "claude",
             tokens.insert(at + len(CODEX_SANDBOX), CODEX_SKIP_GIT_CHECK)
         return _join(tokens)
     raise ValueError(f"{arm}: cannot make {program!r} read-only; only claude, claude-work and codex are supported")
+
+
+def _strip_codex_options(tokens: list[str]) -> tuple[list[str], int | None]:
+    """The template without its sandbox and working-root options; where the first sandbox option was.
+
+    Codex spells them ``--sandbox X``, ``--sandbox=X``, ``-s X``, ``-sX`` and
+    ``--cd X``, ``--cd=X``, ``-C X``, ``-CX``. A second sandbox option would
+    make Codex reject the command before any work ran, and ``--cd`` would move
+    the agent out of the directory ``agent_cwd`` isolates it in, after the
+    process has started, so with ``--repo`` a workspace-write sandbox would
+    be writing into the repository. Both are the run's to decide, so a
+    template's own values are dropped, whatever they say.
+    """
+    kept: list[str] = []
+    first: int | None = None
+    index = 0
+    while index < len(tokens):
+        tok = tokens[index]
+        if tok == "{task}":
+            kept.extend(tokens[index:])
+            break
+        sandbox = tok in CODEX_SANDBOX_OPTIONS or any(tok.startswith(f"{opt}=") for opt in CODEX_SANDBOX_OPTIONS) \
+            or (tok.startswith("-s") and not tok.startswith("--"))
+        cd = tok in CODEX_CD_OPTIONS or any(tok.startswith(f"{opt}=") for opt in CODEX_CD_OPTIONS) \
+            or (tok.startswith("-C") and not tok.startswith("--"))
+        if sandbox and first is None:
+            first = len(kept)
+        if sandbox or cd:
+            # Only the bare spellings take the next token as their value.
+            index += 2 if tok in CODEX_SANDBOX_OPTIONS + CODEX_CD_OPTIONS else 1
+            continue
+        kept.append(tok)
+        index += 1
+    return kept, first
 
 
 def is_codex(arm: str, pools: dict[str, Pool], host: str = "claude") -> bool:
@@ -603,13 +648,16 @@ Return the corrected JSON only, between the same markers; change nothing except 
 
 def dispatch_checked(run: ultra.Run, arm: str, pools: dict[str, Pool], host: str, prompt: str, cwd: Path, stem: str,
                      timeout: float, mcp_config: Path | None, *, parse, error: type[ValueError], begin: str, end: str,
-                     header: str) -> tuple[object | None, bool, str]:
+                     header: str, cancel: threading.Event | None = None) -> tuple[object | None, bool, str]:
     """One arm's try at a unit, repaired once when it printed a block that did not validate.
 
     (the parsed value or None, whether the repair produced it, why it failed).
     The repair goes to the SAME arm in the same directory, logged as
     ``<stem>-repair.log``. A timeout or an output with no block at all is not
     repaired: there is nothing to correct, and the next arm is the better bet.
+    Nor is a dispatch the run has cancelled (``cancel`` set): the block it
+    left behind was cut short by the run's own signal, and starting another
+    model to mend it would hold the cancellation up for ``REPAIR_TIMEOUT``.
     """
     rc, text = dispatch(run, arm, pools, host, prompt, cwd, f"{stem}.log", timeout, mcp_config)
     if rc == 124:
@@ -625,6 +673,8 @@ def dispatch_checked(run: ultra.Run, arm: str, pools: dict[str, Pool], host: str
         block = None
     if block is None:
         return None, False, reason
+    if cancel is not None and cancel.is_set():
+        return None, False, f"{reason}; run interrupted before the repair"
     rc, text = dispatch(run, arm, pools, host, repair_prompt(first, block, begin, end, header), cwd,
                         f"{stem}-repair.log", REPAIR_TIMEOUT, mcp_config)
     if rc == 124:
@@ -743,7 +793,7 @@ def _run_part(run: ultra.Run, part: Part, arm: str, pools: dict[str, Pool], quot
         answer, repaired, why = dispatch_checked(
             run, arm, pools, host, prompt, agent_cwd(arm, pools, host, repo, own_dir), stem, PART_TIMEOUT, mcp_config,
             parse=parse_answer, error=ResearchAnswerError, begin=ANSWER_BEGIN, end=ANSWER_END,
-            header=f"Part id: {part.id}")
+            header=f"Part id: {part.id}", cancel=cancel)
         if answer is None:
             if cancel is not None and cancel.is_set():
                 with _LOCK:

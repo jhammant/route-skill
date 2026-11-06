@@ -189,11 +189,22 @@ route ultra --research "<question>" --json
 
 `route ultra status` and `route ultra cancel <run-id>` work as in section 3.
 
-Claude arms run without Edit, Write and NotebookEdit, and Codex in a
-read-only sandbox, but a Claude agent still has a shell, and a shell can
-write. So `--repo` is not write-protected: the run compares
+Claude arms run in `--repo` without Edit, Write and NotebookEdit and with a
+strict MCP config, read-only by instruction. Codex arms run
+`codex exec --sandbox workspace-write -c sandbox_workspace_write.network_access=true`:
+the network is on (curl, `npx -y lighthouse` and the PageSpeed API work), and
+each one runs in its own empty directory under the run directory, never inside
+`--repo`, with the absolute `--repo` path named in its prompt to read from, so
+Codex can never write to `--repo`. A Claude agent still has a shell, though,
+and a shell can write. So `--repo` is not write-protected: the run compares
 `git status --porcelain` before and after and only warns about a change in
 `summary.md`, afterwards; it neither prevents nor reverts it.
+
+A part whose answer block is malformed goes back to the same arm once to be
+repaired (`logs/part-<id>-repair.log`, marked repaired in the footer) before
+the next arm redoes it. A source id reused for a different ref is renamed to
+`S<max+1>` and listed under `## Run`. Claim text is not rewritten, so check a
+renamed id's citations against that list.
 
 `research.toml` (in `~/.config/route/`, `mcp_servers = ["name", ...]`) lists
 the MCP servers from `~/.claude.json` background agents may use. It must only
@@ -216,10 +227,18 @@ Read only `summary.md` in the run directory (`plan.json`, `parts/<id>.json`
 and `summary.json` sit next to it). Open a part's log,
 `logs/part-<id>.log`, only when that part failed. Then:
 
-1. Answer every item under `## For your session` here. Those parts need what
-   only this session has: the claude.ai connectors (Gmail, Calendar, Drive),
-   Claude in Chrome and this Mac. The second account's token is
-   inference-only, so the background agents have none of them.
+1. Answer every item under `## For your session` here. Background agents run
+   on this Mac with web search and fetch and a full shell, so they run
+   headless browsers (`npx -y lighthouse`, `npx -y playwright` scripts,
+   headless Chrome), read HTML, JavaScript bundles, robots.txt and sitemaps,
+   query DNS and TLS, and read public documents and policies themselves.
+   Session work is only what needs this session:
+   claude.ai connectors (Gmail, Calendar, Drive), which the second account's
+   inference-only token lacks;
+   a signed-in browser or account (Claude in Chrome, logged-in dashboards);
+   or the Mac's screen, simulator or physical devices. Session work costs the
+   user's own account, so prefer remote: if an item needs none of those, it
+   should have run in the background; answer it anyway and say so.
 2. Give the user ONE merged answer: the report and your session answers
    together, not two reports. Keep the citations, resolving each
    `[part-id:S1]` from the `## Sources` list into a title and link.
@@ -294,10 +313,15 @@ route ultra --team <layout> "<question>" --url <url> --json
 - `--context`, `--session`, `--max-parallel N` and `--allow-lower-models` as
   in research mode.
 
-Analysts run under research mode's rules: no Edit, Write or NotebookEdit,
-Codex read-only, only the MCP servers in `research.toml`, and a porcelain
-warning when `--repo` changed. A Claude analyst still has a shell, so `--repo`
-is not write-protected even without `--fix`. `route ultra status` and
+Analysts, verifiers, critics and the planner run under research mode's rules:
+Claude with no Edit, Write or NotebookEdit; Codex with
+`--sandbox workspace-write` and `network_access=true`, each in its own
+empty directory under the run directory and never inside `--repo`; only the MCP
+servers in `research.toml`; and a porcelain warning when `--repo` changed. A
+Claude analyst still has a shell, so `--repo` is not write-protected even
+without `--fix`. A malformed analyst answer is repaired by the same arm first
+(`logs/analyst-<id>-repair.log`), and a source id reused for a different ref is
+renamed and listed under `## Run`. `route ultra status` and
 `route ultra cancel <run-id>` work as in section 3.
 
 | Exit | Meaning |
@@ -321,9 +345,13 @@ Then tell the user, in this order and in a few lines each:
    recommendation, whatever shape the layout's report has.
 2. The blockers, each with its fix.
 3. The contested points from `## Contested`, with both sides.
-4. The `## For your session` items, answered here: app-review's GUI walkthrough
-   on the simulator, anything that needs the claude.ai connectors or Claude in
-   Chrome. Do them before you reply and say if they change the verdict.
+4. The `## For your session` items, answered here. Session work is only
+   claude.ai connectors (Gmail, Calendar, Drive),
+   a signed-in browser or account (Claude in Chrome, logged-in dashboards),
+   or the Mac's screen, simulator or physical devices, such as app-review's GUI
+   walkthrough on the simulator. Lighthouse, crawls and other headless browsers
+   run in the background. Do the items before you reply and say if they change
+   the verdict.
 5. Analysts that failed or were held, with the reason from the `## Run`
    footer, and the claims under `## Not cross-examined`, which nobody checked.
 

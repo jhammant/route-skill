@@ -363,11 +363,17 @@ route ultra --research "Compare Postgres hosting for an EU B2B app: PITR, RLS, r
 
 `--base` and `--max-units` are ignored with `--research`.
 
-**Read-only.** Claude arms run with `--disallowedTools Edit Write NotebookEdit`
-and a strict MCP config that holds only the allowlisted servers; Codex runs
-with `--sandbox read-only`. A shell can still write, so with `--repo` the run
-compares `git status --porcelain` before and after and warns in `summary.md`
-about any working-tree change it sees. It never reverts one: that's your call.
+**Read-only.** Claude arms run in `--repo` with
+`--disallowedTools Edit Write NotebookEdit` and a strict MCP config that holds
+only the allowlisted servers, so they are read-only by instruction. Codex arms
+run `codex exec --sandbox workspace-write -c sandbox_workspace_write.network_access=true`:
+the network is on, so curl, `npx -y lighthouse` and the PageSpeed API work.
+Each Codex part runs in its own empty directory under the run directory, never
+inside `--repo`, and its prompt names the absolute `--repo` path to read from,
+so Codex can never write to `--repo`. A Claude agent still has a shell, and a
+shell can write, so with `--repo` the run compares `git status --porcelain`
+before and after and warns in `summary.md` about any working-tree change it
+sees. It never reverts one: that's your call.
 
 **MCP allowlist.** Background agents get no MCP servers unless you name them
 in `~/.config/route/research.toml` (`ROUTE_CONFIG_DIR` overrides the directory):
@@ -383,19 +389,36 @@ ends. **List only read-only servers.** The disallowed tools cover Claude's own
 file tools, not MCP tools: a server that can send mail, post, write tickets or
 push code will do it if an agent asks.
 
-**What stays with your session.** The second account's token is
-inference-only, so its agents have no claude.ai connectors (Gmail, Calendar,
-Drive), no Claude in Chrome and no access to this Mac. Parts that need any of
-those are not sent out: `summary.md` lists them under `## For your session`,
-and the session that started the run answers them. /ultra does that for you.
+**What stays with your session.** Background agents run on this Mac with web
+search and fetch and a full shell, so they can run headless browsers
+(`npx -y lighthouse`, `npx -y playwright` scripts, headless Chrome), download
+and read HTML, JavaScript bundles, `robots.txt` and sitemaps, query DNS and
+TLS, and read public documents and policies. Session work is only what needs
+your session itself:
+
+- claude.ai connectors (Gmail, Calendar, Drive), which the second account's
+  inference-only token doesn't have;
+- a signed-in browser or account (Claude in Chrome, logged-in dashboards);
+- the Mac's screen, simulator or physical devices.
+
+Session work costs your own account, so the planner keeps a part remote
+whenever it can run in the background. Parts that need the session are not sent
+out: `summary.md` lists them under `## For your session`, and the session that
+started the run answers them. /ultra does that for you.
 
 Each run lives in `ROUTE_STATE_DIR/ultra/<run-id>/`, like a build run:
-`plan.json` (the parts), `parts/<id>.json` (each answer), `summary.md` and
-`summary.json`, with logs in `logs/`. `summary.md` always has
-`## For your session` and `## Sources`, and a footer with the run id, the arm
-per part, failed or held parts, the MCP servers loaded and the quota per pool
-before and after. `route ultra status` and `route ultra cancel <run-id>` work
-the same for research runs.
+`plan.json` (the parts), `parts/<id>.json` (each answer), `parts/<id>/` (a
+Codex part's working directory), `summary.md` and `summary.json`, with logs in
+`logs/`. `summary.md` always has `## For your session` and `## Sources`, and a
+`## Run` footer with the run id, the arm per part, failed or held parts, the
+MCP servers loaded and the quota per pool before and after. An answer whose
+marked JSON block is malformed goes back to the same arm with the validation
+error first (`logs/part-<id>-repair.log`); a repaired part is marked repaired
+in the footer and in `summary.json`. Only when there is no block, the arm timed
+out or the repair fails does the next arm redo the part. A source id an answer
+reuses for a different ref is renamed to the next free id (`S<max+1>`) and
+listed in the footer, rather than failing the part. `route ultra status` and
+`route ultra cancel <run-id>` work the same for research runs.
 
 | Exit | Meaning |
 |---|---|
@@ -541,6 +564,14 @@ ids (lowercase letters, digits and hyphens); `tier` is `moderate` or `hard`,
 `where` is `remote` or `session` (a session analyst is handed back to you
 rather than sent out), and `targets` is `url`, `repo` or `any`.
 
+Keep `session` for what only your session has, the same rule research mode
+and the team planner and critic follow:
+claude.ai connectors (Gmail, Calendar, Drive),
+a signed-in browser or account (Claude in Chrome, logged-in dashboards),
+or the Mac's screen, simulator or physical devices. Analysts in the background
+can run headless browsers (`npx -y lighthouse`, `npx -y playwright` scripts),
+so a Lighthouse or crawl lens stays `remote`.
+
 ```toml
 [layouts.pricing-page]
 title = "Pricing page review"
@@ -574,13 +605,19 @@ tier = "hard"
 where = "remote"
 ```
 
-**Read-only.** Analysts, verifiers and critics run exactly like research
-agents: the same disallowed tools and Codex sandbox and the same `research.toml`
-MCP allowlist. A Claude analyst still has a shell, and a shell can write, so
-`--repo` is not write-protected even without `--fix`: the run compares
-`git status --porcelain` before and after and warns in `summary.md` about any
-working-tree change it sees. It never reverts one. `--fix` is the only step
-meant to write, and it builds on its own branch.
+**Read-only.** Analysts, verifiers, critics and the planner run exactly like
+research agents: the same disallowed tools, the same `research.toml` MCP
+allowlist, and Codex with `--sandbox workspace-write` and
+`-c sandbox_workspace_write.network_access=true`. Codex never runs inside
+`--repo`: each dispatch gets its own empty directory under the run directory
+(`analysts/<id>/`, `verify/<claim>-<n>/`, `critic/round-<n>/`,
+`plan/attempt-<n>/`), and the prompt's targets name the absolute `--repo` path
+to read from, so Codex never has write access to `--repo`. A Claude analyst
+still has a shell, and a shell can write, so `--repo` is not write-protected
+even without `--fix`: the run compares `git status --porcelain` before and
+after and warns in `summary.md` about any working-tree change it sees. It never
+reverts one. `--fix` is the only step meant to write, and it builds on its own
+branch.
 
 **Tracker checks and DNS.** Analysts fetch from this machine's network. If it
 blocks trackers at DNS (Pi-hole, NextDNS, a router ad-blocker, some VPNs),
@@ -591,8 +628,12 @@ Check such a finding from another network before acting on it.
 Each run lives in `ROUTE_STATE_DIR/ultra/<run-id>/`: `plan.json` (the team,
 its arms and the intensity), `analysts/<id>.json`, `claims.json`,
 `verdicts.json`, `summary.md` and `summary.json` (`"mode": "team"`), with logs
-in `logs/`. `route ultra status` and `route ultra cancel <run-id>` work the
-same for team runs. `--research` and `--team` together are an error.
+in `logs/`. An analyst's malformed answer is repaired as in research mode
+(`logs/analyst-<id>-repair.log`, marked repaired in `## Run`) before another
+arm redoes it, and a source id an analyst reuses for a different ref is renamed
+to `S<max+1>` and listed under `## Run` instead of failing the analyst.
+`route ultra status` and `route ultra cancel <run-id>` work the same for team
+runs. `--research` and `--team` together are an error.
 
 | Exit | Meaning |
 |---|---|

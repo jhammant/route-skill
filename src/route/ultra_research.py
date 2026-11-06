@@ -472,7 +472,7 @@ def research_mcp_config(run_dir: Path) -> tuple[Path | None, dict]:
 
 # -- dispatch --------------------------------------------------------------------
 
-def _dispatch(run: ultra.Run, arm: str, pools: dict[str, Pool], host: str, prompt: str, cwd: Path,
+def dispatch(run: ultra.Run, arm: str, pools: dict[str, Pool], host: str, prompt: str, cwd: Path,
               log_name: str, timeout: float, mcp_config: Path | None) -> tuple[int, str]:
     """Run one read-only model on a prompt in a directory, logging to the run dir; (exit code, output)."""
     log = run.dir / "logs" / log_name
@@ -496,7 +496,7 @@ def _dispatch(run: ultra.Run, arm: str, pools: dict[str, Pool], host: str, promp
         return rc, ""
 
 
-def _supported(arm: str, pools: dict[str, Pool], host: str) -> bool:
+def supported(arm: str, pools: dict[str, Pool], host: str) -> bool:
     try:
         research_template(arm, pools, host=host, mcp_config=None)
     except ValueError:
@@ -504,7 +504,7 @@ def _supported(arm: str, pools: dict[str, Pool], host: str) -> bool:
     return True
 
 
-def _worker_arm(pools: dict[str, Pool], quota: dict, *, tier: str, host: str, allow_lower: bool,
+def worker_arm(pools: dict[str, Pool], quota: dict, *, tier: str, host: str, allow_lower: bool,
                 exclude: set[str] = frozenset()) -> str | None:
     """The arm ``pick`` would choose for the part, skipping arms whose command cannot be made read-only.
 
@@ -512,11 +512,11 @@ def _worker_arm(pools: dict[str, Pool], quota: dict, *, tier: str, host: str, al
     candidates are walked in their order with the same tier preference.
     """
     first = pick("worker", pools, quota, tier=tier, host=host, allow_lower=allow_lower) if not exclude else None
-    if first is not None and first not in exclude and _supported(first, pools, host):
+    if first is not None and first not in exclude and supported(first, pools, host):
         return first
     skipped = set(exclude) | ({first} if first is not None else set())
     usable = [arm for arm in candidates(pools, quota, host=host, allow_lower=allow_lower, exclude_arms=skipped)
-              if _supported(arm, pools, host)]
+              if supported(arm, pools, host)]
     if not usable:
         return None
     preferred = 3 if tier in {"hard", "open-ended"} else 2
@@ -527,7 +527,7 @@ def _worker_arm(pools: dict[str, Pool], quota: dict, *, tier: str, host: str, al
 
 def _plan_once(run: ultra.Run, planner: str, pools: dict[str, Pool], host: str, prompt: str, cwd: Path,
                max_parts: int, attempt: int, mcp_config: Path | None) -> tuple[ResearchPlan | None, list[str]]:
-    rc, text = _dispatch(run, planner, pools, host, prompt, cwd, f"plan-{attempt}.log", PLANNER_TIMEOUT, mcp_config)
+    rc, text = dispatch(run, planner, pools, host, prompt, cwd, f"plan-{attempt}.log", PLANNER_TIMEOUT, mcp_config)
     if rc == 124:
         return None, ["planner timed out"]
     try:
@@ -571,7 +571,7 @@ def _print_plan(plan: ResearchPlan, arms: dict[str, str], held: list[dict], plan
 
 # -- parts -----------------------------------------------------------------------
 
-def _git_porcelain(repo: Path) -> list[str] | None:
+def git_porcelain(repo: Path) -> list[str] | None:
     """``git status --porcelain`` lines, or None when the directory is not a git work tree."""
     probe = subprocess.run(["git", "-C", str(repo), "rev-parse", "--is-inside-work-tree"],
                            capture_output=True, text=True, errors="replace")
@@ -597,7 +597,7 @@ def _run_part(run: ultra.Run, part: Part, arm: str, pools: dict[str, Pool], quot
         tried.append(arm)
         with _LOCK:
             run.unit(part.id, arm=arm, state="running", attempts=list(tried))
-        rc, text = _dispatch(run, arm, pools, host, prompt, cwd, f"part-{part.id}.log"
+        rc, text = dispatch(run, arm, pools, host, prompt, cwd, f"part-{part.id}.log"
                              if len(tried) == 1 else f"part-{part.id}-{len(tried)}.log", PART_TIMEOUT, mcp_config)
         try:
             if rc == 124:
@@ -610,7 +610,7 @@ def _run_part(run: ultra.Run, part: Part, arm: str, pools: dict[str, Pool], quot
                 return {"id": part.id, "state": "interrupted", "arm": arm, "answer": None,
                         "reason": "run interrupted", "attempts": tried}
             failures.append(f"{arm}: {exc}" + (f" (exit {rc})" if rc not in (0, 124) else ""))
-            arm = (_worker_arm(pools, quota, tier=part.tier, host=host, allow_lower=allow_lower, exclude=set(tried))
+            arm = (worker_arm(pools, quota, tier=part.tier, host=host, allow_lower=allow_lower, exclude=set(tried))
                    if len(tried) < 2 else None)
             continue
         atomic_write(run.dir / "parts" / f"{part.id}.json",
@@ -627,7 +627,7 @@ def _run_part(run: ultra.Run, part: Part, arm: str, pools: dict[str, Pool], quot
             "reason": reason, "attempts": tried}
 
 
-def _stop_parts(run: ultra.Run, cancel: threading.Event, executor: ThreadPoolExecutor, futures: list) -> None:
+def stop_parts(run: ultra.Run, cancel: threading.Event, executor: ThreadPoolExecutor, futures: list) -> None:
     """Stop every part, running or queued, and return only once their threads have ended.
 
     ``executor.shutdown(wait=True)`` alone would wait for the running delegates
@@ -667,9 +667,14 @@ def fallback_report(question: str, parts: list[tuple[Part, Answer]]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _sources_section(body: str, answered: dict[str, tuple[Part, Answer]]) -> list[str]:
-    """Every cite in the body resolved (or flagged), then every source the body never cited."""
-    index = {(part_id, src.get("id")): src for part_id, (_, answer) in answered.items() for src in answer.sources}
+def sources_section(body: str, sources: dict[str, list[dict]]) -> list[str]:
+    """Every cite in the body resolved (or flagged), then every source the body never cited.
+
+    ``sources`` maps a cite prefix (a research part id, a team analyst id) to
+    its source dicts (``id``, ``ref``, ``note``), so research and team runs
+    share one resolver and one ``[prefix:S1]`` format.
+    """
+    index = {(prefix, src.get("id")): src for prefix, rows in sources.items() for src in rows}
     lines = ["## Sources", ""]
     cited: list[tuple[str, str]] = []
     for match in CITE.finditer(body):
@@ -692,7 +697,7 @@ def _sources_section(body: str, answered: dict[str, tuple[Part, Answer]]) -> lis
     return lines
 
 
-def _quota_table(usage_before: dict, usage_after: dict) -> dict:
+def quota_table(usage_before: dict, usage_after: dict) -> dict:
     quota = {}
     for provider in sorted(set(usage_before) | set(usage_after)):
         before, after = usage_before.get(provider, {}), usage_after.get(provider, {})
@@ -707,7 +712,7 @@ def _summary_md(summary: dict, body: str, answered: dict[str, tuple[Part, Answer
         lines += [f"- {part.id}: {part.question.strip()} (needs: {part.needs.strip()})" for part in session_parts]
     else:
         lines.append("Nothing: every part ran in the background.")
-    lines += [""] + _sources_section(body, answered)
+    lines += [""] + sources_section(body, {part_id: answer.sources for part_id, (_, answer) in answered.items()})
     lines += ["", "## Run", "", f"- Run: {summary['run_id']}",
               f"- Planner: {summary['planner'] or '-'}; synthesizer: {summary['synthesizer'] or 'none (deterministic report)'}"]
     arms = [f"{part['id']}: {part['arm']}" for part in summary["parts"] if part.get("arm")]
@@ -758,7 +763,7 @@ def _report(run: ultra.Run, question: str, plan: ResearchPlan | None, body: str,
         "planner": run.progress.get("planner"), "synthesizer": synthesizer, "parts": rows,
         "held": run.progress.get("held", []), "plan_problems": run.progress.get("plan_problems", []),
         "mcp_servers": {k: v for k, v in mcp_info.items()}, "porcelain_changes": list(porcelain),
-        "quota": _quota_table(usage_before, usage_after), "exit_code": exit_code, "run_dir": str(run.dir),
+        "quota": quota_table(usage_before, usage_after), "exit_code": exit_code, "run_dir": str(run.dir),
         "context": run.progress.get("context"), "notes": run.progress.get("notes", []),
     }
     text = _summary_md(summary, body, answered, session_parts)
@@ -805,7 +810,7 @@ def run_research(question: str, *, repo: str | Path | None = None, context: str 
         return 2
     run.save()
     print(f"ultra: run {run.id} at {run.dir}", flush=True)
-    previous = _trap_sigterm()
+    previous = trap_sigterm()
     try:
         return _execute(run, question, repo_path, context, session, max_parts, max_parallel, plan_only,
                         allow_lower, json_out, host)
@@ -819,7 +824,7 @@ def run_research(question: str, *, repo: str | Path | None = None, context: str 
             signal.signal(signal.SIGTERM, previous)
 
 
-def _trap_sigterm():
+def trap_sigterm():
     """Make SIGTERM (what ``route ultra cancel`` sends) behave like Ctrl-C; the handler it replaced.
 
     The default action would end the process at once, skipping the ``finally``
@@ -851,9 +856,9 @@ def _execute(run: ultra.Run, question: str, repo: Path | None, context: str, ses
     work_dir = repo if repo is not None else run.dir
 
     planner = pick("planner", pools, quota, host=host, allow_lower=allow_lower)
-    if planner is not None and not _supported(planner, pools, host):
+    if planner is not None and not supported(planner, pools, host):
         planner = next((arm for arm in candidates(pools, quota, host=host, allow_lower=allow_lower)
-                        if _supported(arm, pools, host)), None)
+                        if supported(arm, pools, host)), None)
     if planner is None:
         return _give_up(run, "no usable model has quota to plan (try --allow-lower-models)", question, None,
                         mcp_info, usage_before, json_out)
@@ -871,7 +876,7 @@ def _execute(run: ultra.Run, question: str, repo: Path | None, context: str, ses
         if part.where == "session":
             run.unit(part.id, state="session", where="session", tier=part.tier, reason=f"needs: {part.needs}")
             continue
-        arm = _worker_arm(pools, quota, tier=part.tier, host=host, allow_lower=allow_lower)
+        arm = worker_arm(pools, quota, tier=part.tier, host=host, allow_lower=allow_lower)
         if arm is None:
             reason = "no usable model has quota (or none can be made read-only)"
             run.progress["held"].append({"id": part.id, "reason": reason})
@@ -889,7 +894,7 @@ def _execute(run: ultra.Run, question: str, repo: Path | None, context: str, ses
         return _give_up(run, "no usable model has quota for any part", question, plan, mcp_info, usage_before,
                         json_out)
 
-    porcelain_before = _git_porcelain(repo) if repo is not None else None
+    porcelain_before = git_porcelain(repo) if repo is not None else None
     (run.dir / "parts").mkdir(exist_ok=True)
     run.step("running", f"{len(arms)} part(s), up to {max_parallel} in parallel")
     results: dict[str, dict] = {}
@@ -908,12 +913,12 @@ def _execute(run: ultra.Run, question: str, repo: Path | None, context: str, ses
         for part_id, future in futures.items():
             results[part_id] = future.result()
     except BaseException:
-        _stop_parts(run, cancel, executor, list(futures.values()))
+        stop_parts(run, cancel, executor, list(futures.values()))
         raise
     executor.shutdown(wait=True)
     porcelain: list[str] = []
     if porcelain_before is not None:
-        after = _git_porcelain(repo) or []
+        after = git_porcelain(repo) or []
         porcelain = [line for line in after if line not in porcelain_before] + \
                     [f"(no longer) {line}" for line in porcelain_before if line not in after]
         if porcelain:
@@ -922,13 +927,13 @@ def _execute(run: ultra.Run, question: str, repo: Path | None, context: str, ses
     answered = {part.id: (part, results[part.id]["answer"]) for part in plan.remote
                 if part.id in results and results[part.id]["state"] == "answered"}
     synthesizer = pick("integrator", pools, quota, host=host, allow_lower=allow_lower)
-    if synthesizer is not None and not _supported(synthesizer, pools, host):
+    if synthesizer is not None and not supported(synthesizer, pools, host):
         synthesizer = next((arm for arm in candidates(pools, quota, host=host, allow_lower=allow_lower)
-                            if _supported(arm, pools, host)), None)
+                            if supported(arm, pools, host)), None)
     body = None
     if synthesizer is not None and answered:
         run.step("synthesizing", f"by {synthesizer}")
-        rc, text = _dispatch(run, synthesizer, pools, host, synthesis_prompt(question, answered, plan.session),
+        rc, text = dispatch(run, synthesizer, pools, host, synthesis_prompt(question, answered, plan.session),
                              run.dir, "synthesis.log", SYNTHESIS_TIMEOUT, mcp_config)
         try:
             body = _marked_block(text, REPORT_BEGIN, REPORT_END, ResearchReportError) if rc == 0 else None

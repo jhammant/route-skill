@@ -383,7 +383,8 @@ def test_team_intensity_thresholds_overrides_and_the_last_two_days(window, headr
     """Spare quota picks the size; an override or low headroom wins; a day before reset is not zeroed."""
     intensity = team_intensity(window, headroom, override)
 
-    assert intensity.name == name and intensity.why.startswith(name + ":")
+    assert intensity.name == name and not intensity.why.startswith(name)
+    assert intensity.label == f"{name} ({intensity.why})" and intensity.to_dict()["label"] == intensity.label
     assert (intensity.team_size, intensity.verifiers, intensity.rounds, intensity.max_claims) == \
         ultra_team.INTENSITIES[name]
 
@@ -488,7 +489,8 @@ def test_full_run_analyses_cross_examines_critiques_and_reports(fake, capsys):
     assert "- [copy:S9] UNRESOLVED" in text
     assert "- Team: seo: claude-work; perf: claude-work; copy: codex; gui: session" in text
     assert "- Layout: site-check (Site check)" in text
-    assert "- Intensity: standard (team 5, 1 verifier(s) per claim, 1 critic round(s), 12 claims examined)" in text
+    assert ("- Intensity: standard (no weekly window to pace against); team 5, 1 verifier(s) per claim, "
+            "1 critic round(s), 12 claims examined") in text
     assert "- Claims: 1 upheld, 1 contested, 1 refuted, 0 not cross-examined; verifiers per claim: 1; " \
            "independence: 3 cross-family, 0 same-family" in text
     assert "- Critic rounds run: 1" in text
@@ -555,7 +557,8 @@ def test_malformed_analysis_is_retried_on_the_other_arm(fake):
     assert rc == 0, (run_dir / "summary.md").read_text()
     seo_calls = [row for row in calls(fake) if row[1] == "analyst" and row[2] == "seo"]
     assert [row[0] for row in seo_calls] == ["claude-work", "codex"]
-    assert seo_calls[1][3] == "exec --sandbox read-only --skip-git-repo-check"
+    assert seo_calls[1][3] == ("exec --sandbox workspace-write -c sandbox_workspace_write.network_access=true "
+                               "--skip-git-repo-check")
     seo = next(row for row in summary["analysts"] if row["id"] == "seo")
     assert seo["arm"] == "codex" and seo["attempts"] == ["claude-work", "codex"]
     assert (run_dir / "logs" / "analyst-seo-2.log").is_file()
@@ -888,7 +891,7 @@ def test_plan_only_writes_the_plan_and_dispatches_nothing(fake, capsys):
     assert plan["layout"] == "site-check" and plan["intensity"]["name"] == "standard"
     out = capsys.readouterr().out
     assert "copy\tremote\tmoderate\tcodex\tCopy analyst" in out and "gui\tsession\tmoderate\t-\tGUI walker" in out
-    assert "intensity: standard: standard: no weekly window" in out
+    assert "intensity: standard (no weekly window to pace against)\n" in out and out.count("standard") == 1
     progress = json.loads((run_dir / "progress.json").read_text())
     assert progress["state"] == "planned" and progress["mode"] == "team"
     assert not (run_dir / "summary.md").exists() and not (run_dir / "research-mcp.json").exists()
@@ -900,7 +903,9 @@ def test_plan_only_json_prints_the_team(fake, capsys):
     rc = run_team(QUESTION, layout="site-check", urls=(URL,), plan_only=True, json_out=True, host="claude")
 
     payload = json.loads(capsys.readouterr().out.split("\n", 1)[1])
-    assert rc == 0 and payload["layout"] == "site-check" and payload["intensity"]["why"].startswith("standard")
+    assert rc == 0 and payload["layout"] == "site-check"
+    assert payload["intensity"]["why"] == "no weekly window to pace against"
+    assert payload["intensity"]["label"] == "standard (no weekly window to pace against)"
 
 
 def test_no_usable_arm_for_any_analyst_exits_two(fake, monkeypatch):

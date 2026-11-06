@@ -273,19 +273,29 @@ def test_research_template_for_the_host_arm_uses_the_default_template():
     assert shlex.split(template)[3] == '{"mcpServers":{}}'
 
 
-def test_research_template_forces_codex_read_only(fake):
-    """Codex gets a read-only sandbox and skips its git check: research directories are not repositories."""
+CODEX_FLAGS = ["--sandbox", "workspace-write", "-c", "sandbox_workspace_write.network_access=true",
+               "--skip-git-repo-check"]
+
+
+def test_research_template_gives_codex_a_networked_workspace_sandbox(fake):
+    """Codex's read-only sandbox has no network, so research gets workspace-write with network on, never
+    read-only; the git check is skipped because Codex runs in an empty run directory, not a repository."""
     pools = pools_for_host(load_pools(), "claude")
     bare = {**pools, "codex": replace(pools["codex"], dispatch="codex exec {task}")}
     no_exec = {**pools, "codex": replace(pools["codex"], dispatch="codex {task}")}
+    other = {**pools, "codex": replace(pools["codex"], dispatch="codex exec --sandbox danger-full-access {task}")}
 
     forced = research_template("codex", pools, host="claude", mcp_config=None)
     inserted = research_template("codex", bare, host="claude", mcp_config=None)
     without_exec = research_template("codex", no_exec, host="claude", mcp_config=None)
+    replaced = research_template("codex", other, host="claude", mcp_config=None)
 
-    assert shlex.split(forced)[1:] == ["exec", "--sandbox", "read-only", "--skip-git-repo-check", "{task}"]
-    assert inserted == "codex exec --sandbox read-only --skip-git-repo-check {task}"
-    assert without_exec == "codex --sandbox read-only --skip-git-repo-check {task}"
+    assert shlex.split(forced)[1:] == ["exec", *CODEX_FLAGS, "{task}"]
+    assert inserted == "codex exec " + " ".join(CODEX_FLAGS) + " {task}"
+    assert without_exec == "codex " + " ".join(CODEX_FLAGS) + " {task}"
+    assert replaced == inserted and "danger-full-access" not in replaced
+    for template in (forced, inserted, without_exec, replaced):
+        assert "read-only" not in template and template.count("--sandbox") == 1
 
 
 def test_research_template_refuses_unsupported_programs(fake):
@@ -426,7 +436,7 @@ def test_malformed_answer_is_retried_on_the_other_arm(fake):
     assert rc == 0, (run_dir / "summary.md").read_text()
     alpha_calls = [row for row in calls(fake) if row[1] == "part" and row[2] == "alpha"]
     assert [row[0] for row in alpha_calls] == ["claude-work", "codex"]
-    assert alpha_calls[1][3] == "exec --sandbox read-only --skip-git-repo-check"
+    assert alpha_calls[1][3] == "exec " + " ".join(CODEX_FLAGS)
     alpha = next(row for row in summary["parts"] if row["id"] == "alpha")
     assert alpha["arm"] == "codex" and alpha["attempts"] == ["claude-work", "codex"]
     assert (run_dir / "logs" / "part-alpha-2.log").is_file()

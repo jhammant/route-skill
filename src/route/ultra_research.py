@@ -7,9 +7,12 @@ the user allowlisted, read access to ``--repo`` when given), a synthesizer
 writes one report, and the run itself appends what only this session can do
 and a sources section that resolves every citation.
 
-Agents are forced read-only at the command line (``--disallowedTools Edit
-Write NotebookEdit`` for Claude, ``--sandbox read-only`` for Codex) and told so
-in their brief; a repository handed over with ``--repo`` is checked with ``git
+Agents are told they are read-only in their brief and held to it at the
+command line: Claude arms get ``--disallowedTools Edit Write NotebookEdit``;
+Codex arms get ``--sandbox workspace-write`` with network access on (research
+needs the web, and Codex's read-only sandbox has none), so every Codex
+dispatch runs in its own empty directory under the run directory and never in
+``--repo``. A repository handed over with ``--repo`` is checked with ``git
 status --porcelain`` before and after, and any difference is reported, never
 reverted. Nothing here ever asks for approval.
 """
@@ -51,6 +54,8 @@ REPORT_END = "ULTRA-REPORT-END"
 PLANNER_TIMEOUT = 1800
 PART_TIMEOUT = 1800
 SYNTHESIS_TIMEOUT = 1800
+#: A repair only re-emits a block the agent already wrote, so it gets a third of a fresh attempt.
+REPAIR_TIMEOUT = 600
 
 PART_ID = re.compile(r"[a-z0-9][a-z0-9-]{0,40}")
 WHERE = ("remote", "session")
@@ -58,6 +63,10 @@ TIERS = ("moderate", "hard")
 CONFIDENCE = ("high", "medium", "low")
 MCP_FILE = "research-mcp.json"
 CODEX_SKIP_GIT_CHECK = "--skip-git-repo-check"
+#: Codex's read-only sandbox has no network; workspace-write with network on is the least that can research.
+CODEX_SANDBOX = ["--sandbox", "workspace-write", "-c", "sandbox_workspace_write.network_access=true"]
+#: ``S<n>`` source ids; the number is what a rename counts up from.
+SOURCE_NUMBER = re.compile(r"S(\d+)")
 #: How long an interrupted run gives its parts to exit on SIGTERM before SIGKILL.
 CANCEL_GRACE = 5.0
 #: Agents read ``[part-id:S1]`` from the synthesizer's report; the run resolves them.
@@ -66,6 +75,15 @@ CITE = re.compile(r"\[([a-z0-9][a-z0-9-]{0,40}):(S\d+)\]")
 READ_ONLY_RULES = ("You are READ-ONLY. Never send, post, create, book, buy, subscribe, delete or change "
                    "anything anywhere: no email, no messages, no calendar events, no files outside "
                    "scratch output, no commits, no settings. Investigate, then report.")
+#: Where work may run, for every planner and the critic, so "session" is never used for what a shell can do.
+WHERE_RULES = (
+    "Where work may run: background agents run on this Mac with web search and fetch and a full shell, so "
+    "they CAN run headless browsers (`npx -y lighthouse`, `npx -y playwright` scripts, headless Chrome), "
+    "download and read HTML, JavaScript bundles, robots.txt and sitemaps, query DNS and TLS, and read public "
+    "documents and policies. Mark work \"session\" ONLY when it needs (a) claude.ai connectors (Gmail, "
+    "Calendar, Drive); (b) a signed-in browser or account (Claude in Chrome, logged-in dashboards); or (c) "
+    "the Mac's screen, simulator or physical devices. Session work costs the user's own account, so prefer "
+    "\"remote\" whenever it can be done in the background.")
 
 _LOCK = threading.RLock()
 
@@ -120,10 +138,41 @@ class Answer:
     sources: list[dict] = field(default_factory=list)
     confidence: str = "low"
     gaps: list[str] = field(default_factory=list)
+    #: ``{"from": "S1", "to": "S3", "ref": ...}`` per source id the parser had to rename.
+    renamed: list[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {"answer": self.answer, "sources": list(self.sources), "confidence": self.confidence,
-                "gaps": list(self.gaps)}
+                "gaps": list(self.gaps), "renamed": list(self.renamed)}
+
+
+@dataclass
+class SourceIds:
+    """One answer's (or analysis's) source-id namespace: each id names one reference.
+
+    Agents reuse ``S1`` across findings for different references; that must not
+    sink an otherwise good answer, nor may ``[unit:S1]`` resolve to either. A
+    source whose id is already taken by a DIFFERENT ref (compared stripped) is
+    renamed to ``S<max+1>``, where max is the highest ``S<n>`` seen so far,
+    renames included; the same ref under the same id is the same source.
+    """
+    refs: dict[str, str] = field(default_factory=dict)
+    peak: int = 0
+
+    def claim(self, source: dict) -> dict | None:
+        """Register one source, renaming it in place when its id clashes; the rename made, or None."""
+        identity, ref = source["id"], source["ref"].strip()
+        match = SOURCE_NUMBER.fullmatch(identity.strip())
+        if match:
+            self.peak = max(self.peak, int(match.group(1)))
+        known = self.refs.setdefault(identity, ref)
+        if known == ref:
+            return None
+        self.peak += 1
+        fresh = f"S{self.peak}"
+        self.refs[fresh] = ref
+        source["id"] = fresh
+        return {"from": identity, "to": fresh, "ref": ref}
 
 
 # -- prompts ---------------------------------------------------------------------
@@ -154,10 +203,9 @@ many tiny ones; one part is fine when the question does not split.
 
 Remote parts are answered by background agents with web search and fetch, a shell, {_mcp_note(list(mcp_names))},
 and nothing else. {repo_line}
-A part that needs claude.ai connectors (Gmail, Calendar, Drive), Claude in Chrome, or this Mac
-(local apps, the screen, devices, files outside the repository) CANNOT run in the background: mark it
-"where": "session" and say in "needs" exactly which of those it needs, so the user's own session can
-do it afterwards.
+{WHERE_RULES}
+A session part gets "where": "session" and says in "needs" exactly which connector, account or device it
+needs, so the user's own session can do it afterwards.
 
 Each part needs:
 - "id": lowercase letters, digits and hyphens, at most 41 characters, unique.
@@ -181,12 +229,16 @@ Think as you need, then print ONLY this, as the last thing, with nothing after i
 """
 
 
-def part_prompt(question: str, part: Part, *, context_note: str = "", mcp_names: list[str] = ()) -> str:
+def part_prompt(question: str, part: Part, *, context_note: str = "", mcp_names: list[str] = (),
+                repo: Path | None = None) -> str:
     """One remote part's brief: the question, its sub-question, the rules and the answer format.
 
-    ``Part id:`` is on its own line so the log and the retry can be matched to the part.
+    ``Part id:`` is on its own line so the log and the retry can be matched to
+    the part. The repository is named by absolute path because a Codex part
+    runs in an empty directory of its own, not in ``--repo``.
     """
     note = f"\n{context_note.strip()}\n" if context_note.strip() else ""
+    repo_line = f"\n- Repository (read access): {repo}" if repo is not None else ""
     return f"""You are one agent in an automated parallel investigation ("route ultra --research").
 Part id: {part.id}
 {READ_ONLY_RULES}
@@ -202,7 +254,7 @@ Part id: {part.id}
 # Rules
 
 - Read only: use web search and fetch, your shell for reading and computing, {_mcp_note(list(mcp_names))},
-  and the files in your working directory. Write no files: your answer goes in your output.
+  and the files in your working directory. Write no files: your answer goes in your output.{repo_line}
 - Cite every claim with a source id from your "sources" list; a claim without a source is a gap.
 - Say what you could not find under "gaps" instead of guessing.
 - Finish with ONE JSON object between the markers, as the last thing you print, nothing after it:
@@ -325,7 +377,11 @@ def lint_research_plan(plan: ResearchPlan, *, max_parts: int) -> list[str]:
 
 
 def parse_answer(text: str) -> Answer:
-    """The last marked JSON object in a part's output, with every field checked."""
+    """The last marked JSON object in a part's output, with every field checked.
+
+    A source id reused for a different reference is renamed, never rejected
+    (see ``SourceIds``); the renames come back on ``Answer.renamed``.
+    """
     block = _marked_block(text or "", ANSWER_BEGIN, ANSWER_END, ResearchAnswerError)
     if block is None:
         raise ResearchAnswerError(f"no {ANSWER_BEGIN} block in the output")
@@ -356,8 +412,10 @@ def parse_answer(text: str) -> Answer:
     gaps = raw["gaps"]
     if not isinstance(gaps, list) or not all(isinstance(gap, str) for gap in gaps):
         raise ResearchAnswerError("'gaps' must be a list of strings")
-    return Answer(answer=answer, sources=[dict(source) for source in sources], confidence=confidence,
-                  gaps=list(gaps))
+    rows = [dict(source) for source in sources]
+    ids = SourceIds()
+    renamed = [change for change in (ids.claim(source) for source in rows) if change is not None]
+    return Answer(answer=answer, sources=rows, confidence=confidence, gaps=list(gaps), renamed=renamed)
 
 
 # -- read-only command lines -----------------------------------------------------
@@ -369,14 +427,16 @@ def _join(tokens: list[str]) -> str:
 
 def research_template(arm: str, pools: dict[str, Pool], *, host: str = "claude",
                       mcp_config: Path | None = None) -> str:
-    """The arm's dispatch template made read-only, with only the allowlisted MCP servers.
+    """The arm's dispatch template made safe for research, with only the allowlisted MCP servers.
 
     Claude arms get ``--strict-mcp-config --mcp-config <file> --disallowedTools
     Edit Write NotebookEdit`` right after the program; both options are
     variadic, so the template's own next token must be an option, never
     ``{task}`` (which would be swallowed as a tool name). Codex arms get
-    ``--sandbox read-only --skip-git-repo-check``. Anything else cannot be
-    made read-only here.
+    ``--sandbox workspace-write -c sandbox_workspace_write.network_access=true
+    --skip-git-repo-check``: the read-only sandbox has no network, so Codex is
+    confined by WHERE it runs instead (``agent_cwd``: an empty directory of its
+    own, never ``--repo``). Anything else cannot be made safe here.
     """
     tokens = shlex.split(dispatch_template(arm, pools, host=host))
     if not tokens:
@@ -404,20 +464,44 @@ def research_template(arm: str, pools: dict[str, Pool], *, host: str = "claude",
         if "--sandbox" in tokens:
             at = tokens.index("--sandbox")
             if at + 1 < len(tokens) and tokens[at + 1] != "{task}":
-                tokens[at + 1] = "read-only"
+                del tokens[at:at + 2]
             else:
-                tokens.insert(at + 1, "read-only")
+                del tokens[at]
         else:
             at = tokens.index("exec") + 1 if "exec" in tokens else 1
-            tokens[at:at] = ["--sandbox", "read-only"]
+        tokens[at:at] = CODEX_SANDBOX
         if CODEX_SKIP_GIT_CHECK not in tokens:
-            # Research parts, the planner and the synthesizer run in fresh run
-            # directories that are not git work trees; Codex refuses those
-            # without this flag. The sandbox is read-only, so the check that the
-            # flag skips (a writable agent outside version control) does not apply.
-            tokens.insert(tokens.index("read-only") + 1, CODEX_SKIP_GIT_CHECK)
+            # Every Codex dispatch runs in an empty directory under the run
+            # directory, which is not a git work tree; Codex refuses those
+            # without this flag. The directory is the agent's own, so the check
+            # the flag skips (a writable agent loose in an unversioned tree)
+            # has nothing to protect there.
+            tokens.insert(at + len(CODEX_SANDBOX), CODEX_SKIP_GIT_CHECK)
         return _join(tokens)
     raise ValueError(f"{arm}: cannot make {program!r} read-only; only claude, claude-work and codex are supported")
+
+
+def is_codex(arm: str, pools: dict[str, Pool], host: str = "claude") -> bool:
+    """Whether the arm's dispatch template runs Codex, by the program's basename."""
+    try:
+        tokens = shlex.split(dispatch_template(arm, pools, host=host))
+    except ValueError:
+        return False
+    return bool(tokens) and os.path.basename(tokens[0]) == "codex"
+
+
+def agent_cwd(arm: str, pools: dict[str, Pool], host: str, shared: Path | None, own: Path) -> Path:
+    """Where one dispatch runs: Codex always in ``own`` (created, empty, under the run directory).
+
+    Codex's sandbox lets it write to its working directory, so it never gets
+    ``--repo``; a Claude arm runs in ``shared`` (the repository, or the run
+    directory for a synthesizer) when given, else in ``own`` too. Chosen per
+    attempt: a retry may move a unit from one program to the other.
+    """
+    if shared is not None and not is_codex(arm, pools, host):
+        return shared
+    own.mkdir(parents=True, exist_ok=True)
+    return own
 
 
 # -- MCP allowlist ---------------------------------------------------------------
@@ -496,6 +580,61 @@ def dispatch(run: ultra.Run, arm: str, pools: dict[str, Pool], host: str, prompt
         return rc, ""
 
 
+def repair_prompt(error: str, block: str, begin: str, end: str, header: str = "") -> str:
+    """Hand an agent its own block back with what failed; cheaper than a fresh attempt elsewhere.
+
+    ``header`` (``Part id: x`` / ``Analyst id: x``) comes first so logs and
+    stand-in arms can match the repair to its unit.
+    """
+    head = f"{header.strip()}\n" if header.strip() else ""
+    return f"""{head}Your previous output was received, but the JSON between the markers did not validate:
+
+{error.strip()}
+
+This is the exact text between {begin} and {end}:
+
+{begin}
+{block}
+{end}
+
+Return the corrected JSON only, between the same markers; change nothing except what the error requires.
+"""
+
+
+def dispatch_checked(run: ultra.Run, arm: str, pools: dict[str, Pool], host: str, prompt: str, cwd: Path, stem: str,
+                     timeout: float, mcp_config: Path | None, *, parse, error: type[ValueError], begin: str, end: str,
+                     header: str) -> tuple[object | None, bool, str]:
+    """One arm's try at a unit, repaired once when it printed a block that did not validate.
+
+    (the parsed value or None, whether the repair produced it, why it failed).
+    The repair goes to the SAME arm in the same directory, logged as
+    ``<stem>-repair.log``. A timeout or an output with no block at all is not
+    repaired: there is nothing to correct, and the next arm is the better bet.
+    """
+    rc, text = dispatch(run, arm, pools, host, prompt, cwd, f"{stem}.log", timeout, mcp_config)
+    if rc == 124:
+        return None, False, "timed out"
+    try:
+        return parse(text), False, ""
+    except error as exc:
+        first = str(exc)
+    reason = first + (f" (exit {rc})" if rc != 0 else "")
+    try:
+        block = _marked_block(text, begin, end, error)
+    except error:
+        block = None
+    if block is None:
+        return None, False, reason
+    rc, text = dispatch(run, arm, pools, host, repair_prompt(first, block, begin, end, header), cwd,
+                        f"{stem}-repair.log", REPAIR_TIMEOUT, mcp_config)
+    if rc == 124:
+        return None, False, f"{reason}; repair timed out"
+    try:
+        return parse(text), True, ""
+    except error as exc:
+        return None, False, f"{reason}; repair: {exc}"
+
+
 def supported(arm: str, pools: dict[str, Pool], host: str) -> bool:
     try:
         research_template(arm, pools, host=host, mcp_config=None)
@@ -525,8 +664,9 @@ def worker_arm(pools: dict[str, Pool], quota: dict, *, tier: str, host: str, all
 
 # -- plan ------------------------------------------------------------------------
 
-def _plan_once(run: ultra.Run, planner: str, pools: dict[str, Pool], host: str, prompt: str, cwd: Path,
+def _plan_once(run: ultra.Run, planner: str, pools: dict[str, Pool], host: str, prompt: str, repo: Path | None,
                max_parts: int, attempt: int, mcp_config: Path | None) -> tuple[ResearchPlan | None, list[str]]:
+    cwd = agent_cwd(planner, pools, host, repo if repo is not None else run.dir, run.dir / "plan" / f"attempt-{attempt}")
     rc, text = dispatch(run, planner, pools, host, prompt, cwd, f"plan-{attempt}.log", PLANNER_TIMEOUT, mcp_config)
     if rc == 124:
         return None, ["planner timed out"]
@@ -538,11 +678,11 @@ def _plan_once(run: ultra.Run, planner: str, pools: dict[str, Pool], host: str, 
     return (plan, []) if not problems else (None, problems)
 
 
-def _plan(run: ultra.Run, planner: str, pools: dict[str, Pool], host: str, prompt: str, cwd: Path,
+def _plan(run: ultra.Run, planner: str, pools: dict[str, Pool], host: str, prompt: str, repo: Path | None,
           max_parts: int, mcp_config: Path | None) -> tuple[ResearchPlan | None, list[str]]:
     """Plan, and on problems re-plan once with them appended; the planner sees its own mistakes."""
     run.step("planning", f"planner {planner} (attempt 1)")
-    plan, problems = _plan_once(run, planner, pools, host, prompt, cwd, max_parts, 1, mcp_config)
+    plan, problems = _plan_once(run, planner, pools, host, prompt, repo, max_parts, 1, mcp_config)
     if plan is not None:
         return plan, []
     run.progress["plan_problems"] = list(problems)
@@ -550,7 +690,7 @@ def _plan(run: ultra.Run, planner: str, pools: dict[str, Pool], host: str, promp
     run.step("planning", f"planner {planner} (attempt 2)")
     retry = prompt + ("\n\n# Problems with your previous plan (fix all of them)\n\n"
                       + "\n".join(f"- {problem}" for problem in problems) + "\n")
-    plan, problems = _plan_once(run, planner, pools, host, retry, cwd, max_parts, 2, mcp_config)
+    plan, problems = _plan_once(run, planner, pools, host, retry, repo, max_parts, 2, mcp_config)
     if plan is None:
         run.progress["plan_problems"].extend(problems)
     return plan, problems
@@ -583,43 +723,45 @@ def git_porcelain(repo: Path) -> list[str] | None:
 
 
 def _run_part(run: ultra.Run, part: Part, arm: str, pools: dict[str, Pool], quota: dict, host: str,
-              allow_lower: bool, question: str, context_note: str, mcp_names: list[str], cwd: Path,
-              mcp_config: Path | None, cancel: threading.Event | None = None) -> dict:
-    """One remote part on its arm, retried once on the next candidate; what happened, for progress.
+              allow_lower: bool, question: str, context_note: str, mcp_names: list[str], repo: Path | None,
+              own_dir: Path, mcp_config: Path | None, cancel: threading.Event | None = None) -> dict:
+    """One remote part on its arm, repaired once there, then retried once on the next candidate.
 
-    Once ``cancel`` is set the part stops after its current dispatch (which the
-    run has already signalled) instead of retrying on another arm.
+    The working directory is chosen per attempt (``agent_cwd``): Claude in
+    ``repo`` when given, Codex always in ``own_dir``. Once ``cancel`` is set
+    the part stops after its current dispatch (which the run has already
+    signalled) instead of retrying on another arm.
     """
-    prompt = part_prompt(question, part, context_note=context_note, mcp_names=mcp_names)
+    prompt = part_prompt(question, part, context_note=context_note, mcp_names=mcp_names, repo=repo)
     tried: list[str] = []
     failures: list[str] = []
     while arm is not None and not (cancel is not None and cancel.is_set()):
         tried.append(arm)
         with _LOCK:
             run.unit(part.id, arm=arm, state="running", attempts=list(tried))
-        rc, text = dispatch(run, arm, pools, host, prompt, cwd, f"part-{part.id}.log"
-                             if len(tried) == 1 else f"part-{part.id}-{len(tried)}.log", PART_TIMEOUT, mcp_config)
-        try:
-            if rc == 124:
-                raise ResearchAnswerError("timed out")
-            answer = parse_answer(text)
-        except ResearchAnswerError as exc:
+        stem = f"part-{part.id}" if len(tried) == 1 else f"part-{part.id}-{len(tried)}"
+        answer, repaired, why = dispatch_checked(
+            run, arm, pools, host, prompt, agent_cwd(arm, pools, host, repo, own_dir), stem, PART_TIMEOUT, mcp_config,
+            parse=parse_answer, error=ResearchAnswerError, begin=ANSWER_BEGIN, end=ANSWER_END,
+            header=f"Part id: {part.id}")
+        if answer is None:
             if cancel is not None and cancel.is_set():
                 with _LOCK:
                     run.unit(part.id, arm=arm, state="interrupted", reason="run interrupted", attempts=list(tried))
                 return {"id": part.id, "state": "interrupted", "arm": arm, "answer": None,
                         "reason": "run interrupted", "attempts": tried}
-            failures.append(f"{arm}: {exc}" + (f" (exit {rc})" if rc not in (0, 124) else ""))
+            failures.append(f"{arm}: {why}")
             arm = (worker_arm(pools, quota, tier=part.tier, host=host, allow_lower=allow_lower, exclude=set(tried))
                    if len(tried) < 2 else None)
             continue
         atomic_write(run.dir / "parts" / f"{part.id}.json",
                      json.dumps({"id": part.id, "question": part.question, "arm": arm, "attempts": tried,
-                                 **answer.to_dict()}, indent=2) + "\n")
+                                 "repaired": repaired, **answer.to_dict()}, indent=2) + "\n")
         with _LOCK:
             run.unit(part.id, arm=arm, state="answered", reason=None, confidence=answer.confidence,
-                     attempts=list(tried))
-        return {"id": part.id, "state": "answered", "arm": arm, "answer": answer, "attempts": tried}
+                     attempts=list(tried), repaired=repaired)
+        return {"id": part.id, "state": "answered", "arm": arm, "answer": answer, "attempts": tried,
+                "repaired": repaired}
     reason = "; ".join(failures) or "no arm"
     with _LOCK:
         run.unit(part.id, arm=tried[-1] if tried else None, state="failed", reason=reason, attempts=list(tried))
@@ -720,6 +862,9 @@ def _summary_md(summary: dict, body: str, answered: dict[str, tuple[Part, Answer
     failed = [f"{part['id']} ({part.get('reason')})" for part in summary["parts"] if part["state"] == "failed"]
     if failed:
         lines.append("- Failed parts: " + "; ".join(failed))
+    repaired = [f"{part['id']} ({part.get('arm')})" for part in summary["parts"] if part.get("repaired")]
+    if repaired:
+        lines.append("- Repaired on the same arm: " + "; ".join(repaired))
     if summary["held"]:
         lines.append("- Held parts: " + "; ".join(f"{row['id']} ({row['reason']})" for row in summary["held"]))
     mcp = summary["mcp_servers"]
@@ -733,6 +878,8 @@ def _summary_md(summary: dict, body: str, answered: dict[str, tuple[Part, Answer
     if summary["porcelain_changes"]:
         lines += ["- WARNING: the repository changed during the run (git status --porcelain differs; "
                   "ultra never reverts):"] + [f"  - {line}" for line in summary["porcelain_changes"]]
+    if summary.get("source_renames"):
+        lines.append("- Source ids renamed: " + renames_text(summary["source_renames"]))
     if summary["quota"]:
         lines.append("- Quota (percent used, before -> after):")
         for provider, labels in summary["quota"].items():
@@ -742,6 +889,16 @@ def _summary_md(summary: dict, body: str, answered: dict[str, tuple[Part, Answer
         lines += ["- Notes:"] + [f"  - {note}" for note in summary["notes"][:8]]
     lines += [f"- Run directory: {summary['run_dir']}", f"- Exit: {summary['exit_code']}"]
     return "\n".join(lines) + "\n"
+
+
+def source_renames(renamed: dict[str, list[dict]]) -> list[dict]:
+    """``{unit id: its renames}`` flattened for summary.json, each row tagged with its unit."""
+    return [{"unit": unit, **change} for unit, changes in renamed.items() for change in changes]
+
+
+def renames_text(rows: list[dict]) -> str:
+    """One footer line's worth: ``seo: S1 -> S3 (https://...); alpha: S1 -> S2 (notes.txt)``."""
+    return "; ".join(f"{row['unit']}: {row['from']} -> {row['to']} ({row['ref']})" for row in rows)
 
 
 def _report(run: ultra.Run, question: str, plan: ResearchPlan | None, body: str,
@@ -757,12 +914,13 @@ def _report(run: ultra.Run, question: str, plan: ResearchPlan | None, body: str,
         rows.append({"id": part_id, "state": state["state"], "arm": state.get("arm"), "where": state.get("where"),
                      "tier": state.get("tier"), "confidence": state.get("confidence"), "reason": state.get("reason"),
                      "question": part.question if part else None, "needs": part.needs if part else None,
-                     "attempts": state.get("attempts", [])})
+                     "attempts": state.get("attempts", []), "repaired": state.get("repaired", False)})
     summary = {
         "run_id": run.id, "question": question, "mode": "research", "title": plan.title if plan else None,
         "planner": run.progress.get("planner"), "synthesizer": synthesizer, "parts": rows,
         "held": run.progress.get("held", []), "plan_problems": run.progress.get("plan_problems", []),
         "mcp_servers": {k: v for k, v in mcp_info.items()}, "porcelain_changes": list(porcelain),
+        "source_renames": source_renames({part_id: answer.renamed for part_id, (_, answer) in answered.items()}),
         "quota": quota_table(usage_before, usage_after), "exit_code": exit_code, "run_dir": str(run.dir),
         "context": run.progress.get("context"), "notes": run.progress.get("notes", []),
     }
@@ -853,7 +1011,6 @@ def _execute(run: ultra.Run, question: str, repo: Path | None, context: str, ses
     mcp_config, mcp_info = research_mcp_config(run.dir)
     run.progress["mcp_servers"] = {"loaded": mcp_info["loaded"], "missing": mcp_info["missing"]}
     mcp_names = list(mcp_info["loaded"])
-    work_dir = repo if repo is not None else run.dir
 
     planner = pick("planner", pools, quota, host=host, allow_lower=allow_lower)
     if planner is not None and not supported(planner, pools, host):
@@ -865,7 +1022,7 @@ def _execute(run: ultra.Run, question: str, repo: Path | None, context: str, ses
     run.progress["planner"] = planner
     prompt = research_plan_prompt(question, max_parts=max_parts, context_note=context_note, repo=repo,
                                   mcp_names=mcp_names)
-    plan, problems = _plan(run, planner, pools, host, prompt, work_dir, max_parts, mcp_config)
+    plan, problems = _plan(run, planner, pools, host, prompt, repo, max_parts, mcp_config)
     if plan is None:
         return _give_up(run, "could not plan: " + "; ".join(problems), question, None, mcp_info, usage_before,
                         json_out)
@@ -905,11 +1062,9 @@ def _execute(run: ultra.Run, question: str, repo: Path | None, context: str, ses
         for part in plan.remote:
             if part.id not in arms:
                 continue
-            cwd = repo if repo is not None else run.dir / "parts" / part.id
-            if repo is None:
-                cwd.mkdir(parents=True, exist_ok=True)
             futures[part.id] = executor.submit(_run_part, run, part, arms[part.id], pools, quota, host, allow_lower,
-                                               question, context_note, mcp_names, cwd, mcp_config, cancel)
+                                               question, context_note, mcp_names, repo, run.dir / "parts" / part.id,
+                                               mcp_config, cancel)
         for part_id, future in futures.items():
             results[part_id] = future.result()
     except BaseException:
@@ -934,7 +1089,8 @@ def _execute(run: ultra.Run, question: str, repo: Path | None, context: str, ses
     if synthesizer is not None and answered:
         run.step("synthesizing", f"by {synthesizer}")
         rc, text = dispatch(run, synthesizer, pools, host, synthesis_prompt(question, answered, plan.session),
-                             run.dir, "synthesis.log", SYNTHESIS_TIMEOUT, mcp_config)
+                             agent_cwd(synthesizer, pools, host, run.dir, run.dir / "synthesis"), "synthesis.log",
+                             SYNTHESIS_TIMEOUT, mcp_config)
         try:
             body = _marked_block(text, REPORT_BEGIN, REPORT_END, ResearchReportError) if rc == 0 else None
         except ResearchReportError:

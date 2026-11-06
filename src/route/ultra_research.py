@@ -23,12 +23,14 @@ import shlex
 import subprocess
 import sys
 import threading
-from concurrent.futures import ThreadPoolExecutor
+import signal
+from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import cli, ultra
 from .pools import Pool, pools_for_host
+from .swarm_dispatch import signal_tree
 from .storage import atomic_write, config_dir
 from .ultra_plan import _marked_block
 from .ultra_select import candidates, dispatch_template, model_rank, pick
@@ -55,6 +57,9 @@ WHERE = ("remote", "session")
 TIERS = ("moderate", "hard")
 CONFIDENCE = ("high", "medium", "low")
 MCP_FILE = "research-mcp.json"
+CODEX_SKIP_GIT_CHECK = "--skip-git-repo-check"
+#: How long an interrupted run gives its parts to exit on SIGTERM before SIGKILL.
+CANCEL_GRACE = 5.0
 #: Agents read ``[part-id:S1]`` from the synthesizer's report; the run resolves them.
 CITE = re.compile(r"\[([a-z0-9][a-z0-9-]{0,40}):(S\d+)\]")
 #: The brief that every read-only agent gets, in one place so parts and the planner agree.
@@ -333,7 +338,10 @@ def parse_answer(text: str) -> Answer:
     answer = raw.get("answer")
     if not isinstance(answer, str) or not answer.strip():
         raise ResearchAnswerError("'answer' must be a non-empty string")
-    sources = raw.get("sources", [])
+    missing = [key for key in ("sources", "confidence", "gaps") if key not in raw]
+    if missing:
+        raise ResearchAnswerError("answer is missing required field(s): " + ", ".join(missing))
+    sources = raw["sources"]
     if not isinstance(sources, list):
         raise ResearchAnswerError("'sources' must be a list")
     for index, source in enumerate(sources):
@@ -342,10 +350,10 @@ def parse_answer(text: str) -> Answer:
             raise ResearchAnswerError(f"source {index}: must be an object with string 'id' and 'ref'")
         if "note" in source and not isinstance(source["note"], str):
             raise ResearchAnswerError(f"source {source['id']!r}: 'note' must be a string")
-    confidence = raw.get("confidence", "low")
+    confidence = raw["confidence"]
     if confidence not in CONFIDENCE:
         raise ResearchAnswerError(f"'confidence' must be one of {', '.join(CONFIDENCE)}")
-    gaps = raw.get("gaps", [])
+    gaps = raw["gaps"]
     if not isinstance(gaps, list) or not all(isinstance(gap, str) for gap in gaps):
         raise ResearchAnswerError("'gaps' must be a list of strings")
     return Answer(answer=answer, sources=[dict(source) for source in sources], confidence=confidence,
@@ -367,7 +375,8 @@ def research_template(arm: str, pools: dict[str, Pool], *, host: str = "claude",
     Edit Write NotebookEdit`` right after the program; both options are
     variadic, so the template's own next token must be an option, never
     ``{task}`` (which would be swallowed as a tool name). Codex arms get
-    ``--sandbox read-only``. Anything else cannot be made read-only here.
+    ``--sandbox read-only --skip-git-repo-check``. Anything else cannot be
+    made read-only here.
     """
     tokens = shlex.split(dispatch_template(arm, pools, host=host))
     if not tokens:
@@ -401,6 +410,12 @@ def research_template(arm: str, pools: dict[str, Pool], *, host: str = "claude",
         else:
             at = tokens.index("exec") + 1 if "exec" in tokens else 1
             tokens[at:at] = ["--sandbox", "read-only"]
+        if CODEX_SKIP_GIT_CHECK not in tokens:
+            # Research parts, the planner and the synthesizer run in fresh run
+            # directories that are not git work trees; Codex refuses those
+            # without this flag. The sandbox is read-only, so the check that the
+            # flag skips (a writable agent outside version control) does not apply.
+            tokens.insert(tokens.index("read-only") + 1, CODEX_SKIP_GIT_CHECK)
         return _join(tokens)
     raise ValueError(f"{arm}: cannot make {program!r} read-only; only claude, claude-work and codex are supported")
 
@@ -569,12 +584,16 @@ def _git_porcelain(repo: Path) -> list[str] | None:
 
 def _run_part(run: ultra.Run, part: Part, arm: str, pools: dict[str, Pool], quota: dict, host: str,
               allow_lower: bool, question: str, context_note: str, mcp_names: list[str], cwd: Path,
-              mcp_config: Path | None) -> dict:
-    """One remote part on its arm, retried once on the next candidate; what happened, for progress."""
+              mcp_config: Path | None, cancel: threading.Event | None = None) -> dict:
+    """One remote part on its arm, retried once on the next candidate; what happened, for progress.
+
+    Once ``cancel`` is set the part stops after its current dispatch (which the
+    run has already signalled) instead of retrying on another arm.
+    """
     prompt = part_prompt(question, part, context_note=context_note, mcp_names=mcp_names)
     tried: list[str] = []
     failures: list[str] = []
-    while arm is not None:
+    while arm is not None and not (cancel is not None and cancel.is_set()):
         tried.append(arm)
         with _LOCK:
             run.unit(part.id, arm=arm, state="running", attempts=list(tried))
@@ -585,6 +604,11 @@ def _run_part(run: ultra.Run, part: Part, arm: str, pools: dict[str, Pool], quot
                 raise ResearchAnswerError("timed out")
             answer = parse_answer(text)
         except ResearchAnswerError as exc:
+            if cancel is not None and cancel.is_set():
+                with _LOCK:
+                    run.unit(part.id, arm=arm, state="interrupted", reason="run interrupted", attempts=list(tried))
+                return {"id": part.id, "state": "interrupted", "arm": arm, "answer": None,
+                        "reason": "run interrupted", "attempts": tried}
             failures.append(f"{arm}: {exc}" + (f" (exit {rc})" if rc not in (0, 124) else ""))
             arm = (_worker_arm(pools, quota, tier=part.tier, host=host, allow_lower=allow_lower, exclude=set(tried))
                    if len(tried) < 2 else None)
@@ -601,6 +625,28 @@ def _run_part(run: ultra.Run, part: Part, arm: str, pools: dict[str, Pool], quot
         run.unit(part.id, arm=tried[-1] if tried else None, state="failed", reason=reason, attempts=list(tried))
     return {"id": part.id, "state": "failed", "arm": tried[-1] if tried else None, "answer": None,
             "reason": reason, "attempts": tried}
+
+
+def _stop_parts(run: ultra.Run, cancel: threading.Event, executor: ThreadPoolExecutor, futures: list) -> None:
+    """Stop every part, running or queued, and return only once their threads have ended.
+
+    ``executor.shutdown(wait=True)`` alone would wait for the running delegates
+    (up to their timeouts and retries); they lead their own sessions, so they
+    are signalled with their groups, SIGTERM first and SIGKILL after a grace.
+    """
+    cancel.set()
+    executor.shutdown(wait=False, cancel_futures=True)
+    with _LOCK:
+        pids = list(run.progress["pids"])
+    for pid in pids:
+        signal_tree(pid, signal.SIGTERM)
+    _, pending = wait(futures, timeout=CANCEL_GRACE)
+    if pending:
+        with _LOCK:
+            pids = list(run.progress["pids"])
+        for pid in pids:
+            signal_tree(pid, signal.SIGKILL)
+    executor.shutdown(wait=True)
 
 
 # -- report ----------------------------------------------------------------------
@@ -759,6 +805,7 @@ def run_research(question: str, *, repo: str | Path | None = None, context: str 
         return 2
     run.save()
     print(f"ultra: run {run.id} at {run.dir}", flush=True)
+    previous = _trap_sigterm()
     try:
         return _execute(run, question, repo_path, context, session, max_parts, max_parallel, plan_only,
                         allow_lower, json_out, host)
@@ -768,6 +815,27 @@ def run_research(question: str, *, repo: str | Path | None = None, context: str 
         return 130
     finally:
         (run.dir / MCP_FILE).unlink(missing_ok=True)
+        if previous is not None:
+            signal.signal(signal.SIGTERM, previous)
+
+
+def _trap_sigterm():
+    """Make SIGTERM (what ``route ultra cancel`` sends) behave like Ctrl-C; the handler it replaced.
+
+    The default action would end the process at once, skipping the ``finally``
+    that deletes the copied MCP server definitions and stops the parts. Only
+    the main thread may install handlers; elsewhere nothing changes.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        return None
+
+    def interrupt(signum, frame):
+        raise KeyboardInterrupt
+
+    try:
+        return signal.signal(signal.SIGTERM, interrupt)
+    except (ValueError, OSError):
+        return None
 
 
 def _execute(run: ultra.Run, question: str, repo: Path | None, context: str, session: str | None, max_parts: int,
@@ -825,8 +893,10 @@ def _execute(run: ultra.Run, question: str, repo: Path | None, context: str, ses
     (run.dir / "parts").mkdir(exist_ok=True)
     run.step("running", f"{len(arms)} part(s), up to {max_parallel} in parallel")
     results: dict[str, dict] = {}
-    with ThreadPoolExecutor(max_workers=max(1, max_parallel)) as executor:
-        futures = {}
+    cancel = threading.Event()
+    executor = ThreadPoolExecutor(max_workers=max(1, max_parallel))
+    futures: dict[str, object] = {}
+    try:
         for part in plan.remote:
             if part.id not in arms:
                 continue
@@ -834,9 +904,13 @@ def _execute(run: ultra.Run, question: str, repo: Path | None, context: str, ses
             if repo is None:
                 cwd.mkdir(parents=True, exist_ok=True)
             futures[part.id] = executor.submit(_run_part, run, part, arms[part.id], pools, quota, host, allow_lower,
-                                               question, context_note, mcp_names, cwd, mcp_config)
+                                               question, context_note, mcp_names, cwd, mcp_config, cancel)
         for part_id, future in futures.items():
             results[part_id] = future.result()
+    except BaseException:
+        _stop_parts(run, cancel, executor, list(futures.values()))
+        raise
+    executor.shutdown(wait=True)
     porcelain: list[str] = []
     if porcelain_before is not None:
         after = _git_porcelain(repo) or []
@@ -857,7 +931,7 @@ def _execute(run: ultra.Run, question: str, repo: Path | None, context: str, ses
         rc, text = _dispatch(run, synthesizer, pools, host, synthesis_prompt(question, answered, plan.session),
                              run.dir, "synthesis.log", SYNTHESIS_TIMEOUT, mcp_config)
         try:
-            body = _marked_block(text, REPORT_BEGIN, REPORT_END, ResearchReportError) if rc != 124 else None
+            body = _marked_block(text, REPORT_BEGIN, REPORT_END, ResearchReportError) if rc == 0 else None
         except ResearchReportError:
             body = None
         if not body or not body.strip():

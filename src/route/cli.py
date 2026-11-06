@@ -754,6 +754,9 @@ def cmd_ultra(args: argparse.Namespace) -> int:
     from .ultra import run_ultra, ultra_cancel, ultra_status
 
     words = list(args.goal)
+    if args.research is not None and words:
+        # Checked before status/cancel: `ultra cancel RUN --research q` must not cancel anything.
+        raise ValueError("--research takes the question as its own argument; drop the positional words")
     if words and words[0] == "status":
         if len(words) > 2:
             raise ValueError("usage: route ultra status [RUN_ID]")
@@ -763,8 +766,6 @@ def cmd_ultra(args: argparse.Namespace) -> int:
             raise ValueError("usage: route ultra cancel RUN_ID")
         return ultra_cancel(words[1])
     if args.research is not None:
-        if words:
-            raise ValueError("--research takes the question as its own argument; drop the positional words")
         from .ultra_research import run_research
 
         return run_research(args.research, repo=args.repo, context=args.context, session=args.session,

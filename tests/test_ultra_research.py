@@ -222,16 +222,26 @@ def test_parse_answer_reads_every_field():
                             gaps=["g"])
 
 
+def answer_text(**fields):
+    """A complete answer block with some fields overridden (or dropped with None)."""
+    payload = {"answer": "a", "sources": [], "confidence": "high", "gaps": [], **fields}
+    payload = {key: value for key, value in payload.items() if value is not None}
+    return f"ULTRA-ANSWER-BEGIN\n{json.dumps(payload)}\nULTRA-ANSWER-END"
+
+
 @pytest.mark.parametrize("payload, message", [
     ("nothing", "no ULTRA-ANSWER-BEGIN"),
     ("ULTRA-ANSWER-BEGIN\n{bad\nULTRA-ANSWER-END", "not valid JSON"),
-    ('ULTRA-ANSWER-BEGIN\n{"answer": ""}\nULTRA-ANSWER-END', "'answer' must be a non-empty string"),
-    ('ULTRA-ANSWER-BEGIN\n{"answer": "a", "sources": [{"id": 1}]}\nULTRA-ANSWER-END', "source 0"),
-    ('ULTRA-ANSWER-BEGIN\n{"answer": "a", "confidence": "sure"}\nULTRA-ANSWER-END', "'confidence' must be one of"),
-    ('ULTRA-ANSWER-BEGIN\n{"answer": "a", "gaps": "none"}\nULTRA-ANSWER-END', "'gaps' must be a list"),
+    (answer_text(answer=""), "'answer' must be a non-empty string"),
+    (answer_text(sources=None), "missing required field\\(s\\): sources"),
+    (answer_text(confidence=None), "missing required field\\(s\\): confidence"),
+    (answer_text(gaps=None), "missing required field\\(s\\): gaps"),
+    (answer_text(sources=[{"id": 1}]), "source 0"),
+    (answer_text(confidence="sure"), "'confidence' must be one of"),
+    (answer_text(gaps="none"), "'gaps' must be a list"),
 ])
 def test_parse_answer_rejects_bad_blocks(payload, message):
-    """An unusable answer is a retry on another arm, so every bad shape must be caught."""
+    """An unusable answer is a retry on another arm, so every bad or missing field must be caught."""
     with pytest.raises(ResearchAnswerError, match=message):
         parse_answer(payload)
 
@@ -264,6 +274,7 @@ def test_research_template_for_the_host_arm_uses_the_default_template():
 
 
 def test_research_template_forces_codex_read_only(fake):
+    """Codex gets a read-only sandbox and skips its git check: research directories are not repositories."""
     pools = pools_for_host(load_pools(), "claude")
     bare = {**pools, "codex": replace(pools["codex"], dispatch="codex exec {task}")}
     no_exec = {**pools, "codex": replace(pools["codex"], dispatch="codex {task}")}
@@ -272,9 +283,9 @@ def test_research_template_forces_codex_read_only(fake):
     inserted = research_template("codex", bare, host="claude", mcp_config=None)
     without_exec = research_template("codex", no_exec, host="claude", mcp_config=None)
 
-    assert shlex.split(forced)[1:] == ["exec", "--sandbox", "read-only", "{task}"]
-    assert inserted == "codex exec --sandbox read-only {task}"
-    assert without_exec == "codex --sandbox read-only {task}"
+    assert shlex.split(forced)[1:] == ["exec", "--sandbox", "read-only", "--skip-git-repo-check", "{task}"]
+    assert inserted == "codex exec --sandbox read-only --skip-git-repo-check {task}"
+    assert without_exec == "codex --sandbox read-only --skip-git-repo-check {task}"
 
 
 def test_research_template_refuses_unsupported_programs(fake):
@@ -415,7 +426,7 @@ def test_malformed_answer_is_retried_on_the_other_arm(fake):
     assert rc == 0, (run_dir / "summary.md").read_text()
     alpha_calls = [row for row in calls(fake) if row[1] == "part" and row[2] == "alpha"]
     assert [row[0] for row in alpha_calls] == ["claude-work", "codex"]
-    assert alpha_calls[1][3] == "exec --sandbox read-only"
+    assert alpha_calls[1][3] == "exec --sandbox read-only --skip-git-repo-check"
     alpha = next(row for row in summary["parts"] if row["id"] == "alpha")
     assert alpha["arm"] == "codex" and alpha["attempts"] == ["claude-work", "codex"]
     assert (run_dir / "logs" / "part-alpha-2.log").is_file()

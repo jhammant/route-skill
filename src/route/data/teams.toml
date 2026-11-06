@@ -1,0 +1,1661 @@
+# Built-in team layouts for `route ultra --team <name>`.
+#
+# A layout is a team of read-only analysts that look at one target through
+# different lenses. They run in parallel, their findings are merged into claims,
+# the claims are cross-examined, and a synthesizer writes the report in the
+# shape `report` describes. A layout with the same name in
+# ~/.config/route/teams.toml (config_dir()/teams.toml) replaces the built-in.
+#
+# Schema, checked by ultra_team.lint_layout and tests/test_ultra_team_layouts.py:
+#   [layouts.<name>]
+#   title, description (one line), report: non-empty strings
+#   targets = "url" | "repo" | "any"   what the team needs: --url, --repo, or either
+#   fix     = true | false              whether `--fix` may act on the confirmed findings
+#   [[layouts.<name>.analysts]]         3 to 8, in PRIORITY order: a smaller team
+#                                       (--lean, --team-size) keeps the first N
+#   id    = [a-z0-9][a-z0-9-]{0,40}, unique within the layout
+#   role, lens, brief: non-empty strings
+#   tier  = "moderate" | "hard"         hard asks for the strongest model with quota
+#   where = "remote" | "session"        session work needs this Mac's screen or the
+#                                       user's connectors, so the run hands it back
+#
+# A brief is written for a background agent that is READ-ONLY, has web search
+# and fetch, a shell, and read access to --repo when one is given, and prints
+# its findings as JSON with sources it can cite. The run adds those rules and
+# the output format; a brief says what to look at, with which commands and
+# sources, and what evidence to return. In a brief, <url> is a target URL,
+# <host> is its host name, <domain> is its registered domain, and <repo> is the
+# --repo path. Anything that must not happen (submitting forms, calling a
+# payments API, printing a secret) is spelled out in the brief that could do it.
+
+
+# -- website-audit --------------------------------------------------------------
+
+[layouts.website-audit]
+title = "Website audit"
+description = "Audit a live site: SEO and indexing, performance, accessibility, conversion, security and domain, analytics and consent, mobile and links."
+targets = "url"
+fix = true
+report = '''
+Open with a scorecard: one row per area (SEO and indexing, performance, accessibility, conversion, security and domain, analytics and consent, mobile and links), a score from 0 to 10, and a one-line reason for the score. Scores follow the evidence: 9-10 means nothing material is wrong, 6-8 fixable gaps, 3-5 problems that cost traffic, trust or sales, and 0-2 broken or dangerous. An area no analyst covered is scored "not checked", never guessed.
+Then list every fix, ranked by impact (what it costs the site today, times how many visitors it touches). Each fix gives the page or URL it applies to, the evidence, and exact steps: the file, setting, header, DNS record or copy to change, and what to change it to. End with what could not be checked from here, and why.
+'''
+
+[[layouts.website-audit.analysts]]
+id = "seo"
+role = "Technical SEO and indexing"
+lens = "Can search engines crawl, index and understand every page that should rank, and none that should not?"
+tier = "moderate"
+where = "remote"
+brief = '''
+For each target <url> (host <host>), check crawlability and indexing with curl, one request at a time.
+1. robots.txt: `curl -s https://<host>/robots.txt`. Flag `Disallow: /` for all user agents, blocked CSS or JS, and a missing `Sitemap:` line.
+2. Sitemap: fetch every sitemap named in robots.txt, or else `curl -s https://<host>/sitemap.xml`. Count its URLs. Check that a sample of up to 20 return 200 with no redirect, use the production host, and match their own canonicals.
+3. Pages: for the home page and up to 20 sitemap pages, run `curl -sL <page>` and `curl -sI <page>`, and record:
+   - the title: flag one that is missing, duplicated across pages, or over 60 characters.
+   - the meta description: flag one that is missing, duplicated, or over 160 characters.
+   - the number of h1 elements.
+   - `<link rel="canonical">`: flag one that is missing, relative, or points at another host, a staging host or http.
+   - `<meta name="robots">` and the `X-Robots-Tag` header: flag any noindex or nofollow left on.
+   - `hreflang` links: they must be reciprocal, use valid language codes, and include x-default.
+4. Structured data: extract each `<script type="application/ld+json">` block, parse it with `python3 -c 'import json,sys; json.load(sys.stdin)'`, and list its @type values. Flag invalid JSON, and required properties missing for the types Google supports (Organization, Product, Article, FAQPage, BreadcrumbList).
+5. Open Graph and Twitter card tags on the home page.
+6. Web-search `site:<host>`. Note roughly how many pages are indexed, and any staging or preview host that is indexed as well.
+Evidence: the URL, the command, and the exact line of output or HTML for each finding. The fix: the tag or header to add or change, and its value.
+'''
+
+[[layouts.website-audit.analysts]]
+id = "performance"
+role = "Performance and Core Web Vitals"
+lens = "How fast does each page load and respond on a mid-range phone, in numbers?"
+tier = "moderate"
+where = "remote"
+brief = '''
+You are the only analyst on this team who runs Lighthouse. Run it on each target <url>, and on at most two other key pages (such as pricing or sign-up):
+`npx -y lighthouse <url> --quiet --chrome-flags="--headless=new" --output=json --output-path=stdout --only-categories=performance,accessibility,best-practices,seo`
+Pipe the output through `jq` or python and keep only the fields you need. Never paste the whole report. Keep:
+- the four category scores.
+- the numericValue of these audits: largest-contentful-paint, cumulative-layout-shift, total-blocking-time, first-contentful-paint, speed-index, server-response-time and total-byte-weight.
+- the top opportunities with their estimated savings: render-blocking-resources, unused-javascript, uses-optimized-images, modern-image-formats, uses-text-compression and uses-long-cache-ttl.
+Scores vary between runs, so run each page three times and report the median run.
+If Lighthouse cannot run (no Chrome, or npx fails), fall back to the PageSpeed Insights API:
+`curl -s 'https://www.googleapis.com/pagespeedonline/v5/runPagespeed?url=<url>&strategy=mobile'`
+URL-encode <url>, and append `&category=ACCESSIBILITY&category=BEST_PRACTICES&category=SEO`, because by default it returns performance only. Its lighthouseResult has the same audits. Its loadingExperience and originLoadingExperience hold real-user (CrUX) field data when the site has enough traffic.
+Report the Core Web Vitals in numbers against Google's thresholds: LCP is good at 2.5 s or less, INP at 200 ms or less, and CLS at 0.1 or less. INP exists only in field data (INTERACTION_TO_NEXT_PAINT in loadingExperience). A lab run has no INP, so give TBT as its proxy, and label which numbers are lab and which are field.
+The fix: the specific resource (its URL and size) and what to do with it.
+'''
+
+[[layouts.website-audit.analysts]]
+id = "accessibility"
+role = "Accessibility (WCAG 2.2 AA)"
+lens = "Can someone using a screen reader, only a keyboard, or with low vision use every key page?"
+tier = "moderate"
+where = "remote"
+brief = '''
+Check each target <url>, and up to five key pages found from the navigation, against WCAG 2.2 AA. Work from the fetched HTML and CSS: run `curl -sL <page>`, then fetch the stylesheets it links. Check:
+- Images: `<img>` with no alt, or with alt text that repeats the file name. Decorative images need `alt=""`. Inline SVG icons that carry meaning need a title or an aria-label (1.1.1).
+- Contrast: the text and background colour pairs in the CSS, for body text, buttons, links, placeholders and text over images. Compute each ratio in python with the WCAG formula. The minimum is 4.5:1 for normal text, and 3:1 for large text and UI components (1.4.3, 1.4.11).
+- Forms (1.3.1, 1.3.5, 3.3.1, 3.3.2):
+  - every input has a `<label for>`, a wrapping label, or an aria-label (a placeholder does not count).
+  - required fields are marked.
+  - error messages are tied to their fields.
+  - autocomplete attributes are set on personal-data fields.
+- Structure (1.3.1, 2.4.1, 3.1.1): one h1, no skipped heading levels, landmarks (header, nav, main, footer), `lang` on `<html>`, and a skip link.
+- Keyboard and focus (2.1.1, 2.4.7, 2.4.11, 2.5.8):
+  - clickable div or span elements with no role and no tabindex.
+  - positive tabindex values.
+  - `outline: none` or `outline: 0` with no replacement focus style.
+  - focus hidden under sticky headers.
+  - targets smaller than 24 by 24 CSS px.
+- Links: link text such as "click here" or "read more" with no context, and links that open a new window without saying so.
+- Motion: autoplaying video or carousels with no pause control (2.2.2).
+Evidence: the WCAG success criterion, the page, and the offending HTML snippet (trimmed). The fix: the corrected markup or CSS value.
+'''
+
+[[layouts.website-audit.analysts]]
+id = "conversion"
+role = "Conversion and copy"
+lens = "Within five seconds, does a first-time visitor understand what this is, trust it, and know what to do next?"
+tier = "moderate"
+where = "remote"
+brief = '''
+Read the home page and the main landing, pricing and sign-up pages as a first-time visitor would. Run `curl -sL <page>`, then strip the tags to get the visible text in order. Never submit a form, sign up, start a checkout or book a demo.
+- Above the fold, meaning the first heading, the subheading and the first call to action in the HTML: does it say what the product is, who it is for, and why it beats the alternative? Quote it, and say what a visitor would think the product is.
+- Calls to action:
+  - how many there are.
+  - whether the primary one is the same across pages.
+  - whether its wording is specific ("Start free trial" rather than "Submit").
+  - where it goes: curl the link and record the status code.
+- Forms: the number of fields, and which are required. Flag fields that could wait until after sign-up, and email fields with no privacy reassurance next to them.
+- Trust signals: named testimonials, customer logos, case studies, review scores with their source, security or compliance badges, a real company name and address, contact details, and team or about pages. Flag claims that have no proof.
+- Pricing: whether prices are visible or hidden behind "contact us", whether plans are easy to compare, whether VAT is included for UK buyers, and the trial and cancellation terms.
+- Competitors: web-search for two or three direct competitors, and compare their headline and primary call to action with this site's.
+Evidence: the quoted copy and its URL. The fix: rewritten copy (headline, subheading or call to action) that is ready to paste, with the reason.
+'''
+
+[[layouts.website-audit.analysts]]
+id = "security"
+role = "Security and domain"
+lens = "Are the transport, headers, domain and email authentication configured so the site cannot easily be intercepted, spoofed or hijacked?"
+tier = "hard"
+where = "remote"
+brief = '''
+Passive checks only: no port scans, vulnerability scanners, fuzzing, login attempts or payloads, and one ordinary request per check. For each target host <host> and its registered domain <domain>:
+- TLS:
+  - Run `echo | openssl s_client -connect <host>:443 -servername <host> 2>/dev/null | openssl x509 -noout -subject -issuer -dates -ext subjectAltName`.
+  - Report the notAfter date and the days left. Under 30 days is high, and under 14 days is a blocker.
+  - Check that the SAN covers both the apex and www.
+  - Check that old protocols are refused: `openssl s_client -connect <host>:443 -servername <host> -tls1_1 </dev/null` should fail.
+- HTTP to HTTPS: `curl -sI http://<host>` should return a 301 or 308 to https on the same host.
+- Headers: run `curl -sI https://<host>` and check:
+  - Strict-Transport-Security: a max-age of at least 31536000, with includeSubDomains.
+  - Content-Security-Policy: present, with no `unsafe-inline` and no `*` in script-src. If there is no CSP, at least frame-ancestors.
+  - X-Content-Type-Options: nosniff.
+  - Referrer-Policy and Permissions-Policy.
+  - the Secure, HttpOnly and SameSite flags on Set-Cookie.
+  - version disclosure in Server or X-Powered-By.
+- Exposed files: for `/.git/HEAD`, `/.env`, `/.DS_Store` and `/wp-config.php.bak`, record only the status code with `curl -o /dev/null -s -w '%{http_code}' https://<host>/<path>`. Never print or save the body. Check that `/.well-known/security.txt` exists.
+- DNS and domain: run `dig +short A <domain>`, `dig +short CAA <domain>` and `dig +short MX <domain>`. Run `whois <domain>` for the registrar, the expiry date, and whether transfer lock (clientTransferProhibited) is on.
+- Email authentication, which stops others sending mail as the domain:
+  - SPF: run `dig +short TXT <domain>`. There must be exactly one v=spf1 record. It must end in -all or ~all, and need no more than 10 DNS lookups.
+  - DMARC: run `dig +short TXT _dmarc.<domain>`. p=none only monitors, so look for quarantine or reject, and an rua address.
+  - DKIM, when you can find a selector: the provider in the MX or SPF records suggests which to try (google; selector1 and selector2 for Microsoft 365; s1 and s2 for SendGrid; k1 for Mailchimp; resend). Check each with `dig +short TXT <selector>._domainkey.<domain>`.
+  - A domain that sends no mail should publish `v=spf1 -all` and a DMARC policy of reject.
+Evidence: the command and its exact output line. The fix: the exact header value or DNS record to set.
+'''
+
+[[layouts.website-audit.analysts]]
+id = "analytics"
+role = "Analytics and consent"
+lens = "Does the site measure what it needs to, and does it ask before it tracks?"
+tier = "moderate"
+where = "remote"
+brief = '''
+Find which analytics and marketing tags the site loads, and whether any of them track before consent.
+- Tags: fetch the HTML of the home page and two other pages (`curl -sL <page>`). Search the HTML and every script it links for these signatures, and record each tag's ID:
+  - Google tag or GA4: `gtag(`, `G-` IDs, googletagmanager.com/gtag/js.
+  - Google Tag Manager: `GTM-`.
+  - Meta Pixel: `fbq(`, connect.facebook.net.
+  - LinkedIn Insight: `_linkedin_partner_id`.
+  - TikTok, Hotjar, Microsoft Clarity, Plausible, Fathom, PostHog, Segment and Mixpanel.
+  - the Vercel and Cloudflare analytics scripts.
+- Consent:
+  - Look for a consent platform (Cookiebot, OneTrust, CookieYes, Iubenda, Osano or Klaro) or a custom banner.
+  - Check whether tracking scripts are in the initial HTML as executable `<script>` tags, which fire before any choice is made, or are gated: `type="text/plain"` with a consent category, or loaded by the platform after consent.
+  - Check whether Google Consent Mode v2 defaults are set to denied before the tag loads: `gtag('consent','default',{ad_storage:'denied',analytics_storage:'denied',ad_user_data:'denied',ad_personalization:'denied'})`.
+  - Check whether the banner offers Reject as prominently as Accept, as the ICO's guidance on UK PECR requires.
+- Cookies set before consent: run `curl -sI <url>` and `curl -s -c - -o /dev/null <url>` to see first-party Set-Cookie headers.
+- Policy: a privacy or cookie policy, linked from every page, that names the tools you found.
+IMPORTANT: this Mac's home DNS blocks ad and tracker domains, so a tracker script that will not load, resolve or fire from here may be a false negative.
+- Check with `dig +short www.googletagmanager.com`: 0.0.0.0, or no answer, means it is blocked here.
+- Base your findings on the tag in the HTML, not on whether its request succeeded.
+- Mark any "tag not firing" finding low confidence, and say it needs checking from another network.
+Evidence: the page, the tag snippet with its ID, and the line where it loads. The fix: the exact gating change.
+'''
+
+[[layouts.website-audit.analysts]]
+id = "mobile"
+role = "Mobile and links"
+lens = "Does the site work on a phone, and does every link go somewhere real?"
+tier = "moderate"
+where = "remote"
+brief = '''
+Mobile: check each target <url> and two or three key pages for:
+- the viewport meta tag, which should be `width=device-width, initial-scale=1`. Flag `user-scalable=no` or a maximum-scale of 1, because they block zoom.
+- whether the server sends different HTML to a phone. Compare a desktop fetch with `curl -sL -A 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1' <url>`.
+- responsive images (`srcset`, `sizes`).
+- in the CSS: images or tables wider than 400px with no max-width, fixed pixel widths and other horizontal-scroll risks, and `@media` breakpoints.
+- font sizes under 16px on inputs, which make iOS zoom the page.
+- tap-target spacing in navigation and footers, and whether there is a menu for small screens.
+Links:
+- Collect the internal links from the home page, the navigation, the footer and the sitemap (`curl -s https://<host>/sitemap.xml`).
+- Sample up to 50 internal links. Check them one at a time, with `sleep 1` between them, using `curl -o /dev/null -s -w '%{http_code}' <url>`.
+- Report every 4xx and 5xx. For every internal redirect (3xx), also give the final status from `curl -o /dev/null -s -L -w '%{http_code} %{url_effective}' <url>`.
+- Check up to 10 external links the same way.
+- Check that a made-up path (`https://<host>/no-such-page-<random>`) returns 404, not a soft-404 200.
+- Check that mailto: and tel: links are well formed.
+Evidence: the source page, the link, and the status code. The fix: the corrected link, or the redirect to add.
+'''
+
+
+# -- app-review -----------------------------------------------------------------
+# Priority order puts rejection risk first (compliance, privacy, then the core
+# flows), so a lean team still answers "will this be rejected?". The hands-on
+# walkthrough needs the screen, so it is handed to the session and comes last.
+
+[layouts.app-review]
+title = "App review"
+description = "Review a mobile app before release: store guidelines, privacy, core flows, crash risk, UX and accessibility, listing, reviews and a hands-on walkthrough."
+targets = "any"
+fix = true
+report = '''
+Open with a release-readiness verdict: READY, READY WITH FIXES or NOT READY, and the two or three reasons that decide it.
+Then list every issue, ranked first by rejection risk: anything that breaks an App Store Review Guideline or Google Play policy, cited by number, and would likely get the build rejected. Rank the rest by user impact: crashes and broken core flows, then privacy, then accessibility and polish. Each issue gives the guideline or policy it touches, the evidence (file:line, a listing field or a review quote), and exact fix steps.
+Finish with the store listing changes (a rewritten title, subtitle, keywords and first screenshots), and what the walkthrough in the user's session must still confirm by hand.
+'''
+
+[[layouts.app-review.analysts]]
+id = "compliance"
+role = "Store guideline compliance"
+lens = "Would App Review or Google Play reject this build, and under which rule?"
+tier = "hard"
+where = "remote"
+brief = '''
+Read the current App Store Review Guidelines (https://developer.apple.com/app-store/review/guidelines/) and, for Android, the Google Play Developer Policy Center (https://play.google.com/about/developer-content-policy/). Check the app in --repo and its store listing against the rules behind most rejections. Cite each rule by number, and quote it.
+- 2.1 App Completeness:
+  - placeholder text or images: `grep -rniE 'lorem ipsum|placeholder|coming soon|test only|dummy' --include=*.swift --include=*.kt --include=*.strings --include=*.xcstrings --include=*.xml --include=*.json <repo>`.
+  - unfinished screens, and debug menus that release builds can reach.
+  - broken links.
+  - login walls with no demo account noted for review.
+- 2.3 Accurate Metadata: screenshots that do not show the app in use, other platforms' names in the listing, an age rating that does not match the content, and prices or features the build does not have.
+- 3.1 Payments:
+  - digital goods and subscriptions must use in-app purchase (StoreKit, RevenueCat or Play Billing). Find the purchase code, and any external payment links (Stripe, PayPal, web checkout URLs).
+  - check for a Restore Purchases control.
+  - check that subscription terms are shown before purchase (3.1.2), and that the paywall links to the terms and the privacy policy.
+  - the rules on external purchase links differ by storefront (US, EU, rest of world) and changed in 2025, so check the current text of 3.1.1, 3.1.1(a) and 3.1.3.
+- 4.0 Design:
+  - 4.2 Minimum Functionality: a thin wrapper around a website is rejected.
+  - 4.8 Login Services: third-party or social login needs an equivalent privacy-focused option, such as Sign in with Apple.
+  - iPad support, if the build is universal.
+- 5.1 Privacy:
+  - a privacy policy URL in the app and in the listing; curl it for a 200.
+  - in-app account deletion when the app offers account creation (5.1.1(v)).
+  - purpose strings for every permission.
+- Android:
+  - targetSdkVersion in build.gradle(.kts), against the current target API level requirement (https://developer.android.com/google/play/requirements/target-sdk).
+  - the Data safety form, against the SDKs actually used.
+  - the account deletion web link.
+  - restricted permissions (SMS, call log, background location, all-files access) and their declarations.
+  - the closed-testing requirement for new personal developer accounts.
+Evidence: the rule number with a short quote, and the file:line or listing field. Severity follows how likely a rejection is.
+'''
+
+[[layouts.app-review.analysts]]
+id = "privacy"
+role = "Privacy and permissions"
+lens = "Does what the app collects, asks for and tracks match its purpose strings, privacy manifest and store privacy label?"
+tier = "hard"
+where = "remote"
+brief = '''
+Work from --repo:
+- Purpose strings:
+  - Find every usage description with `grep -rn 'UsageDescription' --include=Info.plist --include=*.pbxproj --include=*.xcconfig --include=*.strings <repo>`. Modern Xcode projects keep them as INFOPLIST_KEY_NS... build settings in project.pbxproj.
+  - Grep the Swift and Objective-C sources for the APIs that need them: AVCaptureDevice, PHPhotoLibrary, CLLocationManager, CNContactStore, HKHealthStore, CBCentralManager, the microphone, and ATTrackingManager.
+  - Flag an API with no string, a string with no API, and vague strings ("This app needs access to your camera"). Apple rejects these under 5.1.1.
+- Privacy manifest:
+  - Find PrivacyInfo.xcprivacy in the app, and in each embedded SDK.
+  - Check NSPrivacyTracking, NSPrivacyTrackingDomains and NSPrivacyCollectedDataTypes.
+  - Grep the code for the required-reason APIs: UserDefaults, file timestamps (creationDate, modificationDate), system boot time (systemUptime, mach_absolute_time), disk space (volumeAvailableCapacity) and active keyboards. Check that NSPrivacyAccessedAPITypes declares an approved reason for each one the code uses.
+- Entitlements: read the *.entitlements files, and flag capabilities the code does not use, such as HealthKit, iCloud, push or associated domains.
+- Tracking:
+  - Look for ad, attribution and analytics SDKs in Podfile.lock, Package.resolved and build.gradle (for example Firebase, Facebook, AppsFlyer, Adjust, Branch, Mixpanel, Amplitude and Sentry), and for IDFA use (ASIdentifierManager).
+  - If the app tracks, check that NSUserTrackingUsageDescription exists, and that `ATTrackingManager.requestTrackingAuthorization` runs before any tracking.
+- The label against reality:
+  - Fetch the App Store page (https://apps.apple.com/gb/app/id<app id>) and read its App Privacy section. For Android, read the Data safety section.
+  - Compare the declared data types with what those SDKs, and the app's own network calls, collect.
+  - Android: compare the `<uses-permission>` entries in AndroidManifest.xml, including those merged from libraries, with their use.
+Evidence: the file:line, or the label text, for each mismatch. The fix: the exact plist key and string, manifest entry or label change.
+'''
+
+[[layouts.app-review.analysts]]
+id = "onboarding"
+role = "Onboarding and core flows"
+lens = "Can a new user get from install to the app's core value without getting stuck, and does the app do what the listing promises?"
+tier = "moderate"
+where = "remote"
+brief = '''
+1. Read the store listing and write down what it promises. Use the iTunes lookup (`curl -s 'https://itunes.apple.com/lookup?id=<app id>&country=gb'`) or the Play listing page.
+2. Trace the first-run and core flows through the code in --repo. Start at the entry point (the SwiftUI `@main` App, AppDelegate or SceneDelegate, MainActivity, or the React Native or Flutter root), and follow the navigation (NavigationStack, coordinators, storyboard segues, nav graphs or routers).
+3. Map these as numbered steps, with file:line for each:
+   - launch, and any splash or onboarding pages.
+   - permission prompts: are they asked up front, before the user sees why?
+   - sign-up or login: could it be deferred? Is there a guest mode? Can the user reach password reset?
+   - any paywall: when it appears, and whether it can be dismissed.
+   - the empty state on first use.
+   - the core action the listing promises.
+   Count the taps to first value.
+4. Check each step for dead ends:
+   - offline, or when a request fails: look for errors that are caught and dropped, endless spinners, and no retry.
+   - a fresh install with no data.
+   - a user who denies a permission.
+5. Check that each promise in the listing is backed by code.
+Evidence: file:line for each step and each problem. The fix: the change in the flow, such as moving a permission prompt to the moment of use, adding an empty state, or deferring sign-up.
+'''
+
+[[layouts.app-review.analysts]]
+id = "performance"
+role = "Performance and crash risk"
+lens = "What is most likely to crash, freeze or bloat this app on a real device?"
+tier = "moderate"
+where = "remote"
+brief = '''
+Scan --repo for crash and hang risks. Rank them by how likely they are to fire, times how many users reach that code. Launch and core-flow paths come first.
+- Swift:
+  - force unwraps and forced casts: `grep -rnE 'try!|as! |fatalError\(|[A-Za-z0-9_)\]]!([.,)\] ]|$)' --include=*.swift <repo>`, and implicitly unwrapped `var ...: Type!`.
+  - main-thread work: `DispatchQueue.main.sync`, `Data(contentsOf:` or `String(contentsOf:` on the main thread, heavy work in `body`, `viewDidLoad` or `init`, and JSON decoding or image resizing on the main actor.
+  - leaks: unbounded `Timer`s or observers, and closures in long-lived objects that capture self strongly (retain cycles).
+- Kotlin or Java: `!!`, `runBlocking` on the main thread, network or disk on the main thread, `lateinit` used before init, and leaked Activity contexts.
+- React Native or Flutter: unhandled promise rejections, missing error boundaries, large lists without virtualisation (FlatList, ListView.builder), and `setState` after dispose.
+- Assets and size:
+  - find large files with `find <repo> -type f \( -name '*.png' -o -name '*.jpg' -o -name '*.gif' -o -name '*.mp4' -o -name '*.json' \) -size +500k -not -path '*/node_modules/*' -not -path '*/Pods/*' -exec ls -lh {} +`.
+  - flag images outside asset catalogues, oversized images decoded at full size in lists, and bundled video.
+- Memory: unbounded caches, arrays that only grow, and full-size image loading.
+- Existing evidence: crash logs, Sentry or Crashlytics exports, and TestFlight feedback in the repo, and issues labelled crash (`gh issue list --label crash` for a GitHub repo).
+Evidence: the file:line and code line, and the conditions that trigger the crash. The fix: the safe rewrite, such as `guard let`, or moving the work off the main thread.
+'''
+
+[[layouts.app-review.analysts]]
+id = "ux"
+role = "UX and accessibility"
+lens = "Can everyone use the app, including people using VoiceOver, large text or low vision?"
+tier = "moderate"
+where = "remote"
+brief = '''
+Review the UI code in --repo for accessibility and usability. Cite Apple's Human Interface Guidelines (https://developer.apple.com/design/human-interface-guidelines/accessibility) and, for Android, Material's accessibility guidance.
+- Labels:
+  - icon-only buttons and images with no `.accessibilityLabel` (SwiftUI), `accessibilityLabel` (UIKit) or `contentDescription` (Android).
+  - decorative images should be hidden (`Image(decorative:)`, `.accessibilityHidden(true)`).
+  - custom controls need traits or roles, and values.
+- Dynamic Type:
+  - fixed sizes that should be text styles: `.font(.system(size:`, `UIFont.systemFont(ofSize:` without UIFontMetrics, and `dp` instead of `sp` for text on Android.
+  - truncation risk: `.lineLimit(1)` on important text, and fixed-height containers around text.
+- Contrast: the text and background colour pairs in the asset catalogues (`*.colorset/Contents.json`) and the code, in both light and dark appearance. Compute the WCAG ratios in python: 4.5:1 for body text, 3:1 for large text and icons.
+- VoiceOver:
+  - reading order (`accessibilityElement(children:)`, `accessibilitySortPriority`), and elements grouped sensibly.
+  - gestures with no accessible alternative (custom swipes, long-press only).
+  - animations that ignore Reduce Motion.
+- Touch and states:
+  - touch targets smaller than 44 by 44 pt (48 by 48 dp on Android).
+  - destructive actions with no confirmation.
+  - missing loading, empty and error states.
+- Localisation: hard-coded user-facing strings that are not in String Catalogs or .strings files.
+Evidence: file:line, with the snippet. The fix: the modifier or attribute to add.
+'''
+
+[[layouts.app-review.analysts]]
+id = "listing"
+role = "Store listing and competitors"
+lens = "Would the listing make the right person install this app over the alternatives?"
+tier = "moderate"
+where = "remote"
+brief = '''
+Fetch the listing:
+- iOS: `curl -s 'https://itunes.apple.com/lookup?id=<app id>&country=gb'` returns trackName, description, screenshotUrls, averageUserRating, userRatingCount, version, currentVersionReleaseDate, releaseNotes and genres. Read https://apps.apple.com/gb/app/id<app id> for the subtitle.
+- Android: https://play.google.com/store/apps/details?id=<package>&hl=en_GB.
+- No live listing yet: read the fastlane metadata in --repo (`fastlane/metadata/<locale>/name.txt`, `subtitle.txt`, `keywords.txt`, `description.txt`, `promotional_text.txt`), or whatever the question provides.
+Check:
+- Title and subtitle: 30 characters each at most, using the words people search for.
+- Keywords: the field holds 100 characters, comma-separated, and should not repeat words already in the title.
+- Screenshots: the first three tell the story without the description, show the app in use, and have captions.
+- Text: the first lines of the description, the promotional text, and how recent the release notes are.
+- Standing: the rating, the rating count, and the date of the last update.
+Competitors: for the two or three main keywords, search with `curl -s 'https://itunes.apple.com/search?term=<keyword>&entity=software&country=gb&limit=10'`. Compare the top five results' names, subtitles, ratings, rating counts, prices and screenshot counts with this app's.
+Evidence: each field with its current text, and the competitor URLs. The fix: a rewritten title, subtitle, keywords and screenshot captions, ready to paste.
+'''
+
+[[layouts.app-review.analysts]]
+id = "reviews"
+role = "Public reviews"
+lens = "What do real users love, hate and ask for, and what is getting worse?"
+tier = "moderate"
+where = "remote"
+brief = '''
+Gather the reviews:
+- iOS: read the public review feed at https://itunes.apple.com/gb/rss/customerreviews/id=<app id>/sortby=mostrecent/json.
+  - Page through it with `.../customerreviews/page=<n>/id=<app id>/sortby=mostrecent/json`, for n = 1 to 10, until a page comes back empty.
+  - Repeat for the us storefront and the app's other main markets.
+  - Find the app id in the listing URL, or with `curl -s 'https://itunes.apple.com/search?term=<name>&entity=software&country=gb'`.
+  - Each entry has the rating, title, content, version and author.
+- Google Play has no public review API. Read the listing page, and web-search for complaints (Reddit, forums).
+Analyse them:
+- Group the reviews into themes, such as crashes, login, pricing or the paywall, missing features, praise and support.
+- For each theme, give a count, the average rating, the versions it appears in (is it new in the latest version?), and two or three short quotes.
+- Separate bugs that a fix can solve from expectation gaps that the listing or onboarding create.
+- Do the same, more briefly, for the top two competitors' reviews, and list the complaints about them that this app could answer.
+If the app has no reviews yet, say so in one info finding, and review the closest competitors instead.
+Evidence: each review's title, date, rating and version, and the feed URL. The fix: what to change, and which reviews it answers.
+'''
+
+[[layouts.app-review.analysts]]
+id = "walkthrough"
+role = "Hands-on walkthrough"
+lens = "What happens when someone actually installs the app and uses it on a device?"
+tier = "moderate"
+where = "session"
+brief = '''
+This analyst runs in the user's own session, not in the background, because it needs the Simulator or a device on this Mac's screen. Never run parallel agents on the screen: one agent drives the Simulator or device at a time, and nothing else touches the screen while it does.
+iOS:
+1. Pick a simulator with `xcrun simctl list devices available`, then build with `xcodebuild -scheme <scheme> -destination 'platform=iOS Simulator,name=<device>' -derivedDataPath /tmp/app-review-build build`.
+2. Install fresh: `xcrun simctl uninstall booted <bundle id>`, then `xcrun simctl install booted <path to .app>` and `xcrun simctl launch booted <bundle id>`.
+3. Walk the first run and the core flow, taking a screenshot at each step (`xcrun simctl io booted screenshot step-<n>.png`).
+4. Deny each permission once, then repeat the flow that needs it.
+5. Repeat the core flow:
+   - with the network off.
+   - at the largest text size (`xcrun simctl ui booted content_size accessibility-extra-extra-extra-large`).
+   - in dark mode (`xcrun simctl ui booted appearance dark`).
+   - with Increase Contrast on (`xcrun simctl ui booted increase_contrast enabled`).
+   - with VoiceOver, driven from Accessibility Inspector.
+6. Try the paywall, restore purchases, sign-out and account deletion.
+Android: use the emulator, with `adb install`, `adb shell am start` and `adb exec-out screencap -p > step-<n>.png`.
+For each step, record what you did, what you expected, what happened, and the screenshot. Anything that crashes, hangs, dead-ends or looks broken is a finding. A crash on launch or in the core flow is a blocker.
+'''
+
+
+# -- go-live --------------------------------------------------------------------
+
+[layouts.go-live]
+title = "Go-live check"
+description = "Decide GO or NO-GO for a launch: infrastructure, secrets, payments, legal, indexing and analytics, email, store submission, load and support."
+targets = "any"
+fix = true
+report = '''
+Put GO or NO-GO on the first line. It is NO-GO while any blocker stands. Blockers include:
+- a leaked secret.
+- an expired or expiring certificate.
+- noindex, or a staging robots.txt, left on.
+- live payments without verified webhooks.
+- no privacy policy where personal data is collected.
+- no rollback.
+- a store submission that would be rejected.
+List the blockers first. Each blocker gets the evidence, exact fix steps (commands, file changes, settings or DNS records), and an owner: code, config, or Jon by hand (dashboards, accounts, legal sign-off, and anything this run cannot change). Then the should-fix items for launch week, and the nice-to-haves, in the same shape. End with a short checklist of the blockers in order, so they can be ticked off on the day.
+'''
+
+[[layouts.go-live.analysts]]
+id = "infra"
+role = "Deploy and infrastructure"
+lens = "If this goes live today and something breaks at 2am, will anyone know, and can it be rolled back?"
+tier = "moderate"
+where = "remote"
+brief = '''
+Check the production side of each target host <host> (from --url, or from the repo's config) and the repo's deploy set-up. Read only: never deploy, change DNS, run migrations or touch production.
+- DNS: run `dig +short A <domain>`, `dig +short AAAA <domain>` and `dig +short CNAME www.<domain>`. Both the apex and www should resolve, and one should redirect to the other (`curl -sI https://www.<domain>`).
+- TLS: run `echo | openssl s_client -connect <host>:443 -servername <host> 2>/dev/null | openssl x509 -noout -enddate -ext subjectAltName`. Give the days to expiry, and say whether renewal is automatic (managed by the host, or Let's Encrypt with a renewal job).
+- Environments and config: read vercel.json, netlify.toml, fly.toml, render.yaml, Dockerfile, docker-compose*.yml, Procfile, terraform/, k8s or helm files, .github/workflows/ and .env.example. Flag:
+  - production config that points at staging or localhost (API URLs, database hosts).
+  - debug flags that are on: DEBUG=True, NODE_ENV not set to production, verbose error pages.
+  - environment variables that the code reads but that are missing from the documented or example config. Find what it reads with `grep -rnoE 'process\.env\.[A-Z_]+|os\.environ\[.?[A-Z_]+|getenv\(.?[A-Z_]+' --exclude-dir=node_modules --exclude-dir=.git <repo>`.
+- Health checks: an endpoint such as /health or /healthz, and its response from `curl -s -o /dev/null -w '%{http_code} %{time_total}' https://<host>/health`.
+- Monitoring and alerting: error tracking (a Sentry DSN or similar, wired in), uptime monitoring, log retention, and who gets alerted.
+- Backups: the database backup schedule and retention (for example managed Postgres daily backups, or point-in-time recovery on Supabase or RDS), and whether a restore has ever been tested.
+- Rollback: how to redeploy the previous version (the host's rollback or promote-previous, tags, a pinned image), and whether the database migrations can be reversed, or are at least backward compatible with the previous release.
+Evidence: the command output, or the file:line. The owner: code, config or Jon by hand.
+'''
+
+[[layouts.go-live.analysts]]
+id = "secrets"
+role = "Secrets"
+lens = "Is any credential committed to the repo or its history, or shipped to the browser or the app bundle?"
+tier = "hard"
+where = "remote"
+brief = '''
+Find secrets committed to the repo (including its history) or shipped to the client. Report each one as file:line, or commit:file:line, with its KIND (for example "Stripe live secret key" or "AWS access key ID"). NEVER report, print, copy or save the secret value itself, not even partly masked. Keep values out of your own command output too: print locations only.
+- If gitleaks is installed, run `gitleaks git --redact --no-banner <repo>`. Older versions use `gitleaks detect --redact --source <repo>`. --redact keeps the values out of the output.
+- Otherwise, grep, and print only locations:
+  - working tree: `git -C <repo> grep -nIE '<pattern>' | cut -d: -f1,2`.
+  - history: list the commits that ever added or removed a match with `git -C <repo> log --all --format=%H -G'<pattern>'`. For each one, run `git -C <repo> grep -nIE '<pattern>' <commit> | cut -d: -f1-3`. If that commit deleted the match, use `git -C <repo> show --stat <commit>` to find the file.
+- Patterns, with the kind each one finds:
+  - `AKIA[0-9A-Z]{16}`: AWS access key ID.
+  - `(sk|rk)_live_[0-9A-Za-z]{20,}`: Stripe live secret or restricted key.
+  - `whsec_[0-9A-Za-z]{20,}`: Stripe webhook secret.
+  - `gh[pousr]_[0-9A-Za-z]{36}|github_pat_`: GitHub token.
+  - `xox[abprs]-`: Slack token.
+  - `sk-ant-`: Anthropic key.
+  - `sk-(proj-)?[0-9A-Za-z_-]{20,}`: OpenAI key.
+  - `AIza[0-9A-Za-z_-]{35}`: Google API key.
+  - `SG\.[0-9A-Za-z_-]{22}\.`: SendGrid key.
+  - `-----BEGIN [A-Z ]*PRIVATE KEY-----`: private key.
+  - `(postgres|postgresql|mysql|mongodb(\+srv)?|redis)://[^:/ ]+:[^@/ ]+@`: database URL with a password.
+  - `service_role` near a JWT: Supabase service key.
+- Tracked env files: `git -C <repo> ls-files | grep -E '(^|/)\.env($|\.)' | grep -v example`, and whether .gitignore covers them.
+- Shipped to the client:
+  - environment variables that the build exposes (NEXT_PUBLIC_, VITE_, REACT_APP_, EXPO_PUBLIC_, PUBLIC_) and whose names contain SECRET, PRIVATE, SERVICE or TOKEN.
+  - keys in Info.plist, strings.xml or bundled config.
+  - for a live site, the JS bundles linked from the HTML: fetch them and search them with the same patterns, using `grep -cE` so you get only a count.
+These are not secrets, so do not flag them: Stripe publishable keys (pk_), the Firebase web config apiKey, and the Supabase anon key when RLS is on. Mention them only if they are test keys in production.
+For a real secret, the fix is always:
+1. rotate it at the provider (owner: Jon by hand).
+2. remove it from the code, and load it from the environment (owner: code).
+3. decide whether to purge it from history (`git filter-repo`). Purging history does not make a leaked key safe; only rotating it does.
+'''
+
+[[layouts.go-live.analysts]]
+id = "payments"
+role = "Payments"
+lens = "Will real money be taken, recorded, taxed and receipted correctly from the first live customer?"
+tier = "hard"
+where = "remote"
+brief = '''
+Read code and config only. Never call a payments API: no curl to api.stripe.com or any other provider, no `stripe` CLI commands, no test charges, and no dashboard logins. Never print key values; report only the key's KIND and where it is.
+- Provider and mode:
+  - which provider is in use (Stripe, Paddle, Lemon Squeezy, PayPal, RevenueCat, StoreKit or Play Billing).
+  - whether production config uses live keys. Report pk_live_ against pk_test_, and the names of the environment variables that hold the secret key, never their values.
+  - flag test keys, test price IDs or test webhook secrets in production config.
+- Webhooks: find the handler with `grep -rnE 'constructEvent|construct_event|[Ww]ebhook' --exclude-dir=node_modules <repo>`. Check that it:
+  - verifies the signature with the endpoint secret, against the RAW request body. A JSON body parser that runs before the route breaks verification.
+  - returns 2xx quickly.
+  - handles duplicate deliveries idempotently, by deduplicating on the event id.
+  - covers the events the business needs: checkout.session.completed, invoice.paid, invoice.payment_failed, customer.subscription.updated, customer.subscription.deleted and charge.refunded.
+  - does the fulfilment. Fulfilment must happen in the webhook, not on the success redirect.
+- Tax:
+  - whether automatic tax is enabled (`automatic_tax` in Stripe Checkout or Billing).
+  - whether prices are tax-inclusive or tax-exclusive.
+  - whether UK VAT, EU VAT OSS or US sales tax applies, given who this sells to. A merchant of record (Paddle, Lemon Squeezy) handles this for you.
+- Receipts and invoices:
+  - whether customer emails, invoice PDFs and the company details on invoices are configured.
+  - the refund path.
+  - dunning for failed renewals.
+  - the cancellation flow. UK and EU consumers need easy cancellation.
+- Apps: digital goods go through in-app purchase with server-side validation (the App Store Server API or Server Notifications V2, or the Play Developer API), and restore purchases works.
+- Prices: the prices on the pricing pages in the code must match the price IDs configured.
+Evidence: file:line. The owner: code, config, or Jon by hand (dashboard settings such as tax registrations, the webhook endpoint URL, and branding).
+'''
+
+[[layouts.go-live.analysts]]
+id = "legal"
+role = "Legal and privacy"
+lens = "Can this collect personal data and take customers lawfully in the UK on day one?"
+tier = "moderate"
+where = "remote"
+brief = '''
+Check the site (fetch each page with curl) and the repo against the basics of UK GDPR, PECR and UK consumer law. Flag what needs a solicitor, rather than giving legal advice.
+- Privacy policy:
+  - It exists, and is linked from every page footer and wherever data is collected (sign-up, contact forms, checkout).
+  - It names the controller, with contact details.
+  - It gives the lawful basis for each purpose.
+  - It lists the processors the code actually uses. Compare it with the SDKs and services in the repo: payments, hosting, database, email, analytics, error tracking and AI APIs.
+  - It covers international transfers, retention, data subject rights, and the right to complain to the ICO.
+- Cookies: PECR requires consent before non-essential cookies, and rejecting must be as easy as accepting. Read the ICO's current guidance on cookies and similar technologies. The Data (Use and Access) Act 2025 changed some exemptions, with staged commencement.
+- Terms:
+  - terms of service.
+  - an acceptable use policy, where there is user content.
+  - a refund and cancellation policy. The Consumer Contracts Regulations 2013 give a 14-day cancellation right. Digital content can lose that right only with the consumer's express consent and acknowledgement.
+  - subscription auto-renewal terms.
+- Company details: the registered name, company number, registered office and place of registration must appear on the website, on emails and on order forms (Companies Act 2006, and the 2015 trading disclosures regulations). Check them against Companies House (https://find-and-update.company-information.service.gov.uk/).
+- The ICO data protection fee: search the register at https://ico.org.uk/ESDWebPages/Search.
+- Children: whether under-18s are likely users (the ICO Children's Code), and any age gate.
+- Marketing: consent for marketing email, unsubscribe, and DPAs with processors.
+Evidence: the page URL and the quoted text, or what is absent. The owner: usually Jon by hand, or code for links and banners.
+'''
+
+[[layouts.go-live.analysts]]
+id = "indexing"
+role = "Indexing and analytics"
+lens = "Will search engines index the production site, and will analytics count the launch?"
+tier = "moderate"
+where = "remote"
+brief = '''
+Look for the classic go-live misses: staging settings left on, and analytics not firing.
+- robots.txt: run `curl -s https://<host>/robots.txt`. Flag `Disallow: /`, or a staging robots.txt.
+- noindex:
+  - `curl -sI https://<host>` for an `X-Robots-Tag` header.
+  - `curl -sL https://<host>` for `<meta name="robots" content="noindex">`.
+  - in the repo, `grep -rniE 'noindex|nofollow|disallow' --exclude-dir=node_modules --exclude-dir=.git <repo>` finds framework robots settings (Next.js metadata robots, next-sitemap, Astro or Nuxt config, WordPress "discourage search engines"). Check which environment each one applies to.
+- Sitemap: present, listing production URLs (not localhost, staging or preview hosts), and referenced from robots.txt.
+- Canonicals: on key pages, they point at the production host over https.
+- Preview and staging hosts must not be indexable. Web-search `site:<staging host>` and `site:vercel.app <name>`, and check that they send noindex.
+- Search Console: verification, as a google-site-verification meta tag or a DNS TXT record (`dig +short TXT <domain>`).
+- Analytics:
+  - the tag is in the production HTML with the production ID, not a test property.
+  - the code fires events for the actions that matter, such as sign-up and purchase.
+  - tracking waits for consent.
+  This Mac's home DNS blocks tracker domains, so a tag that does not load from here may be a false negative. Judge from the HTML, and mark load failures low confidence.
+- Sharing: the Open Graph image and title, for launch-day sharing.
+Evidence: the URL and the exact line. The fix: the setting to flip or the file to change, and the owner.
+'''
+
+[[layouts.go-live.analysts]]
+id = "email"
+role = "Email deliverability"
+lens = "Will sign-up, receipt and password-reset emails reach the inbox rather than spam?"
+tier = "moderate"
+where = "remote"
+brief = '''
+Find who sends mail for this product: search the repo for the provider SDK and the sender address with `grep -rniE 'resend|sendgrid|postmark|mailgun|amazonses|aws-sdk.*ses|nodemailer|smtp|from:' --exclude-dir=node_modules <repo>`. Then check the sending domain <domain>, and any sending subdomain:
+- MX: run `dig +short MX <domain>`. Replies and the support address must land somewhere.
+- SPF: run `dig +short TXT <domain>`, and the same for the sending subdomain.
+  - There must be exactly one v=spf1 record.
+  - It must include each provider actually used, for example include:_spf.google.com, include:sendgrid.net, include:amazonses.com or include:spf.protection.outlook.com.
+  - It must end in ~all or -all, and stay within 10 DNS lookups.
+- DKIM: run `dig +short TXT <selector>._domainkey.<domain>` for the provider's selectors: resend; s1 and s2 for SendGrid; google; selector1 and selector2 for Microsoft 365; or the CNAME tokens for SES. Find the selector in the provider's set-up docs, or in DNS records the repo documents.
+- DMARC: run `dig +short TXT _dmarc.<domain>`. It must exist, with an rua address that someone reads. p=none should move to quarantine or reject once the reports are clean.
+- Bulk-sender rules: Gmail and Yahoo have enforced these since 2024, and Outlook since 2025:
+  - SPF, DKIM and DMARC, aligned with the From domain.
+  - one-click unsubscribe (RFC 8058 List-Unsubscribe-Post) on marketing mail.
+  - a low spam rate.
+- In the code:
+  - the From address is on the authenticated domain, not gmail.com or an unverified domain.
+  - a Reply-To is set.
+  - transactional and marketing mail are separated, by stream or by subdomain.
+  - bounces and complaints are handled (provider webhooks, a suppression list).
+Evidence: the dig output, or file:line. The fix: the exact DNS record (type, host and value) or code change, and the owner.
+'''
+
+[[layouts.go-live.analysts]]
+id = "store"
+role = "Store submission readiness"
+lens = "If this ships as an app, are the build and its App Store Connect or Play Console record ready to submit?"
+tier = "moderate"
+where = "remote"
+brief = '''
+If the target has no iOS or Android app (no .xcodeproj, .xcworkspace or Package.swift app target, no android/ or app/build.gradle, and no store URL in the question), return a single info finding saying so, and stop.
+Otherwise, check the repo and the listing:
+- Version and build: CFBundleShortVersionString and CURRENT_PROJECT_VERSION (or MARKETING_VERSION in project.pbxproj), or versionName and versionCode, are bumped past the last release. Compare with `curl -s 'https://itunes.apple.com/lookup?bundleId=<bundle id>&country=gb'`.
+- Icon and launch screen: the app icon set is complete, with a 1024px marketing icon that has no alpha channel (`sips -g hasAlpha <icon.png>`), and a launch screen exists.
+- Info.plist: ITSAppUsesNonExemptEncryption is set (export compliance), PrivacyInfo.xcprivacy is present, and every permission has a purpose string.
+- URLs: the privacy policy URL and the support URL are live. Run `curl -o /dev/null -s -w '%{http_code}'` on each.
+- Sign-in: App Review notes have a demo account, and there is in-app account deletion if accounts can be created (Guideline 5.1.1(v)).
+- App Store Connect record:
+  - screenshots for the required device sizes (fastlane/screenshots, or from the question).
+  - an age rating questionnaire answered to match the content.
+  - in-app purchases created and attached to the version.
+- Android: a signed release AAB config, a targetSdkVersion that meets the current Play requirement, the Data safety form, the content rating, and the closed-testing requirement for new personal accounts.
+Cite the App Store Review Guideline or the Play policy for each blocker. The owner: code, config, or Jon by hand for App Store Connect and the Play Console.
+'''
+
+[[layouts.go-live.analysts]]
+id = "load-support"
+role = "Load, support and status"
+lens = "Will it stay up under launch traffic, and can a stuck user reach a human?"
+tier = "moderate"
+where = "remote"
+brief = '''
+Load: never load-test the live site from here. It would look like an attack, and it is not this run's call. Instead:
+- Measure single-request timings for the home page and three key pages, three times each: `curl -o /dev/null -s -w 'dns %{time_namelookup} connect %{time_connect} tls %{time_appconnect} ttfb %{time_starttransfer} total %{time_total} size %{size_download}\n' <url>`.
+- Check the caching and CDN headers on static assets and pages with `curl -sI`: cache-control, age, cf-cache-status, x-vercel-cache and x-cache.
+- Read the code for launch bottlenecks:
+  - N+1 queries, and unbounded queries with no LIMIT or pagination.
+  - missing indexes on hot query columns: compare the WHERE and ORDER BY columns with the migrations.
+  - no rate limiting on auth, sign-up and expensive endpoints.
+  - external API calls with no timeout.
+  - connection pool or serverless limits.
+- Check the hosting and database plan limits (connections, function duration, bandwidth) on the providers' current pricing pages.
+- Recommend a load test for the user to run against staging: a short k6 or Locust script, with a target requests per second derived from the expected launch traffic.
+Support and status:
+- Contact: a contact route (email, form or chat) is linked from every page and from inside the app, and the support address's domain has MX (`dig +short MX <domain>`).
+- Error pages:
+  - a made-up path returns a real 404 page with status 404 (`curl -s -o /dev/null -w '%{http_code}' https://<host>/no-such-page-<random>`).
+  - error pages do not leak stack traces or framework debug pages.
+- Status: a status page (status.<domain>, or a hosted one), or at least a plan for announcing outages, and who answers support on launch day.
+Evidence: the timings, the headers, or file:line. The fix, and its owner.
+'''
+
+
+# -- code-audit -----------------------------------------------------------------
+
+[layouts.code-audit]
+title = "Code audit"
+description = "Audit a repository for correctness, security, tests, performance, operations and maintainability, with file:line evidence and repros."
+targets = "repo"
+fix = true
+report = '''
+Open with a three-line summary: the overall state, the top three things to fix, and what was run (the test suite results, and the tools used).
+Then the findings, grouped by severity (blocker, high, medium, low, info), with the most certain first within each group. Each finding gives:
+- the file:line.
+- what is wrong.
+- why it matters: the input or situation that triggers it.
+- a repro or a test command, where possible: a failing test to add, or a one-line command.
+- the fix.
+End with the areas no analyst examined.
+'''
+
+[[layouts.code-audit.analysts]]
+id = "correctness"
+role = "Correctness"
+lens = "Does the code do what it claims, for every input it will actually see?"
+tier = "hard"
+where = "remote"
+brief = '''
+Read the README and the entry points (main modules, CLI, routes or handlers), then trace the main paths through the code. Look for bugs, not style:
+- Edge cases:
+  - empty, None or null, zero, negative and very large values.
+  - duplicates, and unicode or whitespace in input.
+  - off-by-one errors in ranges and slicing.
+  - integer and float mistakes, such as money held in floats.
+  - time zones, DST and naive datetimes.
+- Error handling:
+  - swallowed exceptions: `grep -rnE 'except( Exception)?:\s*$|except .*:\s*pass|catch \([^)]*\) *\{ *\}' <repo>`.
+  - unchecked return codes.
+  - failure paths that leave state half-written.
+  - resources that are never closed.
+- Concurrency: shared mutable state with no lock, check-then-act races, async functions called without await, and blocking calls inside async code.
+- Contracts: functions whose docstrings, types or README claims do not match their behaviour, and callers that ignore a function's documented failure modes.
+- Data: migrations that do not match the models, nullable columns treated as required, and serialisation round trips that lose data.
+To confirm a bug:
+1. Copy the repo first: `tmp=$(mktemp -d) && cp -R <repo> "$tmp/"`. Never write into <repo>.
+2. In the copy, write a minimal failing test, or a one-line python, node or shell command, and run it.
+Evidence: the file:line, the input that triggers the bug, the expected and actual results, and the repro command with its output. A bug you could not reproduce is medium confidence at most.
+'''
+
+[[layouts.code-audit.analysts]]
+id = "security"
+role = "Security"
+lens = "How could an attacker or a malicious user abuse this code, and what would they get?"
+tier = "hard"
+where = "remote"
+brief = '''
+Review the code in --repo as an attacker would. Do not attack anything live.
+- Injection:
+  - SQL built with f-strings, format() or concatenation: `grep -rnE "execute\(f?[\"'].*(\{|%s|\+)" <repo>`.
+  - shell commands built from user input: `shell=True`, `os.system`, `child_process.exec`.
+  - `eval` and `exec`, and template injection.
+  - unsafe deserialisation: `pickle.loads`, and `yaml.load` without SafeLoader.
+- Access control:
+  - routes and handlers with no auth check.
+  - objects fetched by an id from the request with no owner check (IDOR).
+  - admin functions that ordinary users can reach.
+  - Supabase or Postgres row-level security that is disabled on a table, or written as `using (true)` in the migrations.
+- Authentication and sessions:
+  - password hashing: bcrypt, scrypt or argon2, not a fast hash.
+  - JWT verification: the signature is checked, the algorithms are pinned, and the expiry is checked.
+  - cookie flags.
+  - missing rate limits on login and password reset.
+- Web:
+  - SSRF: fetching URLs the user supplies.
+  - path traversal: user input joined into file paths.
+  - open redirects.
+  - CORS `*` with credentials.
+  - missing CSRF protection on cookie-authenticated forms.
+  - XSS through unescaped output (`dangerouslySetInnerHTML`, `|safe`, `innerHTML`).
+- Secrets in code: report the file:line and the KIND only, never the value.
+- Dependencies: find known vulnerabilities with `npm audit --omit=dev --json`, `pip-audit -r requirements.txt` (for a uv or Poetry project, export the lock to a requirements file in a temp dir first) or `osv-scanner -r <repo>`, when they are installed. Report each one only if the vulnerable code path is reachable.
+If bandit (`bandit -r <repo> -q -ll`) or semgrep (`semgrep scan --config auto --metrics off <repo>`) is installed, run it, and confirm each hit by reading the code.
+Evidence: the file:line, the attack (who sends what, and what they get), and the CWE id. The fix: the specific code change.
+'''
+
+[[layouts.code-audit.analysts]]
+id = "tests"
+role = "Tests"
+lens = "Would the test suite catch the next regression in the code that matters most?"
+tier = "moderate"
+where = "remote"
+brief = '''
+Work in a copy: `tmp=$(mktemp -d) && cp -R <repo> "$tmp/"`. Never run anything in <repo> itself.
+- Run the suite: find how the tests are run (the README, the Makefile, package.json scripts, pyproject.toml, the CI workflows in .github/workflows/), and run them in the copy, for example with `uv run pytest -q`, `npm test`, `go test ./...` or `cargo test`. Record the pass, fail and skip counts, the duration, and every failure with its first error line.
+- Coverage, where it is cheap: `uv run pytest --cov`, `coverage run -m pytest && coverage report --sort=cover`, `npx vitest run --coverage` or `go test -cover ./...`. List the least-covered modules that hold core logic.
+- Gaps: map the important behaviour (from the README and the entry points) to the tests that cover it. List the critical paths that have no test: payments, auth, data writes, migrations and parsing.
+- Test quality:
+  - tests with no assertions.
+  - tests that mock the unit under test.
+  - assertions on implementation details.
+  - sources of flakiness: sleeps, and real network or clock use.
+  - tests that are skipped or marked xfail with no reason.
+  Run the suite twice, and report anything that changes between runs (flaky tests).
+- CI: does it run the tests on every pull request, on the versions the project supports, and fail the build when they fail?
+Evidence: the command, the counts, and the file:line of each gap. The fix: the specific test to add, named, with its assertion, in the project's test style.
+'''
+
+[[layouts.code-audit.analysts]]
+id = "performance"
+role = "Performance"
+lens = "Where will this get slow or expensive as data and traffic grow, measured where possible?"
+tier = "moderate"
+where = "remote"
+brief = '''
+Find the hot paths (request handlers, loops over user data, jobs, start-up), and look for:
+- Database: N+1 queries (ORM calls inside loops), queries with no LIMIT or pagination, `SELECT *` on wide tables, and missing indexes (compare the WHERE, JOIN and ORDER BY columns with the indexes in the migrations).
+- Algorithms: nested loops over collections that grow, repeated list-membership tests that should use a set, sorting inside loops, and files re-read or regexes re-compiled on every call.
+- I/O: sync HTTP or disk calls inside async handlers, no connection pooling, no timeouts, and calls made one after another that could run concurrently.
+- Memory: whole files or result sets loaded at once where streaming would do, unbounded caches, and large objects held globally.
+- Front end: bundle size (the build output, or `npx -y source-map-explorer` on the built files), unoptimised images, and render loops.
+Measure where it is cheap, in a copy of the repo (`tmp=$(mktemp -d) && cp -R <repo> "$tmp/"`). Use `python -m cProfile -s cumtime <entry>`, `hyperfine '<command>'`, `time`, or a micro-benchmark with realistic sizes. Never run anything against production.
+Evidence: the file:line, plus the measured numbers, or a complexity argument with realistic sizes (for example "O(n^2) in orders: at 10k orders, 10^8 comparisons"). The fix: the specific change, and its expected effect.
+'''
+
+[[layouts.code-audit.analysts]]
+id = "operations"
+role = "Operations"
+lens = "When this runs in production and something goes wrong, will it fail safely and tell someone?"
+tier = "moderate"
+where = "remote"
+brief = '''
+Read the code and config in --repo for production readiness:
+- Logging: structured logs with levels, request or correlation IDs, and no secrets or personal data in the logs. Check with `grep -rniE '(log|logger|console)\.(info|debug|warn|error|log)\(.*(password|token|secret|authorization|email)' --exclude-dir=node_modules <repo>`.
+- Errors: an error tracker wired in (Sentry or similar), handlers for unhandled exceptions and rejections, and user-facing errors that do not leak internals.
+- Config: settings come from the environment, are validated at start-up, and fail fast when a required one is missing. There are no hard-coded hosts or credentials.
+- Resilience:
+  - every outbound call has a timeout. Look for `requests.get(` without `timeout=`, `fetch(` without an AbortSignal, and HTTP clients whose default timeout is infinite.
+  - retries use backoff and jitter, and only on idempotent operations.
+  - critical dependencies have circuit breakers or fallbacks.
+  - payment and creation endpoints take idempotency keys.
+- Lifecycle:
+  - health and readiness endpoints.
+  - graceful shutdown on SIGTERM: in-flight requests finish, and workers drain.
+  - background jobs survive restarts: a durable queue, not in-memory.
+- Data: migrations are versioned and run in the deploy pipeline, and backups are documented.
+- Build and deploy:
+  - lockfiles are committed, and versions are pinned.
+  - a Dockerfile with a pinned base image that runs as a non-root user.
+  - CI that lints, tests and builds.
+  - a documented deploy and rollback procedure.
+Evidence: the file:line, or the file that is missing. The fix: the specific change.
+'''
+
+[[layouts.code-audit.analysts]]
+id = "maintainability"
+role = "Maintainability"
+lens = "How expensive will the next feature, and the next new contributor, be?"
+tier = "moderate"
+where = "remote"
+brief = '''
+Measure, then read:
+- Size and hotspots:
+  - the biggest files: `(cd <repo> && git ls-files -z | xargs -0 wc -l | sort -n | tail -25)`.
+  - the files that change most: `git -C <repo> log --since='6 months ago' --name-only --format= | sort | uniq -c | sort -rn | head -20`.
+  - the big files that change often are the hotspots. Read them first.
+- Complexity: very long functions, deep nesting, and functions with many parameters or flags. For Python, `radon cc -s -n C <repo>` if radon is installed.
+- Duplication: the same logic copied across modules. Search for distinctive lines.
+- Dead code: run `vulture <repo>` (Python) or `npx -y knip` (TypeScript) in a copy of the repo (`tmp=$(mktemp -d) && cp -R <repo> "$tmp/"`). Confirm each hit with grep before reporting it.
+- Structure: circular imports, layers that bypass each other (UI code calling the database directly), god objects, and inconsistent patterns for the same job.
+- Types: whether type checking passes in the copy (`mypy`, `pyright` or `tsc --noEmit`).
+- Docs and dependencies:
+  - README set-up steps that no longer match the code.
+  - outdated or abandoned dependencies (`npm outdated`, and the last release date of each key dependency).
+Rank the findings by what they cost the next change, not by taste.
+Evidence: the file:line, and the numbers. The fix: a specific refactor, with its scope in files.
+'''
+
+
+# -- architecture ---------------------------------------------------------------
+
+[layouts.architecture]
+title = "Architecture review"
+description = "Weigh the architecture options for a repository by simplicity, failure modes, scale, cost and migration path, then recommend one."
+targets = "repo"
+fix = false
+report = '''
+Start with the question restated as the decision to make, and a short text diagram of the current architecture.
+Then compare the options in one table:
+- rows: the options, including changing nothing, or changing the least.
+- columns: complexity, failure modes, scale ceiling, monthly cost now and at 10x, migration effort, and reversibility.
+Make a recommendation: the option, why it wins for this team and this load, the conditions that would change it, and the first three migration steps.
+Give the strongest argument against the recommendation, and what to measure to know whether it was right.
+'''
+
+[[layouts.architecture.analysts]]
+id = "simplicity"
+role = "Simplicity and options"
+lens = "What is the simplest design that meets the real requirements, and what are the realistic alternatives?"
+tier = "hard"
+where = "remote"
+brief = '''
+1. Map the current system from --repo: the components, data stores, queues, external services and deploy targets, and how they talk to each other. Use the entry points, the config (docker-compose, terraform, the host's config files, .env.example) and the dependency manifests. Draw it as a short text diagram, citing the file behind each box.
+2. Identify the requirements the question really implies (users, data size, latency, team size, deadlines). Separate the stated requirements from the assumed ones.
+3. List the two to four realistic options. Always include "keep the current design and change the least", and the boring, managed option. For each option, give:
+   - the new moving parts (services, stores, dependencies).
+   - the code that would change: the modules, with a rough count of files.
+   - what the team would need to learn or run.
+   - what it makes harder later.
+4. Prefer fewer moving parts, fewer languages and managed services, unless a requirement rules them out. When one does, say which.
+5. Recommend the simplest option that meets the requirements, and name the requirement that would force the next option up.
+Evidence: the file:line for every claim about the current system, and documentation URLs for every claim about a technology.
+'''
+
+[[layouts.architecture.analysts]]
+id = "failure-modes"
+role = "Failure modes"
+lens = "How does each option break, how badly, and how does it recover?"
+tier = "hard"
+where = "remote"
+brief = '''
+For the current design, and for each realistic option:
+- Dependencies: list every dependency (database, cache, queue, auth provider, payment and email providers, third-party APIs, DNS and CDN), and what happens when each one is slow, down, or returning errors. Read the code for timeouts, retries, fallbacks and circuit breakers, and cite file:line.
+- Single points of failure, and the blast radius of each: all users, one feature, or one tenant.
+- Partial failures:
+  - writes that span two systems with no transaction or outbox.
+  - retries without idempotency, which cause double charges or duplicate emails.
+  - messages lost when a worker dies mid-job.
+- Data loss windows: backup frequency and retention (RPO), restore time (RTO), and whether the restore is tested.
+- Operational failure modes: deploys that need downtime, migrations that lock tables, config drift, and on-call load for a small team.
+Check the published SLAs and recent incident history of the dependencies that matter: their status-page history, and post-mortems found by web search.
+Rank the failure modes by likelihood times impact, for each option.
+Evidence: the file:line, or the SLA or incident URL.
+'''
+
+[[layouts.architecture.analysts]]
+id = "scale"
+role = "Scale"
+lens = "At what load does each option hit its first bottleneck, and is that load realistic?"
+tier = "moderate"
+where = "remote"
+brief = '''
+1. Establish the current and expected load from the question, the repo (analytics config, seed data, rate limits, any capacity notes) and the stated plans: peak requests per second, data size and growth per year, and concurrent users. Say when a number is assumed.
+2. For each option, do the back-of-envelope sums: requests per second per instance, database connections against the plan limit, row counts and index size, payload sizes, queue throughput, and third-party rate limits (cite their documentation). Name the first bottleneck, and the multiple of today's load at which it hits.
+3. Check the code for scale traps: N+1 queries, unbounded queries, heavy work per request, in-memory state that blocks horizontal scaling, and single-writer designs.
+4. Say which options hold at 10x and at 100x, and what each one needs to get there.
+5. Call out premature scaling: work that pays off only at loads the question gives no reason to expect.
+Evidence: the sums, with their inputs cited (file:line, documentation URLs).
+'''
+
+[[layouts.architecture.analysts]]
+id = "cost"
+role = "Cost"
+lens = "What does each option cost to build and to run, now and at 10x?"
+tier = "moderate"
+where = "remote"
+brief = '''
+For each option, estimate:
+- Running cost per month, at today's load and at 10x, from the providers' current public pricing pages (cite each URL, with today's date). Cover compute, database, storage, egress, CDN, logs and monitoring, email, AI or API usage, per-seat tools and support tiers. Include the line items people forget: egress, log volume, NAT gateways, idle minimums and paid backups.
+- Build cost in person-days, and the ongoing maintenance and on-call time per month.
+- Switching and exit cost: lock-in, data export, and contract terms.
+Read the repo's dependencies and config to see what is already paid for, and what the current costs probably are (the plan names in config, and the services in use).
+Give ranges, not point estimates, and list every assumption. Present one table (option by cost line), with the total at each load level.
+Evidence: the pricing URL for each price, and the file:line for the current set-up.
+'''
+
+[[layouts.architecture.analysts]]
+id = "migration"
+role = "Migration path"
+lens = "How do we get from today to each option in small, reversible steps?"
+tier = "moderate"
+where = "remote"
+brief = '''
+For each option other than "change the least", plan the path from the current code in --repo:
+- Steps: a sequence in which each step can be deployed and reversed on its own. Use strangler fig, branch by abstraction, feature flags, dual writes then backfill then switching reads, or shadow traffic.
+- Data migration: the schema changes; the backfill (how many rows, and how long it takes at a realistic rate); any downtime or locking (for example a Postgres ALTER TABLE that rewrites the table); and how to verify the copy.
+- Rollback: how to roll back each step, and the point of no return, if there is one.
+- Scope: the files and modules each step changes (cite them), the tests to add first to protect the current behaviour, and a rough number of person-days.
+- The end: what can be deleted, so the migration finishes rather than leaving two systems running.
+Flag options with no incremental path (big-bang rewrites); that is a major risk.
+Evidence: the file:line of the code each step touches.
+'''
+
+
+# -- launch ---------------------------------------------------------------------
+
+[layouts.launch]
+title = "Launch readiness"
+description = "Decide whether to launch: target user, competitors, pricing, distribution, positioning and timing, and the fixes that would change the answer."
+targets = "any"
+fix = false
+report = '''
+Open with one line: GO, GO WITH FIXES or NOT YET, and the reason.
+Then the fixes that would change the answer, ranked by how much they move it. Each gives what to do, by when, and the evidence behind it.
+Then one short section per area (target user, competitors, pricing, distribution, positioning and timing), each with the finding, its evidence and the risk.
+Finish with a launch plan: the first channel, the launch-day message, the price, and the metric that would show it worked after two weeks.
+'''
+
+[[layouts.launch.analysts]]
+id = "target-user"
+role = "Target user"
+lens = "Who exactly has this problem badly enough to pay or switch, and where is the evidence?"
+tier = "moderate"
+where = "remote"
+brief = '''
+From the question, the --url site or the --repo README, write down who the product says it is for. Then test that claim against the evidence:
+- Pain: people describing this problem in their own words. Quote real posts, with their URLs and dates. Search:
+  - Reddit.
+  - Hacker News: `curl -s 'https://hn.algolia.com/api/v1/search?query=<terms>&tags=story'`, and again with `tags=comment`.
+  - Stack Overflow, GitHub issues on adjacent tools, and product forums.
+  - the competitors' reviews (G2, Capterra, the App Store).
+- Workarounds: how those people solve it today, and what that costs them in money, time and effort.
+- Trigger: the moment when someone goes looking for a solution.
+- Size: how many such people there are, with a cited source, and how easy they are to reach.
+Write the sharpest ideal-customer profile the evidence supports (role, company type and size, situation, trigger), and the profiles it does not support. If the evidence of pain is thin, say so plainly; that is the most important finding a launch can get.
+Evidence: a URL and date for every quote and number.
+'''
+
+[[layouts.launch.analysts]]
+id = "competitors"
+role = "Competitors"
+lens = "Who else solves this, how well, for how much, and where is the gap?"
+tier = "moderate"
+where = "remote"
+brief = '''
+Find five to eight alternatives: direct competitors, indirect ones (a spreadsheet, an agency, a general tool used for this job), and doing nothing. Use web search, "alternatives to <competitor>" pages, Product Hunt, GitHub topics and app store searches.
+For each one, give:
+- its positioning line, quoted from its home page.
+- its target segment.
+- its pricing, from its pricing page (cite the URL).
+- traction signals: G2 or App Store review counts, GitHub stars (the stargazers_count field from `curl -s https://api.github.com/repos/<owner>/<repo>`), funding news, and headcount from job posts.
+- recent moves: its changelog, and launches in the last six months.
+- the weaknesses its own users name, in reviews and forum threads.
+Then name the gap this product fills, or show honestly that there is none, and say how a competitor would respond if it worked.
+Present a comparison table, with a source for every cell.
+'''
+
+[[layouts.launch.analysts]]
+id = "pricing"
+role = "Pricing"
+lens = "What should it cost, on what value metric, and do the unit economics work?"
+tier = "moderate"
+where = "remote"
+brief = '''
+- Competitor prices: each plan's price, limits and value metric (per seat, usage or flat), from the pricing pages (cite the URLs).
+- Willingness to pay: what the target users spend on workarounds today, pricing complaints in competitors' reviews, and prices mentioned in forum threads.
+- Proposed pricing: two or three tiers, each with a price, what is included, and the reasoning. Cover:
+  - the free tier or trial, and what it costs to serve.
+  - annual against monthly.
+  - whether prices are shown including VAT for UK and EU consumers.
+- Unit economics:
+  - the cost to serve one customer per month: hosting, database, AI or API usage at the providers' current per-token or per-call prices, email, and support time.
+  - payment fees, from the provider's pricing page.
+  - the gross margin per tier.
+  If --repo is given, read which paid services the code calls, to get the cost lines right.
+- Billing set-up: a payment processor or a merchant of record (Paddle, Lemon Squeezy), and who handles VAT and sales tax.
+Evidence: a URL for every price, and the sums shown.
+'''
+
+[[layouts.launch.analysts]]
+id = "distribution"
+role = "Distribution and channels"
+lens = "How will the first 100 users actually find this?"
+tier = "moderate"
+where = "remote"
+brief = '''
+List the channels where the target users already are: communities (subreddits, Discord and Slack groups, forums), newsletters, marketplaces and app stores, integration directories, search keywords, GitHub, LinkedIn and X, conferences and partners.
+For each channel, give:
+- its reach, with a source: subscriber or member counts, and search-volume proxies such as Google Trends or keyword-tool figures, if you find them.
+- its rules on self-promotion.
+- the cost and the effort.
+- what comparable launches got there: past Show HN posts for similar tools and their points (`curl -s 'https://hn.algolia.com/api/v1/search?query=<terms>&tags=show_hn'`), Product Hunt results, and launch write-ups.
+Count the owner's existing audience, if the question or the repo shows one (GitHub stars, followers, a mailing list).
+Rank the channels by expected users per hour of effort. Then write a concrete plan for the first 100 users: which channel comes first, the post or message, and the timing.
+Evidence: a URL for each number.
+'''
+
+[[layouts.launch.analysts]]
+id = "positioning"
+role = "Positioning and message"
+lens = "Does the message make the right person say 'that's for me', in words that differ from the competitors'?"
+tier = "moderate"
+where = "remote"
+brief = '''
+1. Read the current message, from whichever apply: the --url home page (headline, subheading, first call to action), the first screen of the --repo README, and the app listing. Quote it.
+2. Write the positioning as it stands: for whom, the problem, the category, the key benefit, and against which alternative.
+3. Say where it is vague, generic ("AI-powered", "all-in-one", "seamless"), or the same as the competitors' wording. Quote theirs alongside it.
+4. List the proof points available: numbers, users, a demo, open-source code, testimonials.
+5. Propose a positioning statement and three alternative headlines, each with a subheading, aimed at the strongest ideal customer the evidence supports. Use the users' own words where forum quotes exist.
+6. Say which one you would test first, and how (for example a landing-page A/B test, or posting two versions).
+Evidence: the URL of every piece of quoted copy.
+'''
+
+[[layouts.launch.analysts]]
+id = "timing"
+role = "Timing"
+lens = "Is now the right moment, and what does waiting cost?"
+tier = "moderate"
+where = "remote"
+brief = '''
+Check what is happening now. Search with date filters, and give the date of every item:
+- competitor launches and funding in the last 90 days.
+- platform changes that help or hurt: API pricing or terms, app store policy, OS or model releases, and regulation coming into force.
+- seasonality in the target market (budget cycles, holidays, the academic year), and upcoming events where the target users gather.
+- news cycles that would drown out a launch or amplify it.
+If --repo is given, assess its readiness:
+- open issues labelled bug (`gh issue list --label bug`, for a GitHub repo).
+- TODO and FIXME counts in the core paths.
+- recent commit velocity: `git -C <repo> log --since='30 days ago' --oneline | wc -l`.
+- whether the README's install steps work as written. Try them in a copy, if they are cheap to run.
+Weigh the cost of waiting (competitors moving, lost momentum) against the cost of launching early (first impressions, support load). Recommend a date window, with the reasons, and the conditions that would move it.
+'''
+
+
+# -- decision -------------------------------------------------------------------
+
+[layouts.decision]
+title = "Decision"
+description = "Make a decision with the case for, the strongest case against, the alternatives, the cost, the risk and who it affects."
+targets = "any"
+fix = false
+report = '''
+Put a one-line recommendation first: do it, do not, or do a smaller version first, with the confidence.
+Then the reasoning, in a few paragraphs.
+Then the strongest case against it, stated as its best advocate would put it, not as a strawman, and what would have to be true for the other choice to be right.
+Then a table of the options (including doing nothing and the cheapest experiment), by cost, risk, reversibility and upside.
+End with who needs to be told or asked, the signal that would trigger a rethink, and when to check for it.
+'''
+
+[[layouts.decision.analysts]]
+id = "advocate"
+role = "Advocate"
+lens = "What is the strongest honest case for doing it?"
+tier = "moderate"
+where = "remote"
+brief = '''
+Make the best case FOR the option the question is considering. Do not strawman the alternatives, and do not oversell.
+- Benefits: the concrete benefits, with numbers and sources where they exist (revenue, time saved, users, cost avoided).
+- Precedent: others who made the same choice, and how it turned out. Look for case studies, write-ups, data and comparable decisions; web-search, and prefer first-hand accounts with dates.
+- Timing: what makes now a good time.
+- Conditions: when it is clearly the right call, and what would have to be true. Check each condition against the evidence.
+If --repo or --url is given, ground the case in what already exists there, citing files or pages.
+Evidence: a URL or file:line for each claim. Mark which benefits are measured and which are only hoped for.
+'''
+
+[[layouts.decision.analysts]]
+id = "sceptic"
+role = "Sceptic"
+lens = "What is the strongest honest case against it, and how would it fail?"
+tier = "hard"
+where = "remote"
+brief = '''
+You work alone and will not see the other analysts' work. Make the strongest honest case AGAINST the option the question is considering.
+- Regret: others who did this and regretted it. Web-search for post-mortems, "why we moved away from", "we regret" and failure stories, and prefer first-hand accounts with dates.
+- Hidden costs and second-order effects: maintenance, lock-in, opportunity cost, the team's focus, and reputation.
+- Pre-mortem: assume it failed badly 12 months from now. Give the three most likely reasons, each with the evidence that it could happen here.
+- Assumptions: the ones the decision rests on that have not been tested, and the cheapest way to test each.
+Do not list generic risks. Each point needs evidence or a specific mechanism, and a rough likelihood. If the case against is weak, say so; that is a useful finding too.
+Evidence: a URL or file:line for each claim.
+'''
+
+[[layouts.decision.analysts]]
+id = "alternatives"
+role = "Alternatives"
+lens = "Which options are not on the table but should be?"
+tier = "moderate"
+where = "remote"
+brief = '''
+Generate the options the question does not mention: doing nothing, doing less, doing it later, a smaller reversible experiment, buying or partnering instead of building (or the reverse), a different order, and someone else doing it.
+For each one, give:
+- what it costs.
+- what it gives up.
+- when it would beat the main option.
+- real examples of others who took that route (web search, cited).
+Then design the cheapest experiment that would show which option is right: what to do, how long it takes, what it costs, and the result that would decide it.
+Evidence: a URL for each example and each price.
+'''
+
+[[layouts.decision.analysts]]
+id = "cost"
+role = "Cost"
+lens = "What does each option really cost in money and time, and what will not get done instead?"
+tier = "moderate"
+where = "remote"
+brief = '''
+For the main option and each obvious alternative, including doing nothing, estimate:
+- money: up-front and ongoing, from current public prices (cite each URL and the date).
+- time: person-days to do it, and hours per month to keep it going.
+- opportunity cost: what will not get done instead, judged from what the question or the repo says is in progress.
+- switching cost: what it would cost to reverse it later.
+- the cost of doing nothing, which is rarely zero.
+Give ranges, not point estimates, and list every assumption. Present one table. Flag the cost that matters most to the decision, and how sure the estimate is.
+'''
+
+[[layouts.decision.analysts]]
+id = "risk"
+role = "Risk"
+lens = "What could go wrong, how likely is it, and can the decision be reversed?"
+tier = "moderate"
+where = "remote"
+brief = '''
+Build a risk register for the main option. For each risk, give:
+- its likelihood (low, medium or high), with the reason.
+- its impact.
+- the early warning sign.
+- the mitigation.
+- who owns it.
+Cover these kinds of risk:
+- legal and regulatory.
+- security and privacy.
+- financial.
+- reputational.
+- key-person.
+- dependency: a single supplier, platform or API whose terms could change. Web-search for their recent terms changes.
+- delivery.
+Classify the decision as a one-way door (hard to reverse) or a two-way door, and say what makes it so. If it is a one-way door, suggest how to make it more reversible.
+Name the two or three things to monitor after deciding, and for each one the threshold that should trigger a rethink.
+Evidence: a URL or file:line for each risk that is specific to this case.
+'''
+
+[[layouts.decision.analysts]]
+id = "stakeholders"
+role = "Who it affects"
+lens = "Who is affected, who must agree, and what will each of them say?"
+tier = "moderate"
+where = "remote"
+brief = '''
+List everyone the decision affects, inferred from the question, and from the repo or site when one is given: customers and users, the team, co-founders, partners, suppliers, investors, regulators and family, as they apply.
+For each one, give:
+- how it affects them: better or worse, and by how much.
+- whether they must agree, should be consulted, or just need to be told.
+- their likely objection, in their own words.
+- what they need to hear, and when.
+Flag conflicts of interest, and incentives that could bias the decision, including the decider's own.
+Where public information helps, web-search and cite it: for example how customers reacted to similar pricing changes, licence changes or shutdowns elsewhere.
+Finish with the order in which to tell people, and a one-line message for each.
+'''
+
+
+# -- due-diligence --------------------------------------------------------------
+
+[layouts.due-diligence]
+title = "Due diligence"
+description = "Investigate a company or product as an investor would: market, numbers, red team, customer voice, competitors and regulation."
+targets = "any"
+fix = false
+report = '''
+An investment-style memo. Start with a one-paragraph summary and a verdict: proceed, proceed with conditions, or pass, with the confidence. Then cover, citing every number:
+- the company and product, in brief.
+- the market: size, growth and timing, with sources.
+- the competition.
+- the traction and numbers: a table of each claimed number, its source, the independent check, and a verdict.
+- what customers say.
+- regulation.
+- the key risks, and the red-team case.
+- the open questions to put to the founders or the counterparty.
+- the conditions or terms that would address the risks.
+'''
+
+[[layouts.due-diligence.analysts]]
+id = "market"
+role = "Market"
+lens = "How big is this market really, is it growing, and why now?"
+tier = "moderate"
+where = "remote"
+brief = '''
+1. Size the market bottom-up: the number of potential buyers times a realistic price.
+   - Cite where the buyer count comes from: official statistics (ONS, Census, Eurostat), industry bodies or directories.
+   - Take the price from the company's or the competitors' pricing.
+2. Cross-check against the top-down figures in market reports, giving each publisher and date. Headline market-research numbers are often inflated, so note how far they differ from your bottom-up figure.
+3. Separate TAM, SAM (who this company can actually reach with this product) and a realistic SOM for three to five years.
+4. Give the growth drivers and headwinds, with evidence (regulation, technology shifts, spending trends), and say why now, rather than five years ago or five years from now.
+Evidence: a URL and publication date for every figure. Show the sums.
+'''
+
+[[layouts.due-diligence.analysts]]
+id = "numbers"
+role = "Numbers sceptic"
+lens = "Are the company's numbers true, consistent and honestly defined?"
+tier = "hard"
+where = "remote"
+brief = '''
+Collect every number the company claims (revenue, ARR or MRR, growth, users, customers, retention or churn, margins, CAC, LTV, funding, headcount) from the question, its site, its deck if provided, press releases and interviews.
+Check each one against independent sources:
+- UK companies: the Companies House filing history (https://find-and-update.company-information.service.gov.uk/company/<number>/filing-history), for the accounts, the confirmation statement, allotments of shares, charges (debt), officers and persons with significant control. Small companies may file abridged accounts with no P&L, so note what is missing.
+- US companies: SEC EDGAR (https://www.sec.gov/edgar/search/), for Form D funding filings and any 10-K or S-1.
+- Traction proxies: app store rating counts, web traffic estimates, GitHub activity, LinkedIn headcount and its trend, job posts, and customer logos you can verify.
+Look for inconsistencies:
+- growth claims that imply more customers than the market holds.
+- revenue against headcount, and users against server bills.
+- numbers that change between sources.
+- vanity metrics (sign-ups, GMV) presented as revenue.
+Check the definitions too: ARR against run-rate, and gross against net.
+Evidence: for each claim, the value claimed and where, the independent evidence, and a verdict (verified, consistent, inconsistent or unverifiable). Show the sums.
+'''
+
+[[layouts.due-diligence.analysts]]
+id = "red-team"
+role = "Red team"
+lens = "Why does this fail, and what is not being said?"
+tier = "hard"
+where = "remote"
+brief = '''
+You work alone and will not see the other analysts' work. Build the strongest case that this investment or deal goes wrong:
+- Dependence: on one customer, channel, supplier or platform. An example is a business built on one API or app store whose terms or prices could change; check their recent changes.
+- Defensibility: what stops an incumbent, or a well-funded competitor, from copying this in six months.
+- The team:
+  - key-person risk.
+  - the founders' and directors' track records: their Companies House officer appointments at previous companies and how those ended, news, and court and insolvency notices in The Gazette (https://www.thegazette.co.uk/).
+  - staff turnover visible on LinkedIn.
+- Legal and IP: who owns the code and the brand (trade mark searches at the UK IPO or USPTO), open-source licence obligations, and pending litigation or regulatory action in the news.
+- Contradictions between what the company says and what the public records show.
+- Pre-mortem: three years on, this has gone to zero. Give the three most likely stories, each with the evidence that it could happen.
+Stick to public records and published sources. Evidence: a URL and date for each point.
+'''
+
+[[layouts.due-diligence.analysts]]
+id = "customer-voice"
+role = "Customer voice"
+lens = "What do real customers say when the company is not in the room?"
+tier = "moderate"
+where = "remote"
+brief = '''
+Find what customers and users say:
+- reviews on G2, Capterra, Trustpilot and the app stores. For iOS, use the public feed at https://itunes.apple.com/gb/rss/customerreviews/id=<app id>/sortby=mostrecent/json.
+- Reddit and Hacker News threads (`curl -s 'https://hn.algolia.com/api/v1/search?query=<company>'`).
+- social posts.
+- GitHub issues, if the product is aimed at developers.
+- staff reviews on job sites (Glassdoor). These are a signal, not proof.
+Group what you find into themes (what customers love, why they churn, support quality, pricing complaints, reliability), each with a count and two or three short quotes.
+Note the sample size and recency, whether reviewers look like paying customers, and any signs of incentivised or fake reviews (bursts of 5-star reviews, generic text).
+Compare the sentiment with the company's own claims, and with the reviews of the top competitor.
+Evidence: the URL and date of every quote.
+'''
+
+[[layouts.due-diligence.analysts]]
+id = "competitors"
+role = "Competitors"
+lens = "Who is winning this market, and can this company win against them?"
+tier = "moderate"
+where = "remote"
+brief = '''
+Map the competitive landscape: direct competitors, incumbents with an adjacent product, and open-source alternatives.
+For each significant one, give:
+- its positioning.
+- its pricing (cite the pricing page).
+- its funding and backers, from news and its own announcements.
+- its traction signals: review counts, headcount, stars.
+- its recent moves: launches in the last six months, and acquisitions.
+Then assess:
+- the switching costs for customers.
+- who is winning, and why: distribution, product or price.
+- how the strongest competitor would likely respond if this company succeeds.
+- any consolidation: recent acquisitions in the space, and their prices if they are public.
+Present a comparison table, with a source for every cell.
+'''
+
+[[layouts.due-diligence.analysts]]
+id = "regulatory"
+role = "Regulatory"
+lens = "Which rules apply, does the company comply, and what is coming?"
+tier = "moderate"
+where = "remote"
+brief = '''
+Identify the regulation that applies, given the company's product, customers and countries, and check compliance where public evidence allows:
+- Data protection: UK GDPR and EU GDPR, a privacy policy that matches the product, and the ICO fee register (https://ico.org.uk/ESDWebPages/Search).
+- Sector rules:
+  - FCA authorisation for payments, lending, crypto or investments (check the FCA register at https://register.fca.org.uk/).
+  - MHRA or FDA rules for health and medical device software.
+  - the Online Safety Act 2023 (Ofcom) for user-to-user and search services.
+  - the EU AI Act: the obligations for each risk category, and the dates they apply.
+- Other rules, where relevant: consumer law, advertising rules (the ASA and CAP codes), sanctions and export controls.
+- Enforcement: actions, fines or investigations against the company or its close peers, from regulators' enforcement pages and the news.
+- What is coming: changes in the next 24 months that would help or hurt, with their dates.
+Flag anything that needs a lawyer; this is not legal advice. Evidence: a URL to the regulation, the register entry or the enforcement notice for each point.
+'''
+
+
+# -- deep-research --------------------------------------------------------------
+
+[layouts.deep-research]
+title = "Deep research"
+description = "Research a question from primary sources, the contrarian case, the latest developments, the numbers and practitioners' experience."
+targets = "any"
+fix = false
+report = '''
+A cited literature review. Open with the answer in a short paragraph, and how confident the evidence allows you to be. Then cover:
+- the state of the evidence, organised by theme rather than by source, with each claim cited.
+- where the sources agree, where they conflict, and why they might conflict.
+- the strongest contrary evidence.
+- what changed recently.
+- the key numbers, with ranges.
+- what practitioners report.
+- the open questions.
+Every substantive sentence carries a citation. End with the sources ranked by weight: primary over secondary, recent over old, and strong methods over weak.
+'''
+
+[[layouts.deep-research.analysts]]
+id = "primary-sources"
+role = "Primary sources"
+lens = "What do the original sources actually say, as opposed to the coverage of them?"
+tier = "moderate"
+where = "remote"
+brief = '''
+Find and read the primary sources behind the question, rather than press coverage of them:
+- original papers: arXiv, journals and DOIs, Google Scholar, and Semantic Scholar (`curl -s 'https://api.semanticscholar.org/graph/v1/paper/search?query=<terms>&fields=title,year,authors,citationCount,externalIds,abstract'`).
+- official documentation, specifications, RFCs and standards.
+- legislation (legislation.gov.uk, EUR-Lex).
+- datasets and company filings.
+- original announcements.
+For each important source, give:
+- what it actually claims: quote the key sentence.
+- the date, and the authors with their affiliations.
+- the method and sample.
+- the stated limitations.
+- how often it is cited.
+Where secondary coverage or common belief misstates a source, show the gap, quoting both.
+Prefer the most recent authoritative version: the published paper over the preprint, and the current spec over a draft. Say when only a preprint exists.
+Evidence: the URL or DOI, and a quote, for every claim.
+'''
+
+[[layouts.deep-research.analysts]]
+id = "contrarian"
+role = "Contrarian"
+lens = "What is the best evidence that the prevailing view is wrong?"
+tier = "hard"
+where = "remote"
+brief = '''
+You work alone and will not see the other analysts' work. Find the best evidence AGAINST the prevailing answer to the question:
+- failed replications, critiques and comment papers, retractions (search Retraction Watch and PubPeer), conflicting datasets, and negative results.
+- credible experts who disagree: their credentials, and their argument in their own words.
+- methodological weaknesses in the key studies: small samples, no control group, p-hacking risk, survivorship bias, conflicts of interest, and funding.
+- historical cases where a similar consensus turned out to be wrong.
+Steelman the opposite conclusion. Then judge how strong the consensus really is (unanimous, majority, contested or fringe), and whether the contrary evidence is strong enough to change the answer.
+Evidence: the URL or DOI, and a quote, for every claim.
+'''
+
+[[layouts.deep-research.analysts]]
+id = "latest"
+role = "Latest developments"
+lens = "What has changed in the last twelve months, and does it overturn anything?"
+tier = "moderate"
+where = "remote"
+brief = '''
+Find what is new, with a date on every item:
+- papers and preprints from the last 12 months (arXiv listings, Semantic Scholar sorted by year).
+- product or version releases, and their changelogs.
+- policy and legal changes.
+- conference talks.
+- news.
+Search with date terms (this year and last year), and check the publication date on the page itself, not in the search snippet.
+For each item, say:
+- what changed.
+- whether it overturns, refines or confirms the earlier understanding.
+- how solid it is: peer reviewed, a preprint, an announcement, or a rumour.
+Note what has been announced but is not yet available, with the expected dates.
+Your training data may be out of date on this topic. Trust what you fetch over what you remember, and say when the two disagree.
+Evidence: the URL and date of each item.
+'''
+
+[[layouts.deep-research.analysts]]
+id = "numbers"
+role = "Numbers"
+lens = "Are the key quantitative claims right, and what is the best-supported figure?"
+tier = "hard"
+where = "remote"
+brief = '''
+List the key quantitative claims bearing on the question: the figures quoted most often, and the ones the answer depends on. For each one:
+- Trace it to the underlying data or study, not to a citation of a citation.
+- Check the units, denominators and base rates, the sample size, the time window (is it cherry-picked?), the confidence intervals, and effect size as well as statistical significance.
+- Recompute it where the data is available: download the data to a scratch directory (`mktemp -d`), calculate in python, and show the code and its output.
+- Note where different sources give different figures, and why (definitions, years, methods).
+Give the best-supported number for each claim, with a range, its source, and how confident you are.
+Evidence: the URL or DOI of the data, and the computation.
+'''
+
+[[layouts.deep-research.analysts]]
+id = "practitioner"
+role = "Practitioner"
+lens = "What do the people doing this in practice report, and where does practice differ from theory?"
+tier = "moderate"
+where = "remote"
+brief = '''
+Find first-hand reports from practitioners:
+- engineering blogs and post-mortems.
+- conference talks; cite the timestamp.
+- GitHub issues and discussions on the relevant projects (`gh search issues '<terms>' --limit 30`, or the GitHub search API).
+- forums and Q&A sites: Stack Overflow, Hacker News (`curl -s 'https://hn.algolia.com/api/v1/search?query=<terms>'`) and Reddit.
+- benchmarks that users have run.
+Report:
+- where practice differs from the documentation or the research.
+- the common pitfalls, and their workarounds.
+- what people switched to or away from, and why.
+- the operational realities the papers leave out: cost, maintenance and failure modes.
+Weigh each report: is it first-hand, how recent is it, at what scale, and does the author have a vested interest?
+Evidence: the URL and date of every quote.
+'''
+
+
+# -- incident -------------------------------------------------------------------
+
+[layouts.incident]
+title = "Incident"
+description = "Find the root cause of an incident from hypotheses, logs, recent changes and a red team, then how to prove it and the fix."
+targets = "any"
+fix = true
+report = '''
+Start with the most likely root cause in one or two sentences, and the confidence. Then cover:
+- a timeline of what happened, in UTC, built from the logs and the changes.
+- the evidence for the root cause, and the evidence against it.
+- how to prove it: the exact command, query or reproduction that would confirm it, read-only where possible.
+- the fix, with exact steps for each part: the immediate mitigation (a rollback or a config change), the real fix (code), and the data repair, if anything was corrupted.
+- the other hypotheses considered, and why they rank lower.
+Finish with a follow-up to prevent it: the test, alert or check that would have caught it.
+'''
+
+[[layouts.incident.analysts]]
+id = "hypotheses"
+role = "Hypothesis generator"
+lens = "What could explain these exact symptoms, and what is the cheapest check for each?"
+tier = "moderate"
+where = "remote"
+brief = '''
+From the question, extract the exact symptoms: what fails, the error text, since when (in UTC), who is affected and who is not, and whether it is constant or intermittent.
+Then list every plausible cause, across:
+- a code change, or a config or environment change.
+- a dependency or provider outage. Check the providers' status pages and their incident history for the time window (for example https://www.githubstatus.com/, https://status.cloud.google.com/ and https://health.aws.amazon.com/health/status), or web-search "<provider> outage <date>".
+- something that expired: the TLS certificate, the domain, an API key, an OAuth token or app password, or a payment card.
+- a quota or rate limit.
+- bad data, or a migration.
+- capacity.
+- DNS.
+- the clock, a time zone or DST.
+- caching, or the CDN.
+- client or OS updates.
+For each cause, give the evidence that would confirm or rule it out, and the cheapest read-only check. Run the checks that are read-only and quick (curl, dig, `openssl s_client`, status pages, `git -C <repo> log`). Never restart, redeploy, roll back or change anything.
+Rank the hypotheses by likelihood given the symptoms: what each one explains, and what it fails to explain.
+Evidence: the command output, and the URLs.
+'''
+
+[[layouts.incident.analysts]]
+id = "logs"
+role = "Log reader"
+lens = "What do the logs say happened, and exactly when?"
+tier = "moderate"
+where = "remote"
+brief = '''
+Find and read every log you can reach without changing anything:
+- in --repo: log files, crash reports and saved CI output.
+- CI, for a GitHub repo: `gh run list --limit 20` and `gh run view <id> --log-failed`.
+- the hosting provider's read-only CLIs, if they are installed and logged in:
+  - `vercel logs <deployment-url>`.
+  - `fly logs -a <app>`.
+  - `heroku logs -a <app> -n 1500`.
+  - `kubectl logs <pod> --since=2h` and `kubectl get events --sort-by=.lastTimestamp`.
+  - `docker logs --since 2h <container>`.
+  - `journalctl -u <unit> --since '2 hours ago'`.
+  - Supabase or database logs, where they are exposed.
+- on this Mac, for a local app: `log show --last 2h --predicate 'process == "<name>"' --style compact`, and the crash reports in ~/Library/Logs/DiagnosticReports.
+Build a timeline in UTC: the last good moment, the first error, how the error rate changed, and related events (deploys, restarts, config reloads, cron jobs).
+Quote the exact error messages and stack traces, map stack frames to file:line in --repo, and note the first occurrence of each distinct error.
+Say which logs you could not reach, and what the session or the user should pull.
+Keep quoted logs short, and strip secrets and personal data (tokens, emails, IPs) from what you quote.
+'''
+
+[[layouts.incident.analysts]]
+id = "changes"
+role = "Recent-changes bisector"
+lens = "Which change, ours or upstream, lines up with when it broke?"
+tier = "moderate"
+where = "remote"
+brief = '''
+List what changed around the start of the incident. Take the window from the question; by default, use the seven days before it.
+- Code: run `git -C <repo> log --since='<start minus 7 days>' --until='<start plus 1 day>' --date=iso-strict --format='%h %ad %an %s' --stat` and `git -C <repo> diff <last good>..<first bad> --stat`, then read the diffs of the suspicious files.
+- Dependencies: run `git -C <repo> log -p --since='<window start>' -- package-lock.json pnpm-lock.yaml yarn.lock uv.lock poetry.lock 'requirements*.txt' go.sum Cargo.lock Gemfile.lock Podfile.lock Package.resolved`. For each dependency that was bumped, read the release notes and changelog for the new version.
+- Config and infrastructure: changes under .github/workflows/, Dockerfile, terraform/, k8s/ and helm/, the host's config files, and .env.example.
+- Deploys: `gh run list --limit 30`, `gh api repos/{owner}/{repo}/deployments` and `gh release list`, or the host's deployment list (for example `vercel ls`).
+- Upstream: releases in the window of the platform, SDKs and APIs the code uses (GitHub releases, changelogs).
+Line the changes up against the incident timeline. Name the smallest change that plausibly explains the symptoms, with its diff hunk (file:line).
+If a check command can tell good from bad, write a `git bisect run` script for it. It must run in a clone (`tmp=$(mktemp -d) && git clone -q <repo> "$tmp/repo"`), never in <repo>. Run it there if it is cheap and safe.
+'''
+
+[[layouts.incident.analysts]]
+id = "red-team"
+role = "Red team"
+lens = "What if the obvious explanation is wrong?"
+tier = "hard"
+where = "remote"
+brief = '''
+You work alone and will not see the other analysts' work. From the symptoms in the question, write down the explanation most people would jump to first. Then attack it:
+- If it were true, what evidence would we expect to see? Look for that evidence (logs, timings, `git -C <repo> log`, status pages), and report what is missing.
+- Timing coincidences: a deploy or change that happened near the start, but cannot cause these symptoms.
+- Symptoms the obvious explanation does not account for: who is not affected, the intermittency, or when it started.
+- Two causes at once, or a trigger plus a latent bug.
+- Whether the obvious fix (a rollback, a restart, more capacity) would only mask the cause, and whether it is safe, given data written since then and migrations that cannot be rolled back.
+Then put forward the best alternative explanation that someone might miss, and the check that would separate it from the obvious one.
+Read-only: never restart, redeploy or change anything.
+'''
+
+
+# -- post-review ----------------------------------------------------------------
+
+[layouts.post-review]
+title = "Post review"
+description = "Review a post before it is published, with a target reader, an editor, a fact-checker and a sceptic."
+targets = "any"
+fix = false
+report = '''
+First, the edited draft in full, ready to paste, in the author's voice.
+Then a claim-by-claim check: a table of every factual claim in the draft, with its verdict (correct, wrong, out of date, unverifiable, or needs a source), the source, and corrected wording where it is needed.
+Then the three most important changes and why, the objections readers are likely to raise with a suggested response to each, and two alternative opening lines.
+'''
+
+[[layouts.post-review.analysts]]
+id = "reader"
+role = "Target reader"
+lens = "Will the intended reader stop scrolling, understand it and act on it?"
+tier = "moderate"
+where = "remote"
+brief = '''
+The draft is in the question, at the --url, or in a file inside --repo that the question names. From the draft and the question, work out who it is for, and where it will appear (LinkedIn, a blog, a newsletter, X, Hacker News or a README).
+Then read it as that reader would, on a phone:
+- Do the first two lines, before the "see more" fold, make them want to read on?
+- Where do they stop reading, and why?
+- What jargon or context will they not have?
+- What is in it for them?
+- What should they do at the end, and is that clear?
+Quote the exact lines that lose or confuse them.
+If the platform has known conventions (length, links, hashtags), check the draft against them. Do not invent rules; cite a source for any rule you state.
+Evidence: the quoted line for each finding. The fix: the rewritten line.
+'''
+
+[[layouts.post-review.analysts]]
+id = "editor"
+role = "Editor"
+lens = "How can this say the same thing in fewer, clearer words?"
+tier = "moderate"
+where = "remote"
+brief = '''
+Edit the draft. Keep the author's voice and spelling conventions, such as British English if the draft uses it.
+- Structure: one idea; a hook that earns the next line; evidence or a story; and a payoff. Move or cut whatever does not serve that idea.
+- Length: cut 20 to 30 percent: filler, hedges ("I think", "just", "really"), throat-clearing openings, repetition, and lists that run on.
+- Clarity: concrete nouns and active verbs, shorter sentences, one claim per sentence, and numbers instead of adjectives where the draft has them.
+- Clichés and hype words: "game-changer", "excited to announce", "revolutionary", "unlock".
+- The tells of generated text: rule-of-three lists everywhere, "it's not X, it's Y" constructions, and chains of em dashes.
+Return the full edited draft as the fix of one finding. Then give one finding per significant edit, with the text before and after, and the reason. Keep the edited draft within the platform's length norms.
+'''
+
+[[layouts.post-review.analysts]]
+id = "fact-checker"
+role = "Fact-checker"
+lens = "Is every factual claim in the draft true and checkable?"
+tier = "moderate"
+where = "remote"
+brief = '''
+List every factual claim in the draft: numbers, dates, names, titles, quotes, product facts, technical claims, comparisons, superlatives ("first", "only", "fastest", "most") and links.
+Check each one:
+- against primary sources, with web search and fetch: the original source, not coverage of it.
+- against --repo, when the post is about the author's own project. Does the code do what the post says? Check:
+  - version numbers and features.
+  - benchmarks: rerun them in a copy (`tmp=$(mktemp -d) && cp -R <repo> "$tmp/"`) if that is cheap.
+  - star counts: the stargazers_count field from `curl -s https://api.github.com/repos/<owner>/<repo>`.
+- links: run `curl -o /dev/null -s -L -w '%{http_code} %{url_effective}' <link>`.
+Give each claim a verdict: correct, wrong (with the correct version), out of date, unverifiable, or needs a source. Quote the source line. A wrong claim about other people or companies is high severity.
+Evidence: the source URL or file:line, and a quote, for each claim.
+'''
+
+[[layouts.post-review.analysts]]
+id = "sceptic"
+role = "Sceptic"
+lens = "What will the sharpest hostile commenter say?"
+tier = "moderate"
+where = "remote"
+brief = '''
+Read the draft as a well-informed, hostile commenter would. Find:
+- the weakest claims, and the overclaims.
+- what is missing: limitations, who it does not work for, the costs, and the alternatives readers will name. Web-search for the obvious counter-examples.
+- how it could be misread, or quoted out of context.
+- tone problems: humblebrag, false modesty, punching down, and hype.
+- anything that could embarrass the author or their employer, or cause legal trouble: confidential details, customers named without permission, and claims about competitors.
+Write the three to five comments most likely to appear, in the commenter's voice. For each one, give either an edit that pre-empts it, or a short reply the author could post.
+Evidence: the quoted line that invites each objection.
+'''

@@ -84,3 +84,51 @@ def test_readme_table_lists_every_built_in_layout(layout):
     row = f"| `{layout}` |"
 
     assert row in text, f"README layout table has no row for {layout}"
+
+
+SESSION_PHRASES = [
+    "headless browsers",
+    "claude.ai connectors (Gmail, Calendar, Drive)",
+    "signed-in browser or account (Claude in Chrome, logged-in dashboards)",
+    "screen, simulator or physical devices",
+]
+
+
+def teams_section(doc: Path) -> str:
+    text = doc.read_text()
+    if doc == README:
+        return text.split("\n### Teams\n", 1)[1].split("\n## Swarms:", 1)[0]
+    return text.split("\n## Teams\n", 1)[1].split("\n## When not to use it\n", 1)[0]
+
+
+@pytest.mark.parametrize("doc", [README, SKILL], ids=["readme", "skill"])
+@pytest.mark.parametrize("needle", ["workspace-write", "network_access=true", "empty directory"])
+def test_both_docs_give_team_codex_network_outside_the_repo(doc, needle):
+    """Team Codex agents share research's command, so their docs must name the same sandbox and directory."""
+    section = teams_section(doc)
+
+    found = needle in section
+
+    assert found, f"{doc.name} teams section does not mention {needle!r}"
+
+
+@pytest.mark.parametrize("doc", [README, SKILL], ids=["readme", "skill"])
+@pytest.mark.parametrize("stale", ["--sandbox read-only", "Codex read-only"])
+def test_neither_doc_calls_team_codex_read_only(doc, stale):
+    """Team Codex agents now have the network, so a read-only sandbox claim is out of date."""
+    section = teams_section(doc)
+
+    found = stale in section
+
+    assert not found, f"{doc.name} teams section still says {stale!r}"
+
+
+@pytest.mark.parametrize("doc", [README, SKILL], ids=["readme", "skill"])
+@pytest.mark.parametrize("phrase", SESSION_PHRASES)
+def test_both_docs_keep_the_session_rule_for_teams(doc, phrase):
+    """Layouts mark analysts remote or session by the planner's rule, so the teams docs must state it in its words."""
+    section = teams_section(doc)
+
+    found = phrase in section
+
+    assert found, f"{doc.name} teams section lacks {phrase!r}"

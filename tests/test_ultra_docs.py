@@ -52,3 +52,61 @@ def test_readme_states_the_read_only_rules():
     mentions = ("--disallowedTools" in text, "read-only" in text)
 
     assert mentions == (True, True)
+
+
+SESSION_PHRASES = [
+    "headless browsers",
+    "claude.ai connectors (Gmail, Calendar, Drive)",
+    "signed-in browser or account (Claude in Chrome, logged-in dashboards)",
+    "screen, simulator or physical devices",
+]
+
+
+def research_section(doc: Path) -> str:
+    text = doc.read_text()
+    if doc == README:
+        return text.split("\n### Research mode\n", 1)[1].split("\n### Spending the second account first\n", 1)[0]
+    return text.split("\n## Research mode\n", 1)[1].split("\n## Teams\n", 1)[0]
+
+
+@pytest.mark.parametrize("doc", [README, SKILL], ids=["readme", "skill"])
+@pytest.mark.parametrize("needle", ["workspace-write", "network_access=true", "empty directory"])
+def test_both_docs_give_research_codex_network_outside_the_repo(doc, needle):
+    """Codex research arms need the network for curl and Lighthouse, so they run workspace-write in a directory of their own."""
+    section = research_section(doc)
+
+    found = needle in section
+
+    assert found, f"{doc.name} research section does not mention {needle!r}"
+
+
+@pytest.mark.parametrize("doc", [README, SKILL], ids=["readme", "skill"])
+def test_neither_doc_says_codex_runs_read_only(doc):
+    """A read-only sandbox has no network; docs that still promise it describe a command that no longer runs."""
+    text = doc.read_text()
+
+    stale = "--sandbox read-only" in text
+
+    assert not stale, f"{doc.name} still says Codex runs with --sandbox read-only"
+
+
+@pytest.mark.parametrize("doc", [README, SKILL], ids=["readme", "skill"])
+@pytest.mark.parametrize("phrase", SESSION_PHRASES)
+def test_both_docs_say_what_counts_as_session_work(doc, phrase):
+    """The planner keeps work remote by these words, so the docs must use the same ones for the same rule."""
+    section = research_section(doc)
+
+    found = phrase in section
+
+    assert found, f"{doc.name} research section lacks {phrase!r}"
+
+
+@pytest.mark.parametrize("doc", [README, SKILL], ids=["readme", "skill"])
+@pytest.mark.parametrize("needle", ["-repair.log", "S<max+1>"])
+def test_both_docs_describe_repairs_and_source_renames(doc, needle):
+    """A repaired part or a renamed source shows up in the footer; the docs must say where it came from."""
+    section = research_section(doc)
+
+    found = needle in section
+
+    assert found, f"{doc.name} research section does not mention {needle!r}"

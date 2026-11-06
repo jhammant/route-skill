@@ -6,6 +6,7 @@ import re
 
 from .eligibility import quota_keys
 from .pools import Pool, pool_family
+from .surplus import load_surplus_k, quota_adjustment
 
 ULTRA_MIN_RANK = 2
 
@@ -34,6 +35,31 @@ def model_rank(pool: Pool) -> int:
     return 0
 
 
+def surplus_adjustment(arm: str, pools: dict[str, Pool], quota: dict[str, str]) -> float:
+    """The router's signed weekly-pace adjustment, so ultra spends the same account it would."""
+    return _adjustment(arm, pools, quota, *_weekly_pace(quota))
+
+
+def _weekly_pace(quota: dict[str, str]) -> tuple[dict[str, dict], float]:
+    """Weekly windows and k; a plain dict has no windows, so config.toml is not read."""
+    weekly = getattr(quota, "weekly", {})
+    return weekly, (load_surplus_k() if weekly else 0.0)
+
+
+def _adjustment(arm: str, pools: dict[str, Pool], quota: dict[str, str],
+                weekly: dict[str, dict], k: float) -> float:
+    # Without weekly windows ultra keeps its old order, even for constrained headroom.
+    if not weekly:
+        return 0.0
+    # A model-scoped arm is paced by the tighter of its pool's week and its model's week.
+    keys = quota_keys(arm, pools)
+    window = max((weekly.get(key, {}) for key in keys),
+                 key=lambda w: w.get("percentUsed") or 0, default={})
+    headroom = next((quota.get(key) for key in reversed(keys) if quota.get(key)), None)
+    return quota_adjustment(window.get("percentUsed"), window.get("resetsInMinutes"), k,
+                            headroom=headroom)
+
+
 def candidates(
     pools: dict[str, Pool],
     quota: dict[str, str],
@@ -43,7 +69,13 @@ def candidates(
     exclude_families: set[str] = frozenset(),
     exclude_arms: set[str] = frozenset(),
 ) -> list[str]:
-    """Apply account and model-window gates before allowing weaker fallback arms."""
+    """Apply account and model-window gates before allowing weaker fallback arms.
+
+    Among arms of equal rank and headroom, spend the account that would otherwise
+    waste its week: a projected weekly surplus goes first and an account ahead of
+    pace goes last. Rank still dominates, so surplus never buys a weaker model.
+    """
+    weekly, k = _weekly_pace(quota)
     ranked = []
     for arm, pool in pools.items():
         if arm in exclude_arms or pool_family(pool) in exclude_families:
@@ -52,10 +84,11 @@ def candidates(
         if "critical" in headroom:
             continue
         rank = model_rank(pool)
-        ranked.append((-rank, "low" in headroom, arm == host, arm))
+        adjustment = round(_adjustment(arm, pools, quota, weekly, k), 2)
+        ranked.append((-rank, "low" in headroom, -adjustment, arm == host, arm))
     best = [item for item in ranked if -item[0] >= ULTRA_MIN_RANK]
     usable = best if best else (ranked if allow_lower else [])
-    return [arm for _, _, _, arm in sorted(usable)]
+    return [item[-1] for item in sorted(usable)]
 
 
 def pick(

@@ -329,7 +329,8 @@ shows the plan, `--context digest` hands the workers this conversation, and
 `route ultra status` and `route ultra cancel <run-id>` watch and stop a run.
 Each run's state lives in `ROUTE_STATE_DIR/ultra/<run-id>/`. Exit 0 means every
 unit merged and the goal check passed, 1 that a unit was not merged or the goal
-check failed, and 2 that it could not plan or no usable model had quota. `ultra` is the same command. For
+check failed, and 2 that it could not plan or no usable model had quota. `ultra` is the same command. Pin planning and building to chosen pools with `--pool ARM`
+(repeatable, e.g. `--pool claude-work`); reviews still go to another model family. For
 `/ultra` in Claude Code, link the skill:
 `ln -s "$PWD/skill-ultra" "$HOME/.claude/skills/ultra"`.
 

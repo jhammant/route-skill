@@ -14,12 +14,14 @@ from __future__ import annotations
 import contextlib
 import io
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 import re
 import signal
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -68,11 +70,15 @@ class Run:
 
     A watcher (``route ultra status``) and a canceller only ever see this file,
     so it carries every PID the run started and each unit's current state.
+    Mutations and saves share a reentrant lock; direct/nested progress edits
+    must also hold ``lock`` so serialization never races another unit's update.
     """
 
     def __init__(self, run_id: str, goal: str, repo: Path, base: str, host: str):
         self.id = run_id
         self.dir = ultra_dir(run_id)
+        self.lock = threading.RLock()
+        self._arm_slots: dict[str, threading.BoundedSemaphore] = {}
         self.progress: dict = {
             "schema": SCHEMA, "run_id": run_id, "goal": goal, "repo": str(repo), "base": base,
             "base_sha": None, "host": host, "pid": os.getpid(), "state": "starting", "step": "",
@@ -82,35 +88,50 @@ class Run:
         }
 
     def save(self) -> None:
-        self.progress["updated_at"] = utc_now()
-        atomic_write(self.dir / "progress.json", json.dumps(self.progress, indent=2) + "\n")
+        with self.lock:
+            self.progress["updated_at"] = utc_now()
+            atomic_write(self.dir / "progress.json", json.dumps(self.progress, indent=2) + "\n")
 
     def step(self, state: str, step: str = "") -> None:
-        self.progress.update(state=state, step=step)
-        self.save()
+        with self.lock:
+            self.progress.update(state=state, step=step)
+            self.save()
 
     def note(self, text: str) -> None:
-        self.progress["notes"].append(text)
-        print(f"ultra: {text}", flush=True)
-        self.save()
+        with self.lock:
+            self.progress["notes"].append(text)
+            print(f"ultra: {text}", flush=True)
+            self.save()
 
     def unit(self, unit_id: str, **fields) -> dict:
-        row = self.progress["units"].setdefault(unit_id, {"id": unit_id, "state": "planned", "fix_passes": 0})
-        row.update(fields)
-        self.save()
-        return row
+        with self.lock:
+            row = self.progress["units"].setdefault(unit_id, {"id": unit_id, "state": "planned", "fix_passes": 0})
+            row.update(fields)
+            self.save()
+            return row
 
     def track(self, pid: int) -> None:
-        self.progress["pids"].append(pid)
-        self.save()
+        with self.lock:
+            self.progress["pids"].append(pid)
+            self.save()
 
     def untrack(self, pid: int) -> None:
-        self.progress["pids"] = [p for p in self.progress["pids"] if p != pid]
-        self.save()
+        with self.lock:
+            self.progress["pids"] = [p for p in self.progress["pids"] if p != pid]
+            self.save()
 
     def finish(self, state: str, exit_code: int) -> None:
-        self.progress.update(state=state, exit_code=exit_code, finished_at=utc_now(), pids=[])
-        self.save()
+        with self.lock:
+            self.progress.update(state=state, exit_code=exit_code, finished_at=utc_now(), pids=[])
+            self.save()
+
+    def arm_slot(self, arm: str, pool: Pool) -> threading.BoundedSemaphore:
+        """Share one dispatch cap across roles; never wait while holding the progress lock."""
+        with self.lock:
+            if arm not in self._arm_slots:
+                # Match the swarm's minimum of one for a non-positive configured limit.
+                self._arm_slots[arm] = threading.BoundedSemaphore(max(1, pool.parallel_limit))
+            return self._arm_slots[arm]
 
 
 def _resolve_base(repo: Path, base: str) -> str | None:
@@ -134,11 +155,14 @@ def _dispatch(run: Run, arm: str, pools: dict[str, Pool], host: str, prompt: str
         pid_box.append(pid)
         run.track(pid)
 
-    try:
-        rc = cli._dispatch(template, prompt, target=arm, cwd=cwd, log=log, timeout=timeout, on_start=started)
-    finally:
-        for pid in pid_box:
-            run.untrack(pid)
+    # cli._dispatch keeps its subprocess, environment and log local to this call;
+    # it has no shared lease/counter and does not enforce Pool.parallel_limit itself.
+    with run.arm_slot(arm, pools[arm]):
+        try:
+            rc = cli._dispatch(template, prompt, target=arm, cwd=cwd, log=log, timeout=timeout, on_start=started)
+        finally:
+            for pid in pid_box:
+                run.untrack(pid)
     try:
         return rc, log.read_text(encoding="utf-8", errors="replace")
     except OSError:
@@ -225,7 +249,8 @@ def out_of_scope(changed: list[str], touches: list[str], allowed: list[str] = ()
 
 def _record_scope(run: Run, unit: dict, row: dict, base_sha: str) -> list[str]:
     """Record what a unit changed outside its planned touches; informative, never a failure."""
-    review = run.progress["units"].get(unit["id"], {}).get("review") or {}
+    with run.lock:
+        review = run.progress["units"].get(unit["id"], {}).get("review") or {}
     strayed = out_of_scope(_changed_paths(Path(row["worktree"]), base_sha), unit.get("touches", []),
                            list(review.get("carried_tests", [])))
     run.unit(unit["id"], out_of_scope=strayed)
@@ -241,28 +266,33 @@ def _context(run: Run, context: str, session: str | None) -> str:
     the run degrades to brief: what the workers never see cannot leak.
     """
     record = {"requested": context, "level": "brief", "note": ""}
-    run.progress["context"] = record
+    with run.lock:
+        run.progress["context"] = record
     if context == "brief":
         run.save()
         return ""
     if not session:
-        record["note"] = "no session id (set CLAUDE_CODE_SESSION_ID or pass --session)"
-        run.save()
+        with run.lock:
+            record["note"] = "no session id (set CLAUDE_CODE_SESSION_ID or pass --session)"
+            run.save()
         return ""
     try:
         path = write_digest(session)
     except OSError as exc:
-        record["note"] = f"digest unavailable: {exc}"
-        run.save()
+        with run.lock:
+            record["note"] = f"digest unavailable: {exc}"
+            run.save()
         return ""
     reason = screen_digest(path.read_text(encoding="utf-8", errors="replace"))
     if reason:
         path.unlink(missing_ok=True)
-        record["note"] = f"digest refused ({reason}); workers get the goal only"
-        run.note(f"context digest -> brief: {reason}")
+        with run.lock:
+            record["note"] = f"digest refused ({reason}); workers get the goal only"
+            run.note(f"context digest -> brief: {reason}")
         return ""
-    record.update(level="digest", note=f"digest at {path}", path=str(path))
-    run.save()
+    with run.lock:
+        record.update(level="digest", note=f"digest at {path}", path=str(path))
+        run.save()
     return digest_preamble(path)
 
 
@@ -290,14 +320,16 @@ def _plan(run: Run, planner: str, pools: dict[str, Pool], host: str, goal: str, 
     plan, problems = _plan_once(run, planner, pools, host, prompt, repo, base_sha, max_units, 1)
     if plan is not None:
         return plan, []
-    run.progress["plan_problems"] = list(problems)
+    with run.lock:
+        run.progress["plan_problems"] = list(problems)
     run.note("re-planning once: " + "; ".join(problems))
     run.step("planning", f"planner {planner} (attempt 2)")
     retry = prompt + ("\n\n# Problems with your previous plan (fix all of them)\n\n"
                       + "\n".join(f"- {problem}" for problem in problems) + "\n")
     plan, problems = _plan_once(run, planner, pools, host, retry, repo, base_sha, max_units, 2)
     if plan is None:
-        run.progress["plan_problems"].extend(problems)
+        with run.lock:
+            run.progress["plan_problems"].extend(problems)
     return plan, problems
 
 
@@ -520,12 +552,14 @@ def _integrate(run: Run, plan: Plan, rows: dict[str, dict], sound: set[str], rep
     branch, path = f"ultra/{run.id}", run.dir / "integration"
     result = {"branch": branch, "worktree": str(path), "merged": [], "goal_check": plan.goal_check,
               "goal_check_passed": False, "goal_check_rc": None, "goal_check_output": "", "fix": None}
-    run.progress["integration"] = result
+    with run.lock:
+        run.progress["integration"] = result
     run.step("integrating", f"creating {branch}")
     added = _git(repo, "worktree", "add", "-b", branch, str(path), base_sha)
     if added.returncode:
-        result["error"] = f"could not create {branch}: {added.stderr.strip()}"
-        run.save()
+        with run.lock:
+            result["error"] = f"could not create {branch}: {added.stderr.strip()}"
+            run.save()
         return result
     units = {unit.id: unit.to_dict() for unit in plan.units}
     for unit in plan.units:
@@ -533,7 +567,8 @@ def _integrate(run: Run, plan: Plan, rows: dict[str, dict], sound: set[str], rep
             continue
         reason = _on_branch(path, branch, base_sha)
         if reason:
-            result["error"] = f"integration stopped: {reason}"
+            with run.lock:
+                result["error"] = f"integration stopped: {reason}"
             run.unit(unit.id, state="unmerged", reason=reason)
             continue
         problem = _merge_unit(run, units[unit.id], rows[unit.id]["branch"], path, branch, base_sha,
@@ -541,9 +576,11 @@ def _integrate(run: Run, plan: Plan, rows: dict[str, dict], sound: set[str], rep
         if problem:
             run.unit(unit.id, state="conflict", reason=problem[:240])
             continue
-        result["merged"].append(unit.id)
+        with run.lock:
+            result["merged"].append(unit.id)
         run.unit(unit.id, state="merged")
-    result["unmerged"] = [unit.id for unit in plan.units if unit.id not in result["merged"]]
+    with run.lock:
+        result["unmerged"] = [unit.id for unit in plan.units if unit.id not in result["merged"]]
     if result.get("error"):
         run.save()
         return result
@@ -558,16 +595,19 @@ def _integrate(run: Run, plan: Plan, rows: dict[str, dict], sound: set[str], rep
             rc, _ = _dispatch(run, integrator, pools, host,
                               fix_prompt(unit, check_output=check.output, confirmed=[], pass_no=1),
                               path, "integration-fix.log", FIX_TIMEOUT)
-            result["fix"] = {"arm": integrator, "agent_rc": rc}
+            with run.lock:
+                result["fix"] = {"arm": integrator, "agent_rc": rc}
             try:
                 _commit_if_changed(path, f"ultra({run.id}): integration fix", branch=branch, base_sha=base_sha)
             except CommitError as exc:
                 # The goal check must speak for the branch, so an unkept fix is not re-checked.
-                result["error"] = f"integration fix not kept: {exc}"
+                with run.lock:
+                    result["error"] = f"integration fix not kept: {exc}"
             else:
                 check = run_checked(plan.goal_check, path, timeout=CHECK_TIMEOUT)
-    result.update(goal_check_passed=check.rc == 0, goal_check_rc=check.rc, goal_check_output=check.output[-4000:])
-    run.save()
+    with run.lock:
+        result.update(goal_check_passed=check.rc == 0, goal_check_rc=check.rc, goal_check_output=check.output[-4000:])
+        run.save()
     return result
 
 
@@ -692,8 +732,10 @@ def _settle(run: Run, rows: dict[str, dict]) -> None:
             try:
                 rc = cli.main(argv)
             except Exception as exc:  # settlement must never undo a finished build
-                rc, state["settle_error"] = 1, str(exc)
-        state["settled"] = rc == 0
+                with run.lock:
+                    rc, state["settle_error"] = 1, str(exc)
+        with run.lock:
+            state["settled"] = rc == 0
     run.save()
 
 
@@ -834,15 +876,17 @@ def run_ultra(goal: str, *, repo: str | Path = ".", base: str = "HEAD", context:
             return 2
     set_pin(pin)
     run = Run(new_run_id(goal), goal, repo_path, base, host)
-    run.progress["pin"] = sorted(set(pin))
+    with run.lock:
+        run.progress["pin"] = sorted(set(pin))
     try:
         run.dir.mkdir(parents=True, mode=0o700)
         (run.dir / "logs").mkdir(mode=0o700)
     except FileExistsError:
         print(f"route ultra: run {run.id} already exists at {run.dir}", file=sys.stderr)
         return 2
-    run.progress["base_sha"] = base_sha
-    run.save()
+    with run.lock:
+        run.progress["base_sha"] = base_sha
+        run.save()
     print(f"ultra: run {run.id} at {run.dir}", flush=True)
     try:
         return _execute(run, goal, repo_path, base, base_sha, context, session, max_units, max_parallel,
@@ -865,13 +909,15 @@ def _execute(run: Run, goal: str, repo: Path, base: str, base_sha: str, context:
     pools = pools_for_host(cli.load_pools(), host)
     quota = cli.fetch_quota()
     usage_before = cli.fetch_usage()
-    run.progress["headroom"] = dict(quota)
+    with run.lock:
+        run.progress["headroom"] = dict(quota)
     context_note = _context(run, context, session)
 
     planner = pick("planner", pools, quota, host=host, allow_lower=allow_lower)
     if planner is None:
         return _give_up(run, "no usable model has quota to plan (try --allow-lower-models)", json_out, usage_before)
-    run.progress["planner"] = planner
+    with run.lock:
+        run.progress["planner"] = planner
     plan, problems = _plan(run, planner, pools, host, goal, repo, base, base_sha, max_units, context_note)
     if plan is None:
         return _give_up(run, "could not plan: " + "; ".join(problems), json_out, usage_before)
@@ -881,7 +927,8 @@ def _execute(run: Run, goal: str, repo: Path, base: str, base_sha: str, context:
     for unit in plan.units:
         arm = pick("worker", pools, quota, tier=unit.tier or "moderate", host=host, allow_lower=allow_lower)
         if arm is None:
-            run.progress["held"].append({"id": unit.id, "reason": "no usable model has quota"})
+            with run.lock:
+                run.progress["held"].append({"id": unit.id, "reason": "no usable model has quota"})
             run.unit(unit.id, state="held", tier=unit.tier, reason="no usable model has quota")
         else:
             arms[unit.id] = arm
@@ -904,10 +951,12 @@ def _execute(run: Run, goal: str, repo: Path, base: str, base_sha: str, context:
         swarm = run_swarm_manifest(manifest, host=host, max_parallel=max_parallel, check_timeout=CHECK_TIMEOUT)
     except RuntimeError as exc:
         return _give_up(run, f"swarm did not run: {exc}", json_out, usage_before, plan)
-    run.progress["swarm_dir"] = str(swarm_dir(run.id))
+    with run.lock:
+        run.progress["swarm_dir"] = str(swarm_dir(run.id))
     rows = {row["id"]: row for row in swarm["units"]}
     for row in swarm.get("held", []):
-        run.progress["held"].append(row)
+        with run.lock:
+            run.progress["held"].append(row)
         run.unit(row["id"], state="held", reason=row["reason"])
     for unit_id, row in rows.items():
         run.unit(unit_id, state="accepted" if row["accepted"] else "failed", decision_id=row["decision_id"],
@@ -917,25 +966,24 @@ def _execute(run: Run, goal: str, repo: Path, base: str, base_sha: str, context:
     units = {unit.id: unit.to_dict() for unit in plan.units}
     for unit_id, row in rows.items():
         _record_scope(run, units[unit_id], row, base_sha)
-    reviews: dict[str, list[Finding] | None] = {}
-    run.step("reviewing", "")
-    for unit_id, row in rows.items():
-        if row["accepted"]:
-            reviews[unit_id] = _review_unit(run, units[unit_id], row, pools, quota, host, allow_lower, repo, base_sha)
 
-    sound: set[str] = set()
-    for unit_id, row in rows.items():
+    def review_and_fix(unit_id: str, row: dict) -> bool:
+        # Each job owns one unit/worktree. Pools and quota stay read-only, and
+        # settlement's router counters are only updated after all jobs finish.
         if not row["accepted"]:
-            if _fix_unit(run, units[unit_id], row, [], pools, quota, host, allow_lower, base_sha):
-                sound.add(unit_id)
-            continue
-        confirmed = reviews[unit_id]
+            return _fix_unit(run, units[unit_id], row, [], pools, quota, host, allow_lower, base_sha)
+        confirmed = _review_unit(run, units[unit_id], row, pools, quota, host, allow_lower, repo, base_sha)
         if confirmed is None:
-            continue  # review failed: nothing is known to fix, and nothing was cleared
-        if not confirmed or _fix_unit(run, units[unit_id], row, confirmed, pools, quota, host, allow_lower,
-                                      base_sha):
-            sound.add(unit_id)
+            return False  # review failed: nothing is known to fix, and nothing was cleared
+        return not confirmed or _fix_unit(run, units[unit_id], row, confirmed, pools, quota, host, allow_lower,
+                                         base_sha)
 
+    run.step("reviewing", "")
+    with ThreadPoolExecutor(max_workers=max_parallel) as executor:
+        futures = [(unit_id, executor.submit(review_and_fix, unit_id, row)) for unit_id, row in rows.items()]
+        sound = {unit_id for unit_id, future in futures if future.result()}
+
+    # Keep the original plan and rows: _integrate merges in plan order, never completion order.
     integration = _integrate(run, plan, rows, sound, repo, base_sha, pools, quota, host, allow_lower, goal)
     run.step("settling", "")
     _settle(run, rows)

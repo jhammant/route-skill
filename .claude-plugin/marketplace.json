@@ -1,0 +1,16 @@
+{
+  "name": "route-skill",
+  "description": "Claude Code plugins that go with route-skill (route, auto, /ultra).",
+  "owner": { "name": "Jon Hammant", "url": "https://github.com/jhammant" },
+  "plugins": [
+    {
+      "name": "ultra-watch",
+      "source": "./plugins/ultra-watch",
+      "description": "Watch /ultra runs like a workflow: a live pane with every agent by phase (model, state, time, tokens, what it is doing now), a status-line entry and toasts as units pass, get reviewed, fixed and merged.",
+      "version": "0.2.0",
+      "author": { "name": "Jon Hammant", "url": "https://github.com/jhammant" },
+      "homepage": "https://github.com/jhammant/route-skill#watch-it-in-claude-code",
+      "category": "productivity"
+    }
+  ]
+}

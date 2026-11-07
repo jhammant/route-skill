@@ -333,6 +333,62 @@ check failed, and 2 that it could not plan or no usable model had quota. `ultra`
 `/ultra` in Claude Code, link the skill:
 `ln -s "$PWD/skill-ultra" "$HOME/.claude/skills/ultra"`.
 
+### Watch it in Claude Code
+
+The `ultra-watch` plugin shows a run inside Claude Code the way an ultracode
+workflow is shown:
+
+- `/ultra-watch` opens a pane. Its header gives the run, its state, how many
+  agents there are and how many are running, total tokens and elapsed time.
+  Below that is one group per phase (Plan, Build, Review, Fix, Integrate) with
+  a row per agent: its model, state, time and tokens. A running agent also
+  shows what it is doing now and its sub-agents. The pane ends with the bugs
+  the reviews confirmed and the latest narrator lines.
+- A status-line entry, such as
+  `ULTRA reviewing · 7 agents (1 running, 1 failed) · 182k tok · Review 2/3 · 34m`.
+  A phase's count is the agents that finished it, so a failed one is counted
+  as failed, not as progress.
+- A toast when a unit passes or fails its check, is reviewed, fixed or merged,
+  and when the run ends. A failed check is told as soon as it fails, not when
+  the rest of the swarm finishes.
+
+It reads `ultra-progress --json` every 4 s while a run is live and every 20 s
+otherwise. It also checks that the run's `route` process is still running, as
+`route ultra status` does. If the process is gone (it was killed, crashed, or
+the machine restarted), the run shows as `stopped while <state>`, you get one
+toast, polling drops to every 20 s, and the entry leaves the status line 15
+minutes after the run's last update.
+
+The plugin needs [uv](https://docs.astral.sh/uv/). It looks for
+`ultra-progress` on your PATH first. If it isn't there, the plugin uses its
+own copy: `plugins/ultra-watch/scripts/ultra_progress.py` links to
+`skill-ultra-progress/ultra_progress.py`, and Claude Code copies that file in
+when it installs the plugin, so the two must be pushed together. Last, it
+looks in the marketplace clone under `CLAUDE_CODE_PLUGIN_CACHE_DIR`, else
+`$CLAUDE_CONFIG_DIR/plugins` (a second config such as `claude-work`), else
+`~/.claude/plugins`. To put it on your PATH, run this from the checkout:
+
+```bash
+ln -s "$PWD/skill-ultra-progress/ultra_progress.py" "$HOME/.local/bin/ultra-progress"
+```
+
+To install it from GitHub, type this at a Claude Code prompt in a terminal,
+answer `y` to add the marketplace, then pick a scope:
+
+```text
+/plugin install ultra-watch --marketplace jhammant/route-skill
+```
+
+To install it from a local checkout instead, run these from the checkout:
+
+```bash
+claude plugin marketplace add "$PWD"
+claude plugin install ultra-watch@route-skill
+```
+
+A plugin installed this way runs from the checkout itself, so `/reload-plugins`
+picks up any edits to `plugins/ultra-watch`.
+
 ## Swarms: cross-model, and they talk
 
 When work splits into independent pieces, give each piece its own acceptance

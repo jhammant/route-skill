@@ -1,0 +1,11 @@
+{
+  "name": "ultra-watch",
+  "version": "0.2.0",
+  "description": "Watch /ultra runs inside Claude Code like a workflow: a live pane (/ultra-watch) with every agent by phase, its model, state, time, tokens and what it is doing now; a status-line entry; and toasts as units pass, get reviewed, fixed and merged.",
+  "author": { "name": "Jon Hammant", "url": "https://github.com/jhammant" },
+  "homepage": "https://github.com/jhammant/route-skill#watch-it-in-claude-code",
+  "repository": "https://github.com/jhammant/route-skill",
+  "license": "MIT",
+  "keywords": ["ultra", "route-skill", "workflow", "progress", "status-line"],
+  "types": "./types/index.d.ts"
+}

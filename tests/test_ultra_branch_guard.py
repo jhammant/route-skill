@@ -1,4 +1,5 @@
 from pathlib import Path
+from threading import RLock
 from types import SimpleNamespace as NS
 from unittest.mock import Mock, patch
 from route import ultra as u
@@ -21,7 +22,7 @@ def test_integrator_cannot_commit_on_main():
         head[0] = 'main'
         return 0, ''
 
-    run = NS(id='repro', dir=Path('/memory/run'), progress={},
+    run = NS(id='repro', dir=Path('/memory/run'), progress={}, lock=RLock(),
              step=Mock(), save=Mock(), unit=Mock())
     plan = Plan('p', '', 'pytest', [Unit('u', 'task', 'pytest')])
     with patch.object(u, '_git', side_effect=git), \

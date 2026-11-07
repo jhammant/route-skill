@@ -1,3 +1,4 @@
+from threading import RLock
 from types import SimpleNamespace as NS
 from unittest.mock import Mock, patch
 from route import ultra as u
@@ -12,7 +13,8 @@ def test_regrading_preserves_aggregate_weight():
         for key in ('a', 'b')
     }
     stats.decision.side_effect = decisions.__getitem__
-    run = NS(id='run', progress={'units': {k: {'state': 'conflict'} for k in decisions}}, save=Mock())
+    run = NS(id='run', progress={'units': {k: {'state': 'conflict'} for k in decisions}},
+             lock=RLock(), save=Mock())
     with patch.object(u.cli, '_build_router', return_value=router), \
          patch.object(u.cli, 'Stats', return_value=stats), \
          patch.object(u.cli, 'TaskMemory'):

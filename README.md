@@ -315,10 +315,13 @@ route ultra "Add rate limiting to src/api/, stdlib only. Goal check: pytest -q t
    and only when nothing better has quota.
 3. A model from a different family reviews each non-trivial accepted unit. A
    finding counts only when its repro command shows the bug, and each unit
-   gets at most two fix passes.
+   gets at most two fix passes. Up to `--max-parallel` units (default 6) move
+   through review and fixes concurrently; a unit can start fixing as soon as
+   its own review finishes. Failed build checks go straight to fixing in the
+   same pool of jobs. Agent dispatches also respect each arm's `parallel_limit`.
 4. Accepted branches merge onto `ultra/<run-id>` (build artefacts are never
    staged; a real conflict gets the integrator one pass) and the goal check
-   runs there.
+   runs there. Merges follow plan order regardless of when reviews finish.
 5. Outcomes are settled for the router, and `summary.md` names the branch, the
    units that passed, the bugs the reviews confirmed, the quota spent per pool
    and the merge command.

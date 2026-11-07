@@ -12,6 +12,7 @@ ULTRA_MIN_RANK = 2
 
 # `route ultra --pool ARM` pins planning and building to these arms for the whole run (one run per
 # process). Reviewers ignore the pin so reviews stay cross-family; an empty pin means "any arm".
+# set_pin runs before any workers start; the frozenset is read-only throughout their lifetime.
 PIN: frozenset[str] = frozenset()
 
 
@@ -118,7 +119,12 @@ def pick(
     author_arm: str | None = None,
     allow_lower: bool = False,
 ) -> str | None:
-    """Spend the strongest models on hard work and keep reviews independent."""
+    """Spend the strongest models on hard work and keep reviews independent.
+
+    Selection only reads pools, quota (including weekly windows) and the run's
+    pin; rankings are local. Concurrent callers share no counters or leases.
+    Dispatch must enforce the chosen arm's parallel_limit separately.
+    """
     if role not in {"planner", "worker", "reviewer", "fixer", "integrator"}:
         raise ValueError(f"unknown ultra role: {role}")
     excluded = {author_arm} if role == "reviewer" and author_arm is not None else set()

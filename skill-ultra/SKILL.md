@@ -95,6 +95,11 @@ Run it with the Bash tool's `run_in_background` and the longest timeout
 (7200000 ms): a run takes tens of minutes, often more. Don't poll; you are
 told when it exits. Don't read worker logs or worktrees while it runs.
 
+To keep planning and building on particular pools, pass `--pool ARM` (repeatable), e.g.
+`--pool claude-work` to spend the second Claude account's Opus. Reviewers still come from
+another model family, and a unit is held rather than moved off the pinned pools when they
+run out of quota.
+
 Other flags: `--repo PATH` and `--base REV` (default: this repo at `HEAD`),
 `--max-units N` (default 10), `--max-parallel N` (default 6),
 `--allow-lower-models`.

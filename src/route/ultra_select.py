@@ -10,6 +10,23 @@ from .surplus import load_surplus_k, quota_adjustment
 
 ULTRA_MIN_RANK = 2
 
+# `route ultra --pool ARM` pins planning and building to these arms for the whole run (one run per
+# process). Reviewers ignore the pin so reviews stay cross-family; an empty pin means "any arm".
+PIN: frozenset[str] = frozenset()
+
+
+def set_pin(arms) -> None:
+    """Pin planner, workers, fixers and the integrator to these arms (empty to clear)."""
+    global PIN
+    PIN = frozenset(arms or ())
+
+
+def pinned(arms: list[str], role: str) -> list[str]:
+    """The arms a role may use under the pin; reviewers are never pinned."""
+    if not PIN or role == "reviewer":
+        return arms
+    return [arm for arm in arms if arm in PIN]
+
 
 def model_rank(pool: Pool) -> int:
     """Pinned tier words outrank arm defaults; substrings are not model tiers."""
@@ -105,8 +122,8 @@ def pick(
     if role not in {"planner", "worker", "reviewer", "fixer", "integrator"}:
         raise ValueError(f"unknown ultra role: {role}")
     excluded = {author_arm} if role == "reviewer" and author_arm is not None else set()
-    available = candidates(pools, quota, host=host, allow_lower=allow_lower,
-                           exclude_arms=excluded)
+    available = pinned(candidates(pools, quota, host=host, allow_lower=allow_lower,
+                                  exclude_arms=excluded), role)
     if not available:
         return None
     if role == "worker":

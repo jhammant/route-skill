@@ -773,6 +773,8 @@ def cmd_ultra(args: argparse.Namespace) -> int:
         return ultra_cancel(words[1])
     if args.research is not None and args.team is not None:
         raise ValueError("--research and --team cannot be combined: one question, one mode")
+    if args.pin and (args.research is not None or args.team is not None):
+        raise ValueError("--pool pins a build run; --research and --team choose their own analysts")
     if args.research is not None:
         from .ultra_research import run_research
 
@@ -799,7 +801,8 @@ def cmd_ultra(args: argparse.Namespace) -> int:
     return run_ultra(goal, repo=args.repo if args.repo is not None else ".", base=args.base,
                      context=args.context, session=args.session,
                      max_units=args.max_units, max_parallel=args.max_parallel, plan_only=args.plan_only,
-                     allow_lower=args.allow_lower, json_out=args.json_out, host=args.host)
+                     allow_lower=args.allow_lower, json_out=args.json_out, host=args.host,
+                     pin=tuple(args.pin))
 
 
 def _parser(prog: str) -> argparse.ArgumentParser:
@@ -902,6 +905,10 @@ def _parser(prog: str) -> argparse.ArgumentParser:
     u.add_argument("--max-parts", type=_positive_int, default=6, metavar="N",
                    help="--research: at most this many sub-questions")
     u.add_argument("--max-parallel", type=_positive_int, default=6, metavar="N")
+    u.add_argument("--pool", dest="pin", action="append", default=[], metavar="ARM",
+                   help="pin the planner, workers, fixers and integrator to this pool (repeatable, e.g. "
+                        "--pool claude-work); reviewers still come from another model family, and a run "
+                        "holds rather than leave the pinned pools")
     u.add_argument("--plan-only", action="store_true", help="plan and choose arms, dispatch nothing")
     u.add_argument("--allow-lower-models", dest="allow_lower", action="store_true",
                    help="let Sonnet/Kimi-class arms in when no Fable/Opus/Codex-class arm has quota")

@@ -34,7 +34,7 @@ from .ultra_plan import Plan, PlanError, lint_plan, merge_overlaps, parse_plan, 
 from .ultra_review import (Finding, confirm, fix_prompt, merge_prompt, needs_review, parse_review, resolved,
                            review_prompt, unit_diff)
 from .ultra_safety import run_checked, screen_digest
-from .ultra_select import candidates, dispatch_template, pick, review_independence
+from .ultra_select import candidates, dispatch_template, pick, review_independence, pinned, set_pin
 
 RUN_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,80}$")
 SCHEMA = "route-ultra-progress/1"
@@ -444,7 +444,7 @@ def _pick_fixer(pass_no: int, previous: list[str], author: str, pools: dict[str,
     if pass_no == 1 or not previous:
         return pick("fixer", pools, quota, host=host, author_arm=author, allow_lower=allow_lower)
     first = previous[-1]
-    others = candidates(pools, quota, host=host, allow_lower=allow_lower, exclude_arms={first})
+    others = pinned(candidates(pools, quota, host=host, allow_lower=allow_lower, exclude_arms={first}), "fixer")
     if not others:
         return first
     if first == author:
@@ -810,7 +810,7 @@ def _report(run: Run, goal: str, plan: Plan | None, arms: dict[str, str], integr
 def run_ultra(goal: str, *, repo: str | Path = ".", base: str = "HEAD", context: str = "brief",
               session: str | None = None, max_units: int = 10, max_parallel: int = 6,
               plan_only: bool = False, allow_lower: bool = False, json_out: bool = False,
-              host: str = "claude") -> int:
+              host: str = "claude", pin: tuple[str, ...] | list[str] = ()) -> int:
     """One whole run; exit 0 when the goal check passed on the integration branch with
     every unit merged, 1 when anything failed, 2 when it could not plan or nothing was usable."""
     goal = goal.strip()
@@ -825,7 +825,16 @@ def run_ultra(goal: str, *, repo: str | Path = ".", base: str = "HEAD", context:
     if base_sha is None:
         print(f"route ultra: {repo_path} is not a git work tree with commit {base!r}", file=sys.stderr)
         return 2
+    if pin:
+        known = pools_for_host(cli.load_pools(), host)
+        unknown = sorted(set(pin) - set(known))
+        if unknown:
+            print(f"route ultra: --pool names no such pool: {', '.join(unknown)} (pools: {', '.join(sorted(known))})",
+                  file=sys.stderr)
+            return 2
+    set_pin(pin)
     run = Run(new_run_id(goal), goal, repo_path, base, host)
+    run.progress["pin"] = sorted(set(pin))
     try:
         run.dir.mkdir(parents=True, mode=0o700)
         (run.dir / "logs").mkdir(mode=0o700)

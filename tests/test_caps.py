@@ -123,6 +123,132 @@ def test_ordinary_output_is_not_a_cap(text, rc):
     assert detect_cap(text, rc, now=NOW) is None
 
 
+#: Lines a worker wrote about its own change. Each opens with a limit phrase and none is a CLI's cap message.
+ABOUT_LIMITS = [
+    "- Rate limit reached: the client now backs off and retries",
+    "Session limit reached, so the user is logged out and sent to /login.",
+    "- Daily limit reached for free users now returns 402",
+    "- Monthly limit reached (HTTP 402) is covered by tests/test_billing.py",
+    "Usage limit reached - banner component added in Banner.tsx",
+    "\"You've hit your Fable limit\" is now read as a cap in every role.",
+    "- You've reached the rate limit path: covered by test_retry",
+    "You've hit your usage limit handling is in caps.py",
+    "Weekly limit reached - resets are parsed by parse_reset",
+    "You're out of extra usage banners now link to the settings page",
+]
+
+
+@pytest.mark.parametrize("line", ABOUT_LIMITS)
+def test_a_line_that_carries_on_past_the_limit_phrase_is_a_model_describing_its_work(line):
+    # Whatever the exit code, alone or closing a short final message.
+    for rc in (0, 1, 124, None):
+        assert detect_cap(line + "\n", rc, now=NOW) is None, (line, rc)
+        assert detect_cap("Done. All tests pass.\n" + line + "\n- tests added\n", rc, now=NOW) is None, (line, rc)
+
+
+def test_a_cli_that_exited_0_is_capped_only_when_the_cap_is_the_first_thing_it_said():
+    # Arrange: what the CLIs print around an answer, and a finished worker's own answer.
+    warning = "Warning: no stdin data received in 3s, proceeding without it.\n"
+    hook = 'SessionEnd hook ["${CLAUDE_PLUGIN_ROOT}/scripts/session-end.sh"] failed: Hook cancelled\n'
+    answer = "Done. The detector has a test for the line below.\n"
+    # Act and assert: a cap instead of an answer, with or without the CLI's own noise around it.
+    assert detect_cap(warning + FABLE_LIMIT + hook, 0, now=NOW).model == "Fable"
+    assert detect_cap("Warning: usage limit reached · resets 9pm (Europe/London)\n", 0, now=NOW).window == "usage"
+    assert detect_cap('{"type":"system","subtype":"init"}\n{"type":"result","is_error":true,"result":"You\'ve hit '
+                      'your Fable limit · resets Nov 23 at 3pm (Europe/London)."}\n', 0, now=NOW).model == "Fable"
+    # An answer of its own came first: the model finished, and the line is something it quoted.
+    assert detect_cap(answer + FABLE_LIMIT, 0, now=NOW) is None
+    assert detect_cap(answer + "Usage limit reached\n", 0, now=NOW) is None
+    # The same output from a CLI that failed does end on a cap.
+    assert detect_cap(answer + FABLE_LIMIT, 1, now=NOW).model == "Fable"
+
+
+#: The end of a transcript that failed or timed out for a reason of its own: the project's test
+#: output, a diff, a log line. Each holds a quota error code and none is the CLI's error line.
+OTHER_FAILURES = [
+    "E   requests.HTTPError: 429 Too Many Requests for url: http://test/\n"
+    "FAILED tests/test_retry.py::test_backoff\n1 failed, 12 passed\n",
+    '+    if err.get("type") == "usage_limit_reached":\n+        return True\ntests failed\n',
+    '+    (\'error: {"type": "usage_limit_reached", "message": "The usage limit has been reached"}\\n\', "usage"),\n'
+    "error: tests failed\n",
+    "tests/test_billing.py:41:    assert body['error']['code'] == 'insufficient_quota'\nerror: sandbox denied\n",
+    "E   openai.RateLimitError: Error code: 429 - You exceeded your current quota, please check your plan\n"
+    "1 failed\n",
+    "INFO retry: got 429 Too Many Requests, sleeping 2s\nerror: timed out after 900s\n",
+    "Error: 429 Too Many Requests is not retried by the client yet\n",
+]
+
+
+@pytest.mark.parametrize("tail", OTHER_FAILURES)
+def test_a_quota_error_code_in_test_output_or_a_diff_is_not_a_cap(tail):
+    # Arrange
+    transcript = "work\n" * 800 + tail
+    # Act and assert: a failure and a timeout, after a long transcript and after a short one.
+    for rc in (1, 124):
+        assert detect_cap(transcript, rc, now=NOW) is None, (tail, rc)
+        assert detect_cap(tail, rc, now=NOW) is None, (tail, rc)
+
+
+@pytest.mark.parametrize("text", [
+    'ULTRA-MANIFEST-BEGIN\n{"name": "caps",\n "units": [{"id": "detect", "task": "read usage_limit_reached errors '
+    'from the CLI",\n "check": "pytest -q", "touches": ["src/caps.py"]}],\n "goal_check": "pytest -q"}\n'
+    "ULTRA-MANIFEST-END\n",
+    'ULTRA-FINDINGS-BEGIN\n[\n {"title": "no backoff",\n  "detail": "the client loops on 429 Too Many Requests '
+    'without sleeping",\n  "repro": "pytest tests/test_retry.py"}\n]\nULTRA-FINDINGS-END\n',
+    'ULTRA-FINDINGS-BEGIN\n[{"title": "error swallowed"},\n {"detail": "insufficient_quota from the API is logged '
+    'and ignored"}]\nULTRA-FINDINGS-END\n',
+    '{"title": "error swallowed", "message": "429 Too Many Requests: logged and ignored, usage_limit_reached too"}\n',
+    "Looked at the retry path; a 429 Too Many Requests is handled.\nULTRA-FINDINGS-BEGIN\n[]\nULTRA-FINDINGS-END\n",
+], ids=["plan", "finding-429", "finding-insufficient-quota", "finding-one-line-json", "note-before-findings"])
+def test_a_plan_or_a_finding_that_names_a_quota_error_code_is_not_a_cap(text):
+    for rc in (0, 1):
+        assert detect_cap(text, rc, now=NOW) is None, rc
+
+
+@pytest.mark.parametrize("line", [
+    "You've reached your Fable limit. Switch to another model, or manage usage credits at "
+    "claude.ai/settings/usage?from=cc_cli_limit_message, to continue.",
+    "You've reached your Fable limit for this week. Switch models?",
+    "You've hit your weekly limit. It resets 3pm (Europe/London).",
+    "You've hit your weekly limit for Opus · resets Nov 23 at 3pm (Europe/London)",
+    "You've hit your monthly limit — raise it below, or it resets next month.",
+    "You've hit your monthly spend limit. See Usage in Settings",
+    "You're out of usage credits. Switch to another model to continue.",
+    "You're out of usage credits. Run /usage-credits to keep using Fable or /model to switch models.",
+    "Usage limit reached · continuing automatically at 3pm · esc to cancel",
+    "Claude usage limit reached. Your limit will reset at 3pm (Europe/London).",
+    "⎿  You've hit your session limit · resets 11:30pm (Europe/London)",
+    "ERROR: You've hit your usage limit. To get more access now, send a request to your admin or try again at 3pm.",
+    "ERROR: You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits.",
+    "Usage limit reached - resets at 3pm",
+    "Rate limit reached, please try again in 20s",
+])
+def test_every_way_a_cli_words_a_cap_is_read_whether_it_failed_or_exited_0(line):
+    # The wordings in the Claude Code and Codex CLIs: tightening the detector must not lose one.
+    for rc in (0, 1, None):
+        assert detect_cap(line + "\n", rc, now=NOW) is not None, (line, rc)
+
+
+@pytest.mark.parametrize("text, window", [
+    ('stream error: unexpected status 429 Too Many Requests: {"error": {"type": "usage_limit_reached", '
+     '"message": "The usage limit has been reached"}}\n', "usage"),
+    ("work\n" * 800 + "[2026-11-18T18:39:12] stream error: exceeded retry limit, last status: 429 Too Many "
+     "Requests\n", "rate"),
+    ("Error: 429 You exceeded your current quota, please check your plan and billing details\n", "usage"),
+    ('API Error: 429 {"error": {"code": "insufficient_quota"}}\n', "usage"),
+    ('{"type": "error", "message": "unexpected status 429 Too Many Requests: usage_limit_reached"}\n', "usage"),
+    ("Rate limit reached for gpt-6-astra in organization org-1 on tokens per min (TPM): Limit 30000, Used 29000, "
+     "Requested 2000. Please try again in 2s.\n", "rate"),
+], ids=["wrapped-usage-limit", "retry-429-after-transcript", "current-quota", "insufficient-quota", "json-error-event",
+        "rate-limit-for-an-organization"])
+def test_a_quota_error_code_in_the_cli_s_own_error_line_is_still_a_cap(text, window):
+    # Act
+    cap = detect_cap(text, 1, now=NOW)
+    # Assert
+    assert cap is not None, text
+    assert (cap.model, cap.window) == ("", window)
+
+
 @pytest.mark.parametrize("text, expected", [
     ("resets Nov 23 at 3pm (Europe/London).", datetime(2026, 11, 23, 15, 0, tzinfo=timezone.utc)),
     ("resets 3:05 PM (America/New_York)", datetime(2026, 11, 18, 20, 5, tzinfo=timezone.utc)),

@@ -365,6 +365,14 @@ ultra: claude-work-fable hit its Fable limit (resets Nov 23 15:00); planning on 
   records, for when you buy credit before the reset (claude-swarm's are its
   own: delete that file to lift one early). A cap with no readable reset is
   kept for an hour.
+- Only the CLI's own message counts as a cap. The limit phrase has to open one
+  of the last lines of the output and end its sentence there, or go straight
+  on to the reset; a quota error code (`usage_limit_reached`, `429 Too Many
+  Requests`) counts only inside the CLI's own `error:` line. A CLI that exited
+  0 is capped only when the cap is the first thing it printed. A worker's
+  summary ("Rate limit reached: the client now backs off"), a project's test
+  output or a diff that mentions a limit is not a cap. If one is ever read
+  wrongly, `route caps --clear [ARM]` lifts it.
 - When no arm is left to plan, the run exits 2 and says what was capped, when
   it resets and what to try: `Rerun with --pool claude-work, or wait for the
   reset (Nov 23 15:00)`.

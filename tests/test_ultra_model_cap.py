@@ -301,6 +301,55 @@ def test_a_capped_worker_with_no_arm_left_fails_its_unit_with_the_reason(repo, f
     assert "no other arm left for building alpha" in capsys.readouterr().err
 
 
+# -- output that only looks like a cap --------------------------------------------
+
+def says_at_the_end(fake_dir: Path, script: str, lines: str, exit_code: int) -> None:
+    """Make one stand-in do its work as before, then print ``lines`` and exit with ``exit_code``."""
+    body, rest = build.FAKE_ARM.replace("__FAKE_DIR__", str(fake_dir)).rsplit("exit 0\n", 1)
+    assert rest == ""
+    (fake_dir / script).write_text(f"{body}{lines}exit {exit_code}\n")
+
+
+def assert_built_with_no_cap_on_record(rc: int, fake_dir: Path, repo_dir: Path, err: str) -> None:
+    summary, run_dir = build.latest_run()
+    assert rc == 0, (run_dir / "summary.md").read_text()
+    assert [(unit["id"], unit["arm"], unit["state"], unit["reason"]) for unit in summary["units"]] == [
+        ("alpha", "claude-work", "merged", None), ("beta", "claude-work", "merged", None)]
+    assert build.git(repo_dir, "show", f"ultra/{summary['run_id']}:alpha.txt").strip() == "alpha"
+    # Opus was asked to build each unit once, and nothing calls the account spent.
+    assert sorted(call for call in by_script(fake_dir, "fake-opus") if call[0] == "worker") == [
+        ("worker", "alpha"), ("worker", "beta")]
+    assert summary["quota_events"] == [] and "limit" not in err
+    assert not caps.caps_path().exists() and caps.active_caps() == []
+    swarm = json.loads((swarm_dispatch.swarm_dir(summary["run_id"]) / "summary.json").read_text())
+    assert [row.get("capped") for row in swarm["units"]] == [None, None]
+
+
+def test_a_worker_whose_short_final_message_is_about_rate_limits_is_not_capped(repo, fake, capsys):  # noqa: F811
+    # Arrange: Opus builds each unit, exits 0, and sums up the rate-limit path it wrote in a bullet.
+    says_at_the_end(fake, "fake-opus", 'echo "Done. The check passes."\n'
+                    'echo "- Rate limit reached: the client now backs off and retries"\n', 0)
+    build.write_plan(fake, build.plan(build.two_units()))
+    # Act
+    rc = run_ultra("Create two files", repo=str(repo), host="claude", pin=("claude-work",))
+    # Assert
+    assert_built_with_no_cap_on_record(rc, fake, repo, capsys.readouterr().err)
+
+
+def test_a_failed_worker_whose_transcript_ends_on_the_project_s_own_429_is_not_capped(repo, fake,  # noqa: F811
+                                                                                    capsys):
+    # Arrange: Opus builds each unit, prints a long transcript ending in a diff line and test output, and exits 1.
+    says_at_the_end(fake, "fake-opus", 'for i in $(seq 800); do echo "work $i"; done\n'
+                    "echo '+    if err.get(\"type\") == \"usage_limit_reached\":'\n"
+                    'echo "E   requests.HTTPError: 429 Too Many Requests for url: http://test/"\n'
+                    'echo "FAILED tests/test_retry.py::test_backoff"\necho "1 failed, 12 passed"\n', 1)
+    build.write_plan(fake, build.plan(build.two_units()))
+    # Act
+    rc = run_ultra("Create two files", repo=str(repo), host="claude", pin=("claude-work",))
+    # Assert: the acceptance check decided, as for any worker that exits non-zero.
+    assert_built_with_no_cap_on_record(rc, fake, repo, capsys.readouterr().err)
+
+
 # -- reviewer and fixer ----------------------------------------------------------
 
 def test_a_capped_reviewer_hands_the_review_to_the_next_arm(repo, fake, capsys):  # noqa: F811

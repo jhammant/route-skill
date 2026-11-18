@@ -31,8 +31,8 @@ from .storage import atomic_write, state_dir
 
 #: Only the end of the output is read: a CLI stopped by a cap says so last.
 TAIL_LINES = 12
-#: An output this short may be a cap even when the CLI exited 0; a longer one that
-#: exited 0 is a model that finished its work and happened to mention a limit.
+#: An output this short may be a cap even when the CLI exited 0, if the cap is the
+#: first thing it says; a longer one that exited 0 is a model that finished its work.
 SHORT_OUTPUT = 1500
 #: How long a cap with no readable reset is remembered (claude-swarm uses the same hour).
 DEFAULT_SECONDS = 3600.0
@@ -76,23 +76,48 @@ class Cap:
 # -- detection -------------------------------------------------------------------
 
 _APOS = "(?:'|’)"
-#: What may follow "limit reached" in a real cap line. "Usage limit reached handling
-#: is done" (a worker describing its own change) does not qualify.
-_AFTER = r"(?=\s*(?:$|[.|·∙•!,;:(–—-]|resets?\b|for\b|please\b|try\b|upgrade\b|your\b))"
+_MONTHS = ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec")
+_DAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+#: A reset as a CLI gives it: "resets Nov 23 at 3pm", "resets 3pm", "try again in 2h", "Your limit will reset at 3pm".
+_WHEN = rf"(?:(?:at|in|on|by)\b|\d|{'|'.join(_MONTHS + _DAYS)}|today\b|tomorrow\b|tonight\b|later\b|soon\b|next\b)"
+_RESETS = (rf"(?:resets?\s+{_WHEN}|(?:please\s+)?(?:re)?try (?:again|after|in)\b|available again\b"
+           r"|your\b[^.\n]{0,40}\breset)")
+#: Where a real cap line goes after the limit phrase. It stops there: the line ends, or a full stop, a
+#: "·", a dash or the old "|<epoch>" follows ("... limit for Opus", "... limit for this week" may come
+#: first). Or it goes straight on to the reset or to what to do ("- resets 3pm", ", upgrade to Pro"). Or
+#: it names who the limit is for and then gives the reset ("Rate limit reached for gpt-6 in organization
+#: org-1 on tokens per min. Please try again in 2s"). A sentence that carries on past the phrase ("Rate
+#: limit reached: the client now backs off", "Daily limit reached for free users now returns 402",
+#: "Usage limit reached handling is done") is a model describing its work.
+_AFTER = (r"(?=(?:\s+for\s+[\w.:\-]+(?:\s+[\w.:\-]+){0,2})?\s*(?:$|[.!?](?:\s|$)|[·∙•|–—])"
+          rf"|\s*[,;:-]?\s*(?:{_RESETS}|switch to\b|upgrade (?:to|your)\b)"
+          rf"|\s+for\b[^\n]*?{_RESETS})")
+#: The limit phrase opens the message.
 _PATTERNS: tuple[tuple[re.Pattern, str], ...] = tuple((re.compile(pattern, re.I), window) for pattern, window in (
     # Claude Code and Codex: "You've hit your Fable limit", "You've hit your usage limit".
-    (rf"you(?:{_APOS}| ha)ve (?:hit|reached|exceeded) (?:your|the) (?P<what>[\w.\- ]{{0,40}}?)\s*limit\b", ""),
+    (rf"you(?:{_APOS}| ha)ve (?:hit|reached|exceeded) (?:your|the) (?P<what>[\w.\- ]{{0,40}}?)\s*limit\b" + _AFTER, ""),
     # "5-hour limit reached", "Opus weekly limit reached", "Claude AI usage limit reached|1700000000".
     (r"(?P<what>(?:[\w.\-]+ ){0,3}?(?:usage|5-hour|five-hour|hourly|weekly|session|daily|monthly|rate))"
      r"\s+limit (?:reached|exceeded|hit)" + _AFTER, ""),
-    (rf"you(?:{_APOS}| a)re out of (?:extra )?usage\b", "usage"),
-    (r"limit reached\s*[·∙•|–—-]\s*resets?\b", ""),
-    (r".*\busage_limit_reached\b", "usage"),
-    (r".*\b(?:insufficient_quota|you exceeded your current quota)\b", "usage"),
-    (r".*(?:exceeded retry limit, last status: 429|\b429 too many requests\b)", "rate"),
+    # "You're out of extra usage · resets ...", "You're out of usage credits. Switch to another model to continue."
+    (rf"you(?:{_APOS}| a)re out of (?:extra )?usage(?: credits)?\b" + _AFTER, "usage"),
+    (rf"limit reached(?=\s*[.,;:|·∙•–—-]?\s*{_RESETS})", ""),
 ))
-#: Log furniture in front of the message: a timestamp, a bullet, "ERROR:", "API Error:".
-_LEAD = re.compile(r"^\s*(?:\[[^\]]{1,40}\]\s*)?[^\w\[{]{0,8}\s*(?:(?:\w+ ){0,2}error\w*:\s*|warning:\s*)?", re.I)
+#: Error codes a CLI wraps in its own error line ("stream error: ... last status: 429 Too Many Requests",
+#: 'error: {"type": "usage_limit_reached", ...}'). They are read anywhere in such a line and nowhere else:
+#: the same tokens turn up in a project's test output, in a diff, in a plan and in a review finding.
+_WRAPPED: tuple[tuple[re.Pattern, str], ...] = tuple((re.compile(pattern, re.I), window) for pattern, window in (
+    (r"\busage_limit_reached\b", "usage"),
+    (r"\b(?:insufficient_quota|you exceeded your current quota)\b", "usage"),
+    (r"exceeded retry limit, last status: 429|\b429 too many requests\b(?=\s*(?:$|[.:;,{(\[|]))", "rate"),
+))
+#: Log furniture in front of the message: a timestamp, one terminal glyph, then "ERROR:", "API Error:" or
+#: "warning:". Not a list bullet, a quote mark or a diff's "+": those open a model's own prose or a file it printed.
+_LEAD = re.compile(r"^\s*(?:\[[^\]]{1,40}\]\s*)?(?:[^\w\s\x00-\x7f]{1,2}\s+)?"
+                   r"(?:(?P<error>(?:\w+ ){0,2}error\w*:\s*)|warning:\s*)?", re.I)
+#: Lines a CLI prints around its answer that are not the answer: "Warning: no stdin data received in 3s",
+#: 'SessionEnd hook [...] failed: Hook cancelled'.
+_FURNITURE = re.compile(r"^\s*(?:warning:|\w+ hook\b)", re.I)
 _WINDOWS = {"5-hour": "5-hour", "five-hour": "5-hour", "hourly": "hourly", "weekly": "weekly",
             "session": "session", "daily": "daily", "monthly": "monthly", "rate": "rate", "usage": "usage"}
 #: Words in "your ... limit" that are neither a model nor a window.
@@ -102,51 +127,70 @@ _NOISE = frozenset({"claude", "ai", "chatgpt", "codex", "openai", "plan", "curre
 def detect_cap(text: str | None, rc: int | None = None, *, now: float | None = None) -> Cap | None:
     """The usage cap a role's output ends on, or None.
 
-    Works on any dispatched role's output. The message must open one of the
-    last ``TAIL_LINES`` lines, and the CLI must have failed (``rc`` non-zero or
-    unknown) or have said almost nothing else: a model that exited 0 after a
-    long answer was not stopped by a cap, whatever its answer quotes.
+    Works on any dispatched role's output. Two things are asked of it:
+
+    * the line reads as the CLI's own message: the limit phrase opens it and
+      ends its sentence or goes straight on to the reset (see ``_AFTER``), or
+      it is the CLI's error line wrapping a quota error code;
+    * the CLI was stopped by it. A CLI that failed (``rc`` non-zero or
+      unknown) says so in one of its last ``TAIL_LINES`` lines. A CLI that
+      exited 0 printed the cap *instead of* an answer, so it must be the first
+      thing it said and the output short: a model that exited 0 after an
+      answer of its own finished its work, whatever that answer says or quotes
+      about limits.
     """
     if not text or not text.strip():
         return None
-    if rc == 0 and len(text.strip()) > SHORT_OUTPUT:
-        return None
-    lines = [line for line in text.splitlines() if line.strip()][-TAIL_LINES:]
-    for line in reversed(lines):
-        for candidate in _messages(line):
-            cap = _match(candidate, now)
+    lines = [line for line in text.splitlines() if line.strip()]
+    if rc == 0:
+        if len(text.strip()) > SHORT_OUTPUT:
+            return None
+        # Its own noise, then the first thing it said; whatever follows that is not read.
+        lines = lines[:1 + next((index for index, line in enumerate(lines) if not _furniture(line)), len(lines))]
+    for line in reversed(lines[-TAIL_LINES:]):
+        for candidate, failed in _messages(line):
+            cap = _match(candidate, now, failed)
             if cap is not None:
                 return cap
     return None
 
 
-def _messages(line: str) -> list[str]:
-    """The line itself, or the result text of a ``--output-format json`` line."""
+def _furniture(line: str) -> bool:
+    """Whether a line is the CLI's own noise around an answer: a warning, a hook report, an event with no text."""
+    return bool(_FURNITURE.match(line)) or not _messages(line)
+
+
+def _messages(line: str) -> list[tuple[str, bool]]:
+    """(message, whether an error event carries it): the line itself, or the text of a ``--output-format json`` line."""
     stripped = line.strip()
     if stripped.startswith("{"):
         try:
             event = json.loads(stripped)
         except ValueError:
-            return [stripped]
+            return [(stripped, False)]
         if isinstance(event, dict):
-            return [str(value) for key in ("result", "message", "error") if isinstance(value := event.get(key), str)]
-    return [stripped]
+            failed = event.get("is_error") is True or "error" in str(event.get("type") or "").lower()
+            return [(value, failed or key == "error") for key in ("result", "message", "error")
+                    if isinstance(value := event.get(key), str)]
+    return [(stripped, False)]
 
 
-def _match(line: str, now: float | None) -> Cap | None:
-    body = _LEAD.sub("", line, count=1)
-    for pattern, default_window in _PATTERNS:
-        found = pattern.match(body)
-        if found is None:
-            continue
-        model, window = _model_and_window(found.groupdict().get("what") or "")
-        # The reset follows the message; a wrapped error ("... usage_limit_reached") may carry it earlier.
-        resets_at, resets = parse_reset(body[found.end():], now=now)
-        if resets_at is None and not resets:
-            resets_at, resets = parse_reset(body, now=now)
-        return Cap(model=model, window=window or default_window, resets_at=resets_at, resets=resets,
-                   message=" ".join(line.split())[:400])
-    return None
+def _match(line: str, now: float | None, failed: bool = False) -> Cap | None:
+    lead = _LEAD.match(line)
+    body = line[lead.end():]
+    hits = [(pattern.match(body), window) for pattern, window in _PATTERNS]
+    if failed or lead.group("error"):
+        hits += [(pattern.search(body), window) for pattern, window in _WRAPPED]
+    found, default_window = next((hit for hit in hits if hit[0]), (None, ""))
+    if found is None:
+        return None
+    model, window = _model_and_window(found.groupdict().get("what") or "")
+    # The reset follows the message; a wrapped error ("... usage_limit_reached") may carry it earlier.
+    resets_at, resets = parse_reset(body[found.end():], now=now)
+    if resets_at is None and not resets:
+        resets_at, resets = parse_reset(body, now=now)
+    return Cap(model=model, window=window or default_window, resets_at=resets_at, resets=resets,
+               message=" ".join(line.split())[:400])
 
 
 def _model_and_window(what: str) -> tuple[str, str]:
@@ -160,8 +204,6 @@ def _model_and_window(what: str) -> tuple[str, str]:
     return " ".join(model), window
 
 
-_MONTHS = ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec")
-_DAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 _RESET = re.compile(r"(?:\bresets\b|\breset(?=\s+(?:at|in|on)\b)|\btry again\b|\bavailable again\b)"
                     r"\s+(?P<how>in|at|on)?\s*(?P<when>[^\n]*)", re.I)
 _EPOCH = re.compile(r"^\s*\|\s*(\d{9,13})\b")

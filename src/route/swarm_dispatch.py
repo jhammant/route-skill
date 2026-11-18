@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import cli
+from . import caps, cli
 from .complexity import TIERS
 from .eligibility import quota_provider
 from .memory import TaskMemory
@@ -419,11 +419,33 @@ def _run_unit(a: Assignment, manifest: dict, directory: Path, args: argparse.Nam
                          wall_clock_s=round(time.monotonic() - started, 2), finished_at=utc_now())
         return {}
 
+    def capped_result(record: dict, agent_rc: int | None, note: str) -> dict:
+        # The arm is at a usage cap: nothing was built, so nothing is checked (a check that
+        # already passes at the base would "accept" an empty unit) and nothing is committed.
+        capped = {key: record.get(key) for key in ("model", "window", "resets_at", "resets", "message", "keys")}
+        with log.open("a", encoding="utf-8") as output:
+            output.write(f"\n{note}\n")
+        wall_clock = round(time.monotonic() - started, 2)
+        live_status.unit(identity, state="failed", pid=None, agent_rc=agent_rc, capped=capped,
+                         wall_clock_s=wall_clock, finished_at=utc_now())
+        print(f"swarm: {identity}: {caps.describe({**record, 'arm': a.arm})}; not checked",
+              file=sys.stderr, flush=True)
+        return {"id": identity, "decision_id": a.plan["decision_id"], "arm": a.arm, "why": a.plan["why"],
+                "shape": a.plan["shape"], "tier": a.plan["tier"], "address": address,
+                "branch": branch_name(manifest, identity), "worktree": str(worktree), "agent_rc": agent_rc,
+                "accepted": False, "wall_clock_s": wall_clock, "log": str(log), "committed": False,
+                "capped": capped}
+
     with semaphore:
         if cancel.requested.is_set():
             return {}
-        print(f"swarm: {identity} starts on {a.arm}", flush=True)
         started = time.monotonic()
+        # Only this swarm's own records: a pin the user chose still beats a cap from an earlier run.
+        standing = caps.standing_cap(a.arm, a.ctx.pools, source=f"swarm:{manifest['swarm_id']}:")
+        if standing is not None:
+            # A unit ahead of this one met the cap on this arm's window: don't ask again.
+            return capped_result(standing, None, "Not started: the arm is at a usage cap, so nothing was built.")
+        print(f"swarm: {identity} starts on {a.arm}", flush=True)
         try:
             agent_rc = cli._dispatch(argv, brief, target=a.arm, stdin=a.ctx.task_on_stdin,
                                      cwd=worktree, env=env, log=log, timeout=args.unit_timeout,
@@ -437,6 +459,14 @@ def _run_unit(a: Assignment, manifest: dict, directory: Path, args: argparse.Nam
         cancel.finish(identity)
         if cancel.requested.is_set():
             return cancelled(130)
+        try:
+            cap = caps.detect_cap(log.read_text(encoding="utf-8", errors="replace"), agent_rc)
+        except OSError:
+            cap = None
+        if cap is not None:
+            # The cap is remembered, so the units queued behind this one and later routing skip the window.
+            record = caps.record_cap(a.arm, a.ctx.pools, cap, source=f"swarm:{manifest['swarm_id']}:{identity}")
+            return capped_result(record, agent_rc, "Not checked: the arm reported a usage cap, so nothing was built.")
         live_status.unit(identity, state="checking", pid=None, agent_rc=agent_rc)
         with log.open("a", encoding="utf-8") as output:
             check_rc = _acceptance_check(a, worktree, output, args.check_timeout, cancel,
@@ -486,7 +516,9 @@ def _settle(assignments: list[Assignment], results: list[dict], swarm_id: str) -
     router = cli._build_router()  # Reload after delegates finish.
     groups = defaultdict(list)
     for result in results:
-        groups[result["shape"], result["tier"], result["arm"]].append(result)
+        # A usage cap says nothing about how good the arm is: it is no trial, and no failure.
+        if not result.get("capped"):
+            groups[result["shape"], result["tier"], result["arm"]].append(result)
     outcomes = []
     for (shape, tier, arm), group in groups.items():
         # Pins and preview plans did not persist seeds; seed without a trial.
@@ -496,6 +528,10 @@ def _settle(assignments: list[Assignment], results: list[dict], swarm_id: str) -
         outcomes.append(dict(shape=shape, tier=tier, arm=arm, total=total, accepted=accepted, fraction=fraction))
     stats, memory = Stats(), TaskMemory()
     for a, result in zip(assignments, results):
+        if result.get("capped"):
+            stats.annotate(a.plan["decision_id"], swarm=swarm_id, events=["capped"],
+                           impression_recorded=False, wall_clock_s=result["wall_clock_s"])
+            continue
         score = float(result["accepted"])
         events = ["accepted", "verified"] if result["accepted"] else ["failed"]
         if result["agent_rc"] == 0:
@@ -658,6 +694,10 @@ def _run_swarm(manifest: dict, args: argparse.Namespace, quota: dict, assignment
 def _print_next_arms(assignments: list[Assignment], results: list[dict]) -> None:
     for a, result in zip(assignments, results):
         if result["accepted"]:
+            continue
+        if result.get("capped"):
+            print(f"swarm: {a.unit['id']}: {caps.describe({**result['capped'], 'arm': a.arm})}; "
+                  "rerun it on another pool (no automatic retry)")
             continue
         stronger = STRENGTH_ORDER[STRENGTH_ORDER.index(a.arm) + 1:] if a.arm in STRENGTH_ORDER else ()
         next_arm = next((arm for arm in stronger if arm in a.plan["eligible"]), None)

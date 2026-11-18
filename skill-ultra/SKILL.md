@@ -117,6 +117,35 @@ stops a run.
 On exit 2, tell the user why and, when no top model had quota, offer
 `--allow-lower-models`. Don't rerun on your own.
 
+### When a model hits its usage cap
+
+A model that answers "You've hit your Fable limit · resets ..." (or Codex's
+"You've hit your usage limit") has done no work. The run says so on stderr the
+moment it happens and carries on with the next arm, in every mode and for
+every role:
+
+```text
+ultra: claude-work-fable hit its Fable limit (resets Nov 23 15:00); planning on claude-work (Opus) instead
+```
+
+The capped arm, and any arm on the same model window, is not asked again in
+that run. `--pool` pins still hold, and a review still goes to another model
+family first. The same line is in `route ultra status` (`quota: ...`), in
+`summary.md` under "Quota events" and in `progress.json` and `summary.json`
+as `quota_events`. Pass it on to the user: it explains why a run used its
+second-choice model.
+
+The cap is remembered until its reset, so later runs, `/route` and `/auto`
+skip that window without asking the model again (`ultra: skipped ...` at the
+start of a run). Limits that claude-swarm recorded count too. `route caps`
+lists what is on record; `route caps --clear [ARM]` forgets it, for when the
+user has bought credit or a cap was read wrongly.
+
+When every arm that could plan is capped, the run exits 2 and the last stderr
+line names each cap, its reset and what to try, such as
+`Rerun with --pool claude-work, or wait for the reset (Nov 23 15:00)`. Give
+the user that line; don't rerun on your own.
+
 ## 4. Report back
 
 Each run lives in `~/.local/state/route/ultra/<run-id>/` (under
@@ -135,7 +164,8 @@ Tell the user, in a few lines rather than pasted JSON:
   column); they do not fail the unit, but the user should look at them;
 - which reviews found real bugs (confirmed by their repro) and whether the
   fixes held; say so when a review was same-family rather than cross-family;
-- quota spent per pool;
+- quota spent per pool, and every line under "Quota events" (a model that hit
+  its usage cap, and which arm took over);
 - the exact merge command from `summary.md`, such as
   `git merge --no-ff ultra/<run-id>` on the base branch. Don't run it.
 

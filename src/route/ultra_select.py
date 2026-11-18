@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 
-from .eligibility import quota_keys
+from .eligibility import gate_keys, quota_keys
 from .pools import Pool, pool_family
 from .surplus import load_surplus_k, quota_adjustment
 
@@ -53,6 +53,16 @@ def model_rank(pool: Pool) -> int:
     return 0
 
 
+def model_label(pool: Pool) -> str:
+    """The name people use for an arm's model: "Opus" for claude-opus-5-5, else the model's own name."""
+    name = pool.model.name
+    words = set(re.findall(r"[a-z0-9]+", name.lower()))
+    for tier in ("fable", "opus", "sonnet", "haiku"):
+        if tier in words:
+            return tier.capitalize()
+    return "" if name.lower() in {"", "unknown", "claude"} else name
+
+
 def surplus_adjustment(arm: str, pools: dict[str, Pool], quota: dict[str, str]) -> float:
     """The router's signed weekly-pace adjustment, so ultra spends the same account it would."""
     return _adjustment(arm, pools, quota, *_weekly_pace(quota))
@@ -98,7 +108,8 @@ def candidates(
     for arm, pool in pools.items():
         if arm in exclude_arms or pool_family(pool) in exclude_families:
             continue
-        headroom = [quota.get(key, "ok") for key in quota_keys(arm, pools)]
+        # gate_keys adds the arm's own cap key: an arm that reported a usage cap is out by name.
+        headroom = [quota.get(key, "ok") for key in gate_keys(arm, pools)]
         if "critical" in headroom:
             continue
         rank = model_rank(pool)

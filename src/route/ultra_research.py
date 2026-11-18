@@ -31,7 +31,7 @@ from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import cli, ultra
+from . import caps, cli, ultra
 from .pools import Pool, pools_for_host
 from .swarm_dispatch import signal_tree
 from .storage import atomic_write, config_dir
@@ -601,9 +601,79 @@ def research_mcp_config(run_dir: Path) -> tuple[Path | None, dict]:
 
 # -- dispatch --------------------------------------------------------------------
 
+#: The exit code ``dispatch`` reports when the arm's output was a usage cap. No process exits
+#: with it; a caller that sees it moves to another arm instead of reading the output.
+CAPPED = -429
+
+
+class Capped(str):
+    """Why an attempt failed when its arm was at a usage cap; ``event`` is the run's quota event."""
+
+    event: dict
+
+    def __new__(cls, event: dict) -> Capped:
+        reason = super().__new__(cls, caps.describe(event))
+        reason.event = event
+        return reason
+
+
 def dispatch(run: ultra.Run, arm: str, pools: dict[str, Pool], host: str, prompt: str, cwd: Path,
-              log_name: str, timeout: float, mcp_config: Path | None) -> tuple[int, str]:
-    """Run one read-only model on a prompt in a directory, logging to the run dir; (exit code, output)."""
+              log_name: str, timeout: float, mcp_config: Path | None, *, role: str = "",
+              doing: str = "") -> tuple[int, str]:
+    """Run one read-only model on a prompt in a directory, logging to the run dir; (exit code, output).
+
+    An output that is a usage cap is recorded on the run (the arm's window is
+    then spent for the rest of it) and reported as exit code ``CAPPED``.
+    """
+    rc, text, _ = _dispatch_event(run, arm, pools, host, prompt, cwd, log_name, timeout, mcp_config, role, doing)
+    return rc, text
+
+
+def _dispatch_event(run: ultra.Run, arm: str, pools: dict[str, Pool], host: str, prompt: str, cwd: Path,
+                    log_name: str, timeout: float, mcp_config: Path | None, role: str,
+                    doing: str) -> tuple[int, str, dict | None]:
+    """``dispatch``, plus the quota event when the output was a usage cap."""
+    rc, text = _dispatch_raw(run, arm, pools, host, prompt, cwd, log_name, timeout, mcp_config)
+    cap = caps.detect_cap(text, rc)
+    if cap is None:
+        return rc, text, None
+    stem = Path(log_name).stem
+    return CAPPED, text, run.cap_hit(role or stem.split("-")[0], doing or stem, arm, cap, pools)
+
+
+def dispatch_moving(run: ultra.Run, role: str, doing: str, arm: str | None, pools: dict[str, Pool], host: str,
+                    prompt: str, cwd_for, log_name: str, timeout: float, mcp_config: Path | None,
+                    again) -> tuple[str | None, int, str]:
+    """``dispatch`` that survives a usage cap: (the arm that answered or None, exit code, output).
+
+    A capped arm is never asked twice: the step moves to whatever ``again()``
+    picks once the cap is marked, in the directory ``cwd_for(arm)`` gives that
+    arm. None means every candidate was capped.
+    """
+    tried: set[str] = set()
+    rc, text = CAPPED, ""
+    while arm is not None:
+        tried.add(arm)
+        if run.capped_since(arm, pools) is not None:
+            # Chosen before another step met the cap: the window is spent, so it is not asked.
+            following = again()
+            arm = None if following in tried else following
+            continue
+        rc, text, event = _dispatch_event(run, arm, pools, host, prompt, cwd_for(arm), log_name, timeout, mcp_config,
+                                          role, doing)
+        if event is None:
+            return arm, rc, text
+        ultra._set_aside(run.dir / "logs" / log_name, arm)
+        following = again()
+        if following in tried:
+            following = None
+        run.cap_next(event, following, pools)
+        arm = following
+    return None, rc, text
+
+
+def _dispatch_raw(run: ultra.Run, arm: str, pools: dict[str, Pool], host: str, prompt: str, cwd: Path,
+                  log_name: str, timeout: float, mcp_config: Path | None) -> tuple[int, str]:
     log = run.dir / "logs" / log_name
     template = research_template(arm, pools, host=host, mcp_config=mcp_config)
     pid_box: list[int] = []
@@ -648,7 +718,8 @@ Return the corrected JSON only, between the same markers; change nothing except 
 
 def dispatch_checked(run: ultra.Run, arm: str, pools: dict[str, Pool], host: str, prompt: str, cwd: Path, stem: str,
                      timeout: float, mcp_config: Path | None, *, parse, error: type[ValueError], begin: str, end: str,
-                     header: str, cancel: threading.Event | None = None) -> tuple[object | None, bool, str]:
+                     header: str, cancel: threading.Event | None = None, role: str = "",
+                     doing: str = "") -> tuple[object | None, bool, str]:
     """One arm's try at a unit, repaired once when it printed a block that did not validate.
 
     (the parsed value or None, whether the repair produced it, why it failed).
@@ -658,8 +729,13 @@ def dispatch_checked(run: ultra.Run, arm: str, pools: dict[str, Pool], host: str
     Nor is a dispatch the run has cancelled (``cancel`` set): the block it
     left behind was cut short by the run's own signal, and starting another
     model to mend it would hold the cancellation up for ``REPAIR_TIMEOUT``.
+    An arm at a usage cap fails with a ``Capped`` reason: the caller moves on
+    and does not count the attempt as a try.
     """
-    rc, text = dispatch(run, arm, pools, host, prompt, cwd, f"{stem}.log", timeout, mcp_config)
+    rc, text, event = _dispatch_event(run, arm, pools, host, prompt, cwd, f"{stem}.log", timeout, mcp_config,
+                                      role, doing)
+    if event is not None:
+        return None, False, Capped(event)
     if rc == 124:
         return None, False, "timed out"
     try:
@@ -675,8 +751,10 @@ def dispatch_checked(run: ultra.Run, arm: str, pools: dict[str, Pool], host: str
         return None, False, reason
     if cancel is not None and cancel.is_set():
         return None, False, f"{reason}; run interrupted before the repair"
-    rc, text = dispatch(run, arm, pools, host, repair_prompt(first, block, begin, end, header), cwd,
-                        f"{stem}-repair.log", REPAIR_TIMEOUT, mcp_config)
+    rc, text, event = _dispatch_event(run, arm, pools, host, repair_prompt(first, block, begin, end, header), cwd,
+                                      f"{stem}-repair.log", REPAIR_TIMEOUT, mcp_config, role, doing)
+    if event is not None:
+        return None, False, Capped(event)
     if rc == 124:
         return None, False, f"{reason}; repair timed out"
     try:
@@ -691,6 +769,15 @@ def supported(arm: str, pools: dict[str, Pool], host: str) -> bool:
     except ValueError:
         return False
     return True
+
+
+def lead_arm(role: str, pools: dict[str, Pool], quota: dict, *, host: str, allow_lower: bool) -> str | None:
+    """``pick`` for a planner or synthesizer, else the best arm whose command can be made read-only."""
+    arm = pick(role, pools, quota, host=host, allow_lower=allow_lower)
+    if arm is not None and not supported(arm, pools, host):
+        arm = next((other for other in candidates(pools, quota, host=host, allow_lower=allow_lower)
+                    if supported(other, pools, host)), None)
+    return arm
 
 
 def worker_arm(pools: dict[str, Pool], quota: dict, *, tier: str, host: str, allow_lower: bool,
@@ -715,9 +802,26 @@ def worker_arm(pools: dict[str, Pool], quota: dict, *, tier: str, host: str, all
 # -- plan ------------------------------------------------------------------------
 
 def _plan_once(run: ultra.Run, planner: str, pools: dict[str, Pool], host: str, prompt: str, repo: Path | None,
-               max_parts: int, attempt: int, mcp_config: Path | None) -> tuple[ResearchPlan | None, list[str]]:
-    cwd = agent_cwd(planner, pools, host, repo if repo is not None else run.dir, run.dir / "plan" / f"attempt-{attempt}")
-    rc, text = dispatch(run, planner, pools, host, prompt, cwd, f"plan-{attempt}.log", PLANNER_TIMEOUT, mcp_config)
+               max_parts: int, attempt: int, mcp_config: Path | None,
+               allow_lower: bool = False) -> tuple[ResearchPlan | None, list[str]]:
+    quota = run.quota if run.quota is not None else {}
+
+    def again() -> str | None:
+        arm = lead_arm("planner", pools, quota, host=host, allow_lower=allow_lower)
+        if arm is not None:
+            run.progress["planner"] = arm
+        return arm
+
+    def cwd_for(arm: str) -> Path:
+        return agent_cwd(arm, pools, host, repo if repo is not None else run.dir,
+                         run.dir / "plan" / f"attempt-{attempt}")
+
+    planner, rc, text = dispatch_moving(run, "planner", "planning", planner, pools, host, prompt, cwd_for,
+                                        f"plan-{attempt}.log", PLANNER_TIMEOUT, mcp_config, again)
+    if planner is None:
+        # Every arm that could plan is at a usage cap; a re-plan would have nobody to ask.
+        run.stranded = ultra.capped_out(run, "planning", pools, quota, host, allow_lower)
+        return None, [run.stranded]
     if rc == 124:
         return None, ["planner timed out"]
     try:
@@ -729,19 +833,26 @@ def _plan_once(run: ultra.Run, planner: str, pools: dict[str, Pool], host: str, 
 
 
 def _plan(run: ultra.Run, planner: str, pools: dict[str, Pool], host: str, prompt: str, repo: Path | None,
-          max_parts: int, mcp_config: Path | None) -> tuple[ResearchPlan | None, list[str]]:
-    """Plan, and on problems re-plan once with them appended; the planner sees its own mistakes."""
+          max_parts: int, mcp_config: Path | None, allow_lower: bool = False) -> tuple[ResearchPlan | None, list[str]]:
+    """Plan, and on problems re-plan once with them appended; the planner sees its own mistakes.
+
+    A planner at a usage cap is replaced within the attempt (``progress["planner"]``
+    names the arm that planned); when none is left ``run.stranded`` says why.
+    """
     run.step("planning", f"planner {planner} (attempt 1)")
-    plan, problems = _plan_once(run, planner, pools, host, prompt, repo, max_parts, 1, mcp_config)
+    plan, problems = _plan_once(run, planner, pools, host, prompt, repo, max_parts, 1, mcp_config, allow_lower)
     if plan is not None:
         return plan, []
+    if run.stranded:
+        return None, problems
     run.progress["plan_problems"] = list(problems)
     run.note("re-planning once: " + "; ".join(problems))
+    planner = run.progress.get("planner") or planner
     run.step("planning", f"planner {planner} (attempt 2)")
     retry = prompt + ("\n\n# Problems with your previous plan (fix all of them)\n\n"
                       + "\n".join(f"- {problem}" for problem in problems) + "\n")
-    plan, problems = _plan_once(run, planner, pools, host, retry, repo, max_parts, 2, mcp_config)
-    if plan is None:
+    plan, problems = _plan_once(run, planner, pools, host, retry, repo, max_parts, 2, mcp_config, allow_lower)
+    if plan is None and not run.stranded:
         run.progress["plan_problems"].extend(problems)
     return plan, problems
 
@@ -780,12 +891,21 @@ def _run_part(run: ultra.Run, part: Part, arm: str, pools: dict[str, Pool], quot
     The working directory is chosen per attempt (``agent_cwd``): Claude in
     ``repo`` when given, Codex always in ``own_dir``. Once ``cancel`` is set
     the part stops after its current dispatch (which the run has already
-    signalled) instead of retrying on another arm.
+    signalled) instead of retrying on another arm. An arm at a usage cap is
+    not one of the two tries: the part moves on until an arm answers or none is left.
     """
     prompt = part_prompt(question, part, context_note=context_note, mcp_names=mcp_names, repo=repo)
     tried: list[str] = []
     failures: list[str] = []
+    spent = 0
+    skipped: set[str] = set()
     while arm is not None and not (cancel is not None and cancel.is_set()):
+        if run.capped_since(arm, pools) is not None:
+            # Chosen before another part met the cap: the window is spent, so it is not asked.
+            skipped.add(arm)
+            arm = worker_arm(pools, quota, tier=part.tier, host=host, allow_lower=allow_lower,
+                             exclude=set(tried) | skipped)
+            continue
         tried.append(arm)
         with _LOCK:
             run.unit(part.id, arm=arm, state="running", attempts=list(tried))
@@ -793,7 +913,7 @@ def _run_part(run: ultra.Run, part: Part, arm: str, pools: dict[str, Pool], quot
         answer, repaired, why = dispatch_checked(
             run, arm, pools, host, prompt, agent_cwd(arm, pools, host, repo, own_dir), stem, PART_TIMEOUT, mcp_config,
             parse=parse_answer, error=ResearchAnswerError, begin=ANSWER_BEGIN, end=ANSWER_END,
-            header=f"Part id: {part.id}", cancel=cancel)
+            header=f"Part id: {part.id}", cancel=cancel, role="researcher", doing=f"researching {part.id}")
         if answer is None:
             if cancel is not None and cancel.is_set():
                 with _LOCK:
@@ -801,8 +921,12 @@ def _run_part(run: ultra.Run, part: Part, arm: str, pools: dict[str, Pool], quot
                 return {"id": part.id, "state": "interrupted", "arm": arm, "answer": None,
                         "reason": "run interrupted", "attempts": tried}
             failures.append(f"{arm}: {why}")
+            event = getattr(why, "event", None)
+            spent += event is None
             arm = (worker_arm(pools, quota, tier=part.tier, host=host, allow_lower=allow_lower, exclude=set(tried))
-                   if len(tried) < 2 else None)
+                   if spent < 2 else None)
+            if event is not None:
+                run.cap_next(event, arm, pools)
             continue
         atomic_write(run.dir / "parts" / f"{part.id}.json",
                      json.dumps({"id": part.id, "question": part.question, "arm": arm, "attempts": tried,
@@ -935,10 +1059,17 @@ def _summary_md(summary: dict, body: str, answered: dict[str, tuple[Part, Answer
         for provider, labels in summary["quota"].items():
             moved = ", ".join(f"{label} {v['before']} -> {v['after']}" for label, v in labels.items())
             lines.append(f"  - {provider}: {moved}")
+    lines += quota_event_rows(summary)
     if summary["notes"]:
         lines += ["- Notes:"] + [f"  - {note}" for note in summary["notes"][:8]]
     lines += [f"- Run directory: {summary['run_dir']}", f"- Exit: {summary['exit_code']}"]
     return "\n".join(lines) + "\n"
+
+
+def quota_event_rows(summary: dict) -> list[str]:
+    """The "Quota events" rows of a research or team footer: caps hit, and arms skipped for a known one."""
+    events = ultra.quota_lines(summary)
+    return ["- Quota events:"] + [f"  - {line}" for line in events] if events else []
 
 
 def source_renames(renamed: dict[str, list[dict]]) -> list[dict]:
@@ -973,6 +1104,8 @@ def _report(run: ultra.Run, question: str, plan: ResearchPlan | None, body: str,
         "source_renames": source_renames({part_id: answer.renamed for part_id, (_, answer) in answered.items()}),
         "quota": quota_table(usage_before, usage_after), "exit_code": exit_code, "run_dir": str(run.dir),
         "context": run.progress.get("context"), "notes": run.progress.get("notes", []),
+        "quota_events": run.progress.get("quota_events", []),
+        "quota_standing": run.progress.get("quota_standing", []),
     }
     text = _summary_md(summary, body, answered, session_parts)
     atomic_write(run.dir / "summary.md", text)
@@ -1057,25 +1190,26 @@ def _execute(run: ultra.Run, question: str, repo: Path | None, context: str, ses
     quota = cli.fetch_quota()
     usage_before = cli.fetch_usage()
     run.progress["headroom"] = dict(quota)
+    ultra.note_standing_caps(run, pools, quota)
     context_note = ultra._context(run, context, session)
     mcp_config, mcp_info = research_mcp_config(run.dir)
     run.progress["mcp_servers"] = {"loaded": mcp_info["loaded"], "missing": mcp_info["missing"]}
     mcp_names = list(mcp_info["loaded"])
 
-    planner = pick("planner", pools, quota, host=host, allow_lower=allow_lower)
-    if planner is not None and not supported(planner, pools, host):
-        planner = next((arm for arm in candidates(pools, quota, host=host, allow_lower=allow_lower)
-                        if supported(arm, pools, host)), None)
+    planner = lead_arm("planner", pools, quota, host=host, allow_lower=allow_lower)
     if planner is None:
         return _give_up(run, "no usable model has quota to plan (try --allow-lower-models)", question, None,
                         mcp_info, usage_before, json_out)
     run.progress["planner"] = planner
     prompt = research_plan_prompt(question, max_parts=max_parts, context_note=context_note, repo=repo,
                                   mcp_names=mcp_names)
-    plan, problems = _plan(run, planner, pools, host, prompt, repo, max_parts, mcp_config)
+    plan, problems = _plan(run, planner, pools, host, prompt, repo, max_parts, mcp_config, allow_lower)
+    planner = run.progress.get("planner") or planner  # a usage cap may have moved planning to another arm
     if plan is None:
-        return _give_up(run, "could not plan: " + "; ".join(problems), question, None, mcp_info, usage_before,
-                        json_out)
+        reason = "could not plan: " + "; ".join(problems)
+        if run.stranded:
+            print(f"route ultra: {reason}", file=sys.stderr, flush=True)
+        return _give_up(run, reason, question, None, mcp_info, usage_before, json_out)
 
     run.step("assigning", "choosing an arm per part")
     arms: dict[str, str] = {}
@@ -1131,23 +1265,29 @@ def _execute(run: ultra.Run, question: str, repo: Path | None, context: str, ses
 
     answered = {part.id: (part, results[part.id]["answer"]) for part in plan.remote
                 if part.id in results and results[part.id]["state"] == "answered"}
-    synthesizer = pick("integrator", pools, quota, host=host, allow_lower=allow_lower)
-    if synthesizer is not None and not supported(synthesizer, pools, host):
-        synthesizer = next((arm for arm in candidates(pools, quota, host=host, allow_lower=allow_lower)
-                            if supported(arm, pools, host)), None)
+    def synthesis_arm() -> str | None:
+        return lead_arm("integrator", pools, quota, host=host, allow_lower=allow_lower)
+
+    synthesizer = synthesis_arm()
     body = None
     if synthesizer is not None and answered:
         run.step("synthesizing", f"by {synthesizer}")
-        rc, text = dispatch(run, synthesizer, pools, host, synthesis_prompt(question, answered, plan.session),
-                             agent_cwd(synthesizer, pools, host, run.dir, run.dir / "synthesis"), "synthesis.log",
-                             SYNTHESIS_TIMEOUT, mcp_config)
-        try:
-            body = _marked_block(text, REPORT_BEGIN, REPORT_END, ResearchReportError) if rc == 0 else None
-        except ResearchReportError:
-            body = None
-        if not body or not body.strip():
-            run.note(f"synthesizer {synthesizer} delivered no report (exit {rc}); writing the parts as found")
-            body = None
+        first = synthesizer
+        synthesizer, rc, text = dispatch_moving(
+            run, "synthesizer", "synthesizing", synthesizer, pools, host,
+            synthesis_prompt(question, answered, plan.session),
+            lambda arm: agent_cwd(arm, pools, host, run.dir, run.dir / "synthesis"), "synthesis.log",
+            SYNTHESIS_TIMEOUT, mcp_config, synthesis_arm)
+        if synthesizer is None:
+            run.note(f"synthesizer {first} delivered no report (usage caps left no arm); writing the parts as found")
+        else:
+            try:
+                body = _marked_block(text, REPORT_BEGIN, REPORT_END, ResearchReportError) if rc == 0 else None
+            except ResearchReportError:
+                body = None
+            if not body or not body.strip():
+                run.note(f"synthesizer {synthesizer} delivered no report (exit {rc}); writing the parts as found")
+                body = None
     if body is None:
         synthesizer = None
         body = fallback_report(question, [answered[key] for key in answered])

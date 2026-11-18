@@ -105,16 +105,20 @@ def _estimate_lexical(text: str) -> str:
     return "hard"
 
 
-def estimate_complexity(text: str, *, use_taskgauge: bool = True) -> str:
+def estimate_complexity(text: str, *, use_taskgauge: bool = True, estimate: str | None = None) -> str:
     """Best-available tier for ``text``; always a member of ``TIERS``.
+
+    ``estimate`` is a tier already worked out elsewhere (the optional Jev
+    classifier); when valid it stands in for taskgauge and the lexical scorer.
+    The floors below still apply to it.
 
     Feature builds floor at ``moderate`` (the enum's medium tier), or ``hard``
     when at least three distinct component kinds are named. Long-horizon
     tasks also floor at ``hard``. Floors apply to either estimator without
     downgrading a stronger estimate, including ``open-ended``.
     """
-    tier = None
-    if use_taskgauge:
+    tier = estimate if estimate in TIERS else None
+    if tier is None and use_taskgauge:
         tier = _estimate_taskgauge(text)
     if tier is None:
         tier = _estimate_lexical(text)

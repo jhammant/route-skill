@@ -53,6 +53,7 @@ from .digest import CONTEXT_LEVELS, DEFAULT_MAX_CHARS, find_transcript, build_di
 from .eligibility import fetch_usage, probably_private, quota_keys, quota_provider, quotamax_available
 from .sensitive import detect_sensitive
 from .shapes import SHAPES, ShapeClassification, classify_with_confidence
+from . import jevclass
 from .ship import RunResult, ShipAbort, build_pr_body, ship
 from .stats import report_quota, Decision, Stats, report_arm, report_cells, report_throughput
 from .storage import JsonStorage
@@ -101,8 +102,6 @@ def plan_task(text: str, opts: argparse.Namespace, *, quota=None, exclude=(),
     pools = pools_for_host(load_pools(), host)
     classification = (ShapeClassification(args.shape, "high", "explicit") if args.shape else
                       classify_with_confidence(text, use_llm=args.llm_shape))
-    shape = classification.shape
-    tier = args.tier or estimate_complexity(text)
     long_horizon = is_long_horizon(text)
     if quota is None:
         quota = ({} if args.no_quota else
@@ -152,6 +151,23 @@ def plan_task(text: str, opts: argparse.Namespace, *, quota=None, exclude=(),
             auto_sensitive = True
     if getattr(args, "allow_network", False) and sensitive:
         raise PlanningError("--allow-network cannot be combined with a sensitive task", 2)
+
+    # Optional Jev classifier (off unless ROUTE_JEV=1 or config.toml [classify] jev = true). It sends
+    # the task text to an outside service, so it runs only now that the data class is known, and never
+    # for a sensitive or private task. An explicit --shape / --tier is never second-guessed.
+    jev_reading = None
+    if ((not args.shape or not args.tier) and not sensitive and not args.private
+            and not getattr(args, "no_jev", False) and jevclass.enabled()):
+        jev_reading = jevclass.classify(text)
+    if not args.shape:
+        classification = jevclass.refine_shape(classification, jev_reading, text)
+    shape = classification.shape
+    if args.tier:
+        tier, tier_source = args.tier, "explicit"
+    elif jev_reading is not None and jev_reading.tier:
+        tier, tier_source = estimate_complexity(text, estimate=jev_reading.tier), "jev"
+    else:
+        tier, tier_source = estimate_complexity(text), "estimate"
 
     try:
         result = gate(
@@ -241,6 +257,7 @@ def plan_task(text: str, opts: argparse.Namespace, *, quota=None, exclude=(),
         "why": why,
         "shape_confidence": classification.confidence,
         "shape_source": classification.source,
+        "tier_source": tier_source,
         "quota_adjustment": adjustments,
         "surplus_bonus": adjustments,  # deprecated signed alias for one release
         "neighbours": neighbours,
@@ -1023,6 +1040,8 @@ def _add_task_flags(p: argparse.ArgumentParser) -> None:
     llm = p.add_mutually_exclusive_group()
     llm.add_argument("--llm-shape", action="store_true", help="resolve low-confidence shapes with the local LLM")
     llm.add_argument("--no-llm", action="store_true", help="skip the local-LLM shape tiebreak (default)")
+    p.add_argument("--no-jev", action="store_true",
+                   help="skip the Jev classifier for this task, when it is turned on (ROUTE_JEV / config.toml)")
     p.add_argument("--no-quota", action="store_true", help="skip quotamax")
     swarm = p.add_mutually_exclusive_group()
     swarm.add_argument("--swarm", dest="swarm", action="store_true", default=None,

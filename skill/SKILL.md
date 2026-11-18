@@ -69,6 +69,8 @@ Then:
   count for this decision only.
 - `shape_confidence: low` with a `suggest`: the classifier wasn't sure. Re-run
   with the suggested `--shape/--tier`, or `--llm-shape`, before dispatching.
+  `shape_source: jev` / `tier_source: jev` mean the optional Jev classifier set them
+  (on with `ROUTE_JEV=1` or `[classify] jev = true` in config.toml; `--no-jev` skips it once).
   Feature builds floor at `moderate`, or `hard` with three distinct component
   kinds (route, endpoint, migration, webhook, worker, test, flag).
 - `removed_by_cost`: paid arms (deepseek) are only eligible when no included,

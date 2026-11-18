@@ -904,6 +904,40 @@ supported. Errors or off-enum LLM replies keep the deterministic result and low
 confidence. An explicit `--shape` wins over both paths. The shape vocabulary
 and federation schema are unchanged.
 
+### Optional: classify with Jev
+
+The rules above are regexes, so "build a report generator that summarises each
+customer's usage" reads as `batch:summarize` and most tasks score `trivial`.
+[Jev](https://docs.typesafe.ai) (TypeSafe AI's typed-decision model) can answer
+both questions in one call of a few hundred tokens: which of the closed shapes
+the task is, and where it sits on the tier scale. On 44 hand-labelled tasks it
+got 44 shapes right against the rules' 30, and was within one tier on 43
+against the rules' 32.
+
+It is **off by default**, because it sends the task text to an outside service.
+Turn it on with `ROUTE_JEV=1`, or in `~/.config/route/config.toml`:
+
+```toml
+[classify]
+jev = true
+```
+
+It needs a `jev` command on PATH (or `ROUTE_JEV_CMD`) that accepts
+`jev ask --questions FILE --file - --json` and prints the API's JSON reply.
+
+- A sensitive or private task is never sent (`--sensitive`, `--private`, a
+  `sensitive.toml` path, or the content safety net).
+- An explicit `--shape` or `--tier` is never second-guessed.
+- Jev's shape replaces the rules only when it gives its pick a probability of
+  0.5 or more, and a `batch:*` answer still needs the rules' own volume cue.
+- The feature-build and long-horizon tier floors still apply.
+- Any failure (no command, no key, a timeout) leaves the plan exactly as the
+  rules made it.
+- `--no-jev` skips it for one task. The plan shows `shape_source: jev` and
+  `tier_source: jev` when it was used.
+
+The questions and thresholds are in `src/route/jevclass.py`.
+
 ## The arms and their cost classes
 
 Each arm declares a **cost class**. After shape, health, sensitivity and quota

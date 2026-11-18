@@ -45,6 +45,10 @@ def isolated_env(tmp_path, monkeypatch):
     # how the host arm is gated; the tests that cover those modes set them explicitly.
     monkeypatch.delenv("CLAUDE_WORK_ACCOUNT", raising=False)
     monkeypatch.delenv("ROUTE_WORKER", raising=False)
+    # The Jev classifier calls an outside service: off in every test unless the test turns it on
+    # and hands in a stand-in.
+    monkeypatch.delenv("ROUTE_JEV", raising=False)
+    monkeypatch.delenv("ROUTE_JEV_CMD", raising=False)
     # Default: every subcommand an arm requires is present. Tests of the
     # missing-subcommand path override this.
     monkeypatch.setattr("route.eligibility.subcommand_available", lambda spec: True)

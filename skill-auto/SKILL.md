@@ -58,6 +58,9 @@ three distinct component kinds (route, endpoint, migration, webhook, worker,
 test, flag). Similar settled tasks appear in `neighbours`; their evidence is
 temporary, and the local hashed-token memory never federates.
 
+When the plan shows `shape_source: jev`, the optional Jev classifier set the shape
+(and `tier_source: jev` the tier); override with `--shape/--tier` if it is plainly wrong.
+
 Codex runs in a `workspace-write` sandbox with the network off, local sockets
 included, so a job whose tests open a port fails there. Pass `--allow-network` to
 turn the network on for that one Codex run (`-c sandbox_workspace_write.network_access=true`;

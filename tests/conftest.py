@@ -38,6 +38,9 @@ def isolated_env(tmp_path, monkeypatch):
     # The codex arm reads its model from $CODEX_HOME/config.toml; never the
     # developer's real one.
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex-home"))
+    # Usage caps are read from claude-swarm's own record too; never the developer's real one.
+    monkeypatch.setenv("CLAUDE_SWARM_STATE", str(tmp_path / "claude-swarm-state"))
+    monkeypatch.setenv("CLAUDE_SWARM_CONFIG", str(tmp_path / "claude-swarm-config" / "accounts.json"))
     # A claude-work session (or a route worker) running the suite must not change
     # how the host arm is gated; the tests that cover those modes set them explicitly.
     monkeypatch.delenv("CLAUDE_WORK_ACCOUNT", raising=False)

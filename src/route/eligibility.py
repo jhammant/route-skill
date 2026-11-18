@@ -249,11 +249,16 @@ def quotamax_available(cmd: tuple[str, ...] = ("quotamax", "agent", "--json")) -
 
 
 class QuotaSnapshot(dict):
-    """Headroom mapping, with weekly windows retained from the same probes."""
+    """Headroom mapping, with weekly windows retained from the same probes.
+
+    ``caps`` are the usage caps models have reported and that have not reset
+    (see ``caps``); their keys are already ``critical`` in the mapping.
+    """
 
     def __init__(self, headroom: dict[str, str], weekly: dict[str, dict]):
         super().__init__(headroom)
         self.weekly = weekly
+        self.caps: list[dict] = []
 
 
 QUOTA_CACHE_SECONDS = 300
@@ -310,7 +315,13 @@ def fetch_quota(cmd: tuple[str, ...] = ("quotamax", "agent", "--json"), timeout:
                  for key, value in parse_quota(payload).items()}
         if "deepseek" not in quota:
             quota["deepseek"] = deepseek_headroom(payloads[0], timeout=min(timeout, 2.0))
-        return QuotaSnapshot(quota, parse_weekly(*payloads))
+        snapshot = QuotaSnapshot(quota, parse_weekly(*payloads))
+        # quotamax reads percentages; a model that has said "you've hit your limit" is spent
+        # whatever the percentage says (or when quotamax reports no window for it at all).
+        from .caps import apply_caps
+
+        snapshot.caps = apply_caps(snapshot)
+        return snapshot
     return _fetch_quota(cmd, timeout)
 
 
@@ -385,6 +396,16 @@ def quota_keys(arm: str, pools: dict[str, Pool] | None = None) -> list[str]:
     pool = (pools or {}).get(arm)
     scope = pool.quota_scope if pool is not None else ""
     return [provider, f"{provider}:{scope}"] if scope else [provider]
+
+
+#: Prefix of the quota key that removes one arm by name: an arm that reported a usage
+#: cap is spent whether or not its pool declares the window the cap belongs to.
+ARM_KEY = "arm:"
+
+
+def gate_keys(arm: str, pools: dict[str, Pool] | None = None) -> list[str]:
+    """Every key whose ``critical`` removes the arm: its quota keys, then the arm's own cap key."""
+    return quota_keys(arm, pools) + [ARM_KEY + arm]
 
 
 def parse_usage(agent, providers) -> dict[str, dict[str, float]]:
@@ -538,7 +559,7 @@ def gate(
     if sensitive:
         eligible, removed_sensitive = sensitive_veto(eligible, pools, host=host)
     if quota:
-        survivors = apply_quota(eligible, quota, quota_pool={arm: quota_keys(arm, pools) for arm in eligible})
+        survivors = apply_quota(eligible, quota, quota_pool={arm: gate_keys(arm, pools) for arm in eligible})
         removed = [a for a in eligible if a not in survivors]
         eligible = survivors
     else:

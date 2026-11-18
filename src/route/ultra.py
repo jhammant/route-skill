@@ -25,18 +25,22 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
-from . import cli
+from . import caps, cli
 from .digest import digest_preamble, write_digest
+from .eligibility import gate_keys
 from .pools import Pool, pool_family, pools_for_host
 from .storage import atomic_write, state_dir
-from .swarm_dispatch import is_artefact, run_swarm_manifest, signal_tree, stage_argv, swarm_dir
+from .swarm_dispatch import (is_artefact, render_brief, run_swarm_manifest, signal_tree, stage_argv,
+                             swarm_dir)
 from .swarm_status import utc_now
 from .ultra_plan import Plan, PlanError, lint_plan, merge_overlaps, parse_plan, planner_prompt, to_manifest
 from .ultra_review import (Finding, confirm, fix_prompt, merge_prompt, needs_review, parse_review, resolved,
                            review_prompt, unit_diff)
 from .ultra_safety import run_checked, screen_digest
-from .ultra_select import candidates, dispatch_template, pick, review_independence, pinned, set_pin
+from .ultra_select import (candidates, dispatch_template, model_label, model_rank, pick, review_independence,
+                           pinned, set_pin)
 
 RUN_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,80}$")
 SCHEMA = "route-ultra-progress/1"
@@ -45,6 +49,8 @@ MAX_FIX_PASSES = 2
 PLANNER_TIMEOUT = 1800
 REVIEW_TIMEOUT = 1800
 FIX_TIMEOUT = 3600
+#: A unit rebuilt on another arm after its worker hit a usage cap gets what the swarm gave the first.
+UNIT_TIMEOUT = 3600
 CHECK_TIMEOUT = 600
 #: How long a cancel waits for SIGTERM to work before it sends SIGKILL.
 CANCEL_GRACE = 5.0
@@ -79,12 +85,17 @@ class Run:
         self.dir = ultra_dir(run_id)
         self.lock = threading.RLock()
         self._arm_slots: dict[str, threading.BoundedSemaphore] = {}
+        #: The run's live quota mapping (set by the run once it has one), so a cap can be
+        #: marked from code that was not handed it.
+        self.quota: dict | None = None
+        #: Why the run could not go on, once every arm that could plan was at a usage cap.
+        self.stranded = ""
         self.progress: dict = {
             "schema": SCHEMA, "run_id": run_id, "goal": goal, "repo": str(repo), "base": base,
             "base_sha": None, "host": host, "pid": os.getpid(), "state": "starting", "step": "",
             "started_at": utc_now(), "updated_at": None, "finished_at": None, "exit_code": None,
             "context": {}, "planner": None, "plan_problems": [], "pids": [], "units": {}, "held": [],
-            "integration": {}, "notes": [],
+            "integration": {}, "notes": [], "quota_events": [], "quota_standing": [],
         }
 
     def save(self) -> None:
@@ -124,6 +135,45 @@ class Run:
         with self.lock:
             self.progress.update(state=state, exit_code=exit_code, finished_at=utc_now(), pids=[])
             self.save()
+
+    def cap_hit(self, role: str, doing: str, arm: str, cap: caps.Cap, pools: dict[str, Pool],
+                quota: dict | None = None) -> dict:
+        """Record that ``arm`` reported a usage cap while ``doing`` something; the run's quota event.
+
+        The cap's keys go ``critical`` in the run's quota mapping, so no later
+        pick in this run returns the arm or anything on the same model window,
+        and the cap is remembered for later runs (``caps.record_cap``).
+        """
+        quota = self.quota if quota is None else quota
+        record = caps.record_cap(arm, pools, cap, source=f"ultra:{self.id}:{role}")
+        if quota is not None:
+            caps.mark(quota, record["keys"])
+        event = {"at": utc_now(), "role": role, "doing": doing, "arm": arm, "model": cap.model,
+                 "window": cap.window, "resets": cap.resets, "resets_at": cap.resets_at, "keys": record["keys"],
+                 "also_out": [other for other in caps.exhausted_arms(record["keys"], pools) if other != arm],
+                 "message": cap.message, "fallback": None, "fallback_model": ""}
+        with self.lock:
+            self.progress["quota_events"].append(event)
+            self.save()
+        return event
+
+    def capped_since(self, arm: str, pools: dict[str, Pool]) -> dict | None:
+        """The quota event that has taken ``arm`` out of this run, if a cap met so far covers it.
+
+        An arm chosen before the cap was met (a queued part, a verifier) asks
+        this before it starts, so a spent window is not asked again.
+        """
+        keys = {key.lower() for key in gate_keys(arm, pools)}
+        with self.lock:
+            return next((event for event in self.progress["quota_events"]
+                         if keys & {key.lower() for key in event["keys"]}), None)
+
+    def cap_next(self, event: dict, arm: str | None, pools: dict[str, Pool]) -> None:
+        """Say, once and on stderr, what the capped role does now: move to ``arm``, or stop."""
+        with self.lock:
+            event.update(fallback=arm, fallback_model=model_label(pools[arm]) if arm in pools else "")
+            self.save()
+        print(f"ultra: {quota_event_line(event)}", file=sys.stderr, flush=True)
 
     def arm_slot(self, arm: str, pool: Pool) -> threading.BoundedSemaphore:
         """Share one dispatch cap across roles; never wait while holding the progress lock."""
@@ -167,6 +217,106 @@ def _dispatch(run: Run, arm: str, pools: dict[str, Pool], host: str, prompt: str
         return rc, log.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return rc, ""
+
+
+# -- usage caps ------------------------------------------------------------------
+
+def quota_event_line(event: dict) -> str:
+    """One line for a quota event: what was capped, when it resets, and what the role did next."""
+    doing = event.get("doing") or event.get("role") or "the work"
+    if event.get("fallback"):
+        label = f" ({event['fallback_model']})" if event.get("fallback_model") else ""
+        return f"{caps.describe(event)}; {doing} on {event['fallback']}{label} instead"
+    return f"{caps.describe(event)}; no other arm left for {doing}"
+
+
+def quota_lines(progress: dict) -> list[str]:
+    """What status and the summaries say about quota: caps hit in the run, then arms skipped for a known one."""
+    lines = [quota_event_line(event) for event in progress.get("quota_events") or []]
+    for row in progress.get("quota_standing") or []:
+        limit = " ".join(part for part in (row.get("model"), row.get("window")) if part)
+        lines.append(f"skipped {', '.join(row['arms'])}: already at {'its ' + limit if limit else 'a usage'} limit"
+                     + (f" until {row['resets']}" if row.get("resets") else "")
+                     + (f" (seen by {row['source']})" if row.get("source") else ""))
+    return lines
+
+
+def note_standing_caps(run: Run, pools: dict[str, Pool], quota: dict) -> None:
+    """Attach the run's quota mapping, and flag the arms a cap from an earlier run has already removed.
+
+    The records come with the quota snapshot (route's own and claude-swarm's);
+    a run that silently planned on its second choice would look like a bug.
+    """
+    run.quota = quota
+    standing = []
+    for row in getattr(quota, "caps", None) or []:
+        arms = caps.exhausted_arms(row["keys"], pools)
+        if arms:
+            standing.append({"arms": arms, "keys": row["keys"], "model": row.get("model", ""),
+                             "window": row.get("window", ""), "resets": row.get("resets", ""),
+                             "resets_at": row.get("resets_at"), "source": row.get("source", "")})
+    with run.lock:
+        run.progress["quota_standing"] = standing
+        run.save()
+    for line in quota_lines({"quota_standing": standing}):
+        print(f"ultra: {line}", file=sys.stderr, flush=True)
+
+
+def capped_out(run: Run, doing: str, pools: dict[str, Pool], quota: dict, host: str, allow_lower: bool) -> str:
+    """Why nothing can take over ``doing``: what was capped, when it resets, and how to rerun."""
+    with run.lock:
+        events = list(run.progress.get("quota_events") or [])
+    seen: dict[str, str] = {}
+    for event in events:
+        seen.setdefault(event["arm"], caps.describe(event))
+    resets = sorted({(event["resets_at"], event["resets"]) for event in events if event.get("resets_at")})
+    # --pool pins this run; a pool outside the pin that still has quota is the first thing to try.
+    unpinned = [arm for arm in candidates(pools, quota, host=host, allow_lower=allow_lower)
+                if arm not in pinned([arm], "planner")]
+    # --allow-lower-models is for the Sonnet/Kimi class; a free or local arm is not a planner to suggest.
+    lower = [] if allow_lower else [arm for arm in candidates(pools, quota, host=host, allow_lower=True)
+                                    if model_rank(pools[arm]) >= 1]
+    advice = (f"Rerun with --pool {unpinned[0]}" if unpinned else
+              f"Rerun with --allow-lower-models ({lower[0]} has quota)" if lower else "")
+    if resets:
+        advice = (f"{advice}, or wait for the reset ({resets[0][1]})" if advice else
+                  f"No other model has quota: rerun after the reset ({resets[0][1]})")
+    return f"no model left for {doing}: " + "; ".join(seen.values()) + f". {advice or 'No other model has quota'}."
+
+
+def _set_aside(log: Path, arm: str) -> None:
+    """Keep a capped attempt's log beside the one the next arm writes."""
+    try:
+        os.replace(log, log.with_name(f"{log.stem}.capped-{arm}{log.suffix}"))
+    except OSError:
+        pass
+
+
+def _dispatch_role(run: Run, role: str, doing: str, arm: str, pools: dict[str, Pool], quota: dict, host: str,
+                   prompt: str, cwd: Path, log_name: str, timeout: float, again) -> tuple[str | None, int, str]:
+    """``_dispatch`` that survives a usage cap: (the arm that answered or None, exit code, output).
+
+    When the arm's output is a cap, its window is marked spent for the run and
+    the role moves to whatever ``again()`` picks next; the capped arm is never
+    asked twice. None means every candidate was capped, and the output
+    returned is the last cap message.
+    """
+    tried: set[str] = set()
+    while True:
+        tried.add(arm)
+        rc, text = _dispatch(run, arm, pools, host, prompt, cwd, log_name, timeout)
+        cap = caps.detect_cap(text, rc)
+        if cap is None:
+            return arm, rc, text
+        _set_aside(run.dir / "logs" / log_name, arm)
+        event = run.cap_hit(role, doing, arm, cap, pools, quota)
+        following = again()
+        if following in tried:
+            following = None
+        run.cap_next(event, following, pools)
+        if following is None:
+            return None, rc, text
+        arm = following
 
 
 @contextlib.contextmanager
@@ -298,36 +448,60 @@ def _context(run: Run, context: str, session: str | None) -> str:
 
 # -- plan ----------------------------------------------------------------------
 
-def _plan_once(run: Run, planner: str, pools: dict[str, Pool], host: str, prompt: str,
-               repo: Path, base_sha: str, max_units: int, attempt: int) -> tuple[Plan | None, list[str]]:
+def _plan_once(run: Run, planner: str, pools: dict[str, Pool], quota: dict, host: str, allow_lower: bool,
+               prompt: str, repo: Path, base_sha: str, max_units: int,
+               attempt: int) -> tuple[Plan | None, list[str], str | None]:
+    """One planning attempt: (plan, problems, the arm that planned). The arm is None, with the
+    reason as the only problem, when every arm that could plan turned out to be at a usage cap."""
+    def again() -> str | None:
+        arm = pick("planner", pools, quota, host=host, allow_lower=allow_lower)
+        if arm is not None:
+            with run.lock:
+                run.progress["planner"] = arm
+            run.step("planning", f"planner {arm} (attempt {attempt})")
+        return arm
+
     with _throwaway(repo, run.dir / f"plan-{attempt}", base_sha) as worktree:
-        rc, text = _dispatch(run, planner, pools, host, prompt, worktree, f"plan-{attempt}.log", PLANNER_TIMEOUT)
+        planner, rc, text = _dispatch_role(run, "planner", "planning", planner, pools, quota, host, prompt, worktree,
+                                           f"plan-{attempt}.log", PLANNER_TIMEOUT, again)
+    if planner is None:
+        run.stranded = capped_out(run, "planning", pools, quota, host, allow_lower)
+        return None, [run.stranded], None
     if rc == 124:
-        return None, ["planner timed out"]
+        return None, ["planner timed out"], planner
     try:
         plan = merge_overlaps(parse_plan(text))
     except PlanError as exc:
-        return None, [str(exc)]
+        return None, [str(exc)], planner
     problems = lint_plan(plan, max_units=max_units)
-    return (plan, []) if not problems else (None, problems)
+    return (plan, [], planner) if not problems else (None, problems, planner)
 
 
-def _plan(run: Run, planner: str, pools: dict[str, Pool], host: str, goal: str, repo: Path, base: str,
-          base_sha: str, max_units: int, context_note: str) -> tuple[Plan | None, list[str]]:
-    """Plan, and on problems re-plan once with them appended; the planner sees its own mistakes."""
+def _plan(run: Run, planner: str, pools: dict[str, Pool], quota: dict, host: str, allow_lower: bool, goal: str,
+          repo: Path, base: str, base_sha: str, max_units: int,
+          context_note: str) -> tuple[Plan | None, list[str]]:
+    """Plan, and on problems re-plan once with them appended; the planner sees its own mistakes.
+
+    A planner at a usage cap has made no mistake to learn from: the attempt
+    moves to the next arm instead (``_dispatch_role``) and is not the re-plan.
+    ``progress["planner"]`` names the arm that last planned. When no arm was
+    left to, the only problem is that reason and ``run.stranded`` carries it.
+    """
     prompt = planner_prompt(goal, repo=repo, base=base, max_units=max_units, context_note=context_note)
     run.step("planning", f"planner {planner} (attempt 1)")
-    plan, problems = _plan_once(run, planner, pools, host, prompt, repo, base_sha, max_units, 1)
-    if plan is not None:
-        return plan, []
+    plan, problems, planner = _plan_once(run, planner, pools, quota, host, allow_lower, prompt, repo, base_sha,
+                                         max_units, 1)
+    if plan is not None or planner is None:
+        return plan, problems
     with run.lock:
         run.progress["plan_problems"] = list(problems)
     run.note("re-planning once: " + "; ".join(problems))
     run.step("planning", f"planner {planner} (attempt 2)")
     retry = prompt + ("\n\n# Problems with your previous plan (fix all of them)\n\n"
                       + "\n".join(f"- {problem}" for problem in problems) + "\n")
-    plan, problems = _plan_once(run, planner, pools, host, retry, repo, base_sha, max_units, 2)
-    if plan is None:
+    plan, problems, planner = _plan_once(run, planner, pools, quota, host, allow_lower, retry, repo, base_sha,
+                                         max_units, 2)
+    if plan is None and planner is not None:
         with run.lock:
             run.progress["plan_problems"].extend(problems)
     return plan, problems
@@ -438,15 +612,27 @@ def _review_unit(run: Run, unit: dict, row: dict, pools: dict[str, Pool], quota:
         return []
     tried: list[str] = []
     failures: list[str] = []
+
+    def another() -> str | None:
+        return _another_reviewer(tried, row["arm"], pools, quota, host, allow_lower)
+
     while reviewer is not None:
         tried.append(reviewer)
-        independence = review_independence(row["arm"], reviewer, pools)
-        run.step("reviewing", f"{unit_id} by {reviewer} ({independence})")
+        run.step("reviewing", f"{unit_id} by {reviewer} ({review_independence(row['arm'], reviewer, pools)})")
         try:
             with _throwaway(repo, run.dir / "review" / unit_id, row["branch"]) as review_wt:
-                rc, text = _dispatch(run, reviewer, pools, host, review_prompt(unit, diff), review_wt,
-                                     f"review-{unit_id}-{len(tried)}.log", REVIEW_TIMEOUT)
-                carried = _carry_review_tests(review_wt, worktree, unit_id, branch=row.get("branch"))
+                # A reviewer at a usage cap has reviewed nothing: the review moves to the next
+                # arm (another family first) and that is not one of the two tries.
+                answered, rc, text = _dispatch_role(
+                    run, "reviewer", f"reviewing {unit_id}", reviewer, pools, quota, host, review_prompt(unit, diff),
+                    review_wt, f"review-{unit_id}-{len(tried)}.log", REVIEW_TIMEOUT, another)
+                carried = ([] if answered is None else
+                           _carry_review_tests(review_wt, worktree, unit_id, branch=row.get("branch")))
+            if answered is None:
+                tried.pop()
+                break
+            reviewer = tried[-1] = answered
+            independence = review_independence(row["arm"], reviewer, pools)
             findings = parse_review(rc, text)
         except (RuntimeError, ValueError) as exc:
             failures.append(f"{reviewer}: {exc}")
@@ -461,6 +647,10 @@ def _review_unit(run: Run, unit: dict, row: dict, pools: dict[str, Pool], quota:
             "advisory": [finding.to_dict() for finding in advisory], "carried_tests": carried,
             "attempts": list(tried), "note": "; ".join(failures)})
         return confirmed
+    if not failures:
+        # Every reviewer left was at a usage cap: the same as starting with none that has quota.
+        run.unit(unit_id, review={"skipped": "no reviewer with quota (usage caps)", "attempts": tried})
+        return []
     reason = "review failed: " + "; ".join(failures)
     run.unit(unit_id, state="review failed", reason=reason, review={"attempts": tried, "failed": failures})
     return None
@@ -476,9 +666,11 @@ def _pick_fixer(pass_no: int, previous: list[str], author: str, pools: dict[str,
     if pass_no == 1 or not previous:
         return pick("fixer", pools, quota, host=host, author_arm=author, allow_lower=allow_lower)
     first = previous[-1]
-    others = pinned(candidates(pools, quota, host=host, allow_lower=allow_lower, exclude_arms={first}), "fixer")
+    usable = pinned(candidates(pools, quota, host=host, allow_lower=allow_lower), "fixer")
+    others = [arm for arm in usable if arm != first]
     if not others:
-        return first
+        # The first fixer again, unless it has since hit a usage cap (which takes it out of ``usable``).
+        return first if first in usable else None
     if first == author:
         family = pool_family(pools[author])
         same = [arm for arm in others if pool_family(pools[arm]) == family]
@@ -518,7 +710,19 @@ def _fix_unit(run: Run, unit: dict, row: dict, confirmed: list[Finding], pools: 
         run.unit(unit_id, state="fixing", fix_passes=pass_no, fixers=list(fixers))
         run.step("fixing", f"{unit_id} pass {pass_no} by {fixer}")
         prompt = fix_prompt(unit, check_output=check_output, confirmed=outstanding, pass_no=pass_no)
-        _dispatch(run, fixer, pools, host, prompt, worktree, f"fix-{unit_id}-{pass_no}.log", FIX_TIMEOUT)
+        # A fixer at a usage cap fixed nothing: the pass goes to the next fixer, and is still this pass.
+        answered, _, _ = _dispatch_role(
+            run, "fixer", f"fixing {unit_id}", fixer, pools, quota, host, prompt, worktree,
+            f"fix-{unit_id}-{pass_no}.log", FIX_TIMEOUT,
+            lambda: _pick_fixer(pass_no, fixers[:-1], author, pools, quota, host, allow_lower))
+        if answered is None:
+            fixers.pop()
+            run.unit(unit_id, fix_passes=pass_no - 1, fixers=list(fixers))
+            reason = "no fixer with quota (usage caps)"
+            break
+        if answered != fixer:
+            fixers[-1] = answered
+            run.unit(unit_id, fixers=list(fixers))
         result = run_checked(unit["check"], worktree, timeout=CHECK_TIMEOUT)
         check_output = None if result.rc == 0 else result.output
         _, outstanding = resolved(confirmed, worktree, timeout=CHECK_TIMEOUT)
@@ -537,6 +741,53 @@ def _fix_unit(run: Run, unit: dict, row: dict, confirmed: list[Finding], pools: 
     run.unit(unit_id, state="failed", reason=reason or "unresolved after fix passes",
              outstanding=[finding.to_dict() for finding in outstanding])
     return False
+
+
+def _rebuild_unit(run: Run, unit: dict, row: dict, manifest: dict, pools: dict[str, Pool], quota: dict,
+                  host: str, allow_lower: bool, base_sha: str) -> bool:
+    """Build a unit again after its worker hit a usage cap; False when no arm is left to.
+
+    The swarm ran the unit on an arm that answered with a cap message, so
+    nothing was built and nothing was checked. The next worker arm gets the
+    same brief in the same worktree, then the unit's check; its result stands
+    as the unit's (``row`` is updated in place) and review and fixes follow as
+    for any other unit. This is the build, not a fix pass.
+    """
+    unit_id, worktree, capped_arm = unit["id"], Path(row["worktree"]), row["arm"]
+    doing = f"building {unit_id}"
+
+    def again() -> str | None:
+        return pick("worker", pools, quota, tier=unit.get("tier") or "moderate", host=host, allow_lower=allow_lower)
+
+    event = run.cap_hit("worker", doing, capped_arm, caps.Cap.from_dict(row["capped"]), pools, quota)
+    arm = again()
+    run.cap_next(event, arm, pools)
+    rc = None
+    log = run.dir / "logs" / f"build-{unit_id}.log"
+    if arm is not None:
+        run.unit(unit_id, arm=arm, state="rebuilding", reason=None, rebuilt_after_cap=capped_arm)
+        run.step("running", f"{unit_id} again on {arm} ({capped_arm} hit a usage cap)")
+        brief = render_brief(manifest, SimpleNamespace(unit=unit, channel_capable=False), [])
+        arm, rc, _ = _dispatch_role(run, "worker", doing, arm, pools, quota, host, brief, worktree, log.name,
+                                    UNIT_TIMEOUT, again)
+    if arm is None:
+        run.unit(unit_id, state="failed", reason=f"not built: {capped_out(run, doing, pools, quota, host, allow_lower)}")
+        return False
+    result = run_checked(unit["check"], worktree, timeout=CHECK_TIMEOUT)
+    with log.open("a", encoding="utf-8") as output:
+        output.write(f"\nAcceptance check: {unit['check']}\n{result.output}")
+    accepted, reason = result.rc == 0 and rc != 124, None
+    if not accepted:
+        reason = f"check failed (agent exit {rc})"
+    try:
+        _commit_if_changed(worktree, f"ultra({unit_id}): {arm} result", branch=row.get("branch"))
+    except CommitError as exc:
+        accepted, reason = False, f"result could not be kept: {exc}"
+    row.update(arm=arm, accepted=accepted, agent_rc=rc, log=str(log), rebuilt_after_cap=capped_arm)
+    run.unit(unit_id, arm=arm, state="accepted" if accepted else "failed", agent_rc=rc, log=str(log), reason=reason,
+             rebuilt_after_cap=capped_arm)
+    _record_scope(run, unit, row, base_sha)
+    return True
 
 
 # -- integrate and settle ------------------------------------------------------
@@ -592,19 +843,22 @@ def _integrate(run: Run, plan: Plan, rows: dict[str, dict], sound: set[str], rep
             run.step("integrating", f"goal check failed (exit {check.rc}); fix pass by {integrator}")
             unit = {"id": "integration", "task": f"{goal}\n\n(The units are merged on branch {branch}; "
                     "make the whole goal pass its check.)", "check": plan.goal_check}
-            rc, _ = _dispatch(run, integrator, pools, host,
-                              fix_prompt(unit, check_output=check.output, confirmed=[], pass_no=1),
-                              path, "integration-fix.log", FIX_TIMEOUT)
-            with run.lock:
-                result["fix"] = {"arm": integrator, "agent_rc": rc}
-            try:
-                _commit_if_changed(path, f"ultra({run.id}): integration fix", branch=branch, base_sha=base_sha)
-            except CommitError as exc:
-                # The goal check must speak for the branch, so an unkept fix is not re-checked.
+            integrator, rc, _ = _dispatch_role(
+                run, "integrator", "fixing the goal check", integrator, pools, quota, host,
+                fix_prompt(unit, check_output=check.output, confirmed=[], pass_no=1), path, "integration-fix.log",
+                FIX_TIMEOUT, lambda: pick("integrator", pools, quota, host=host, allow_lower=allow_lower))
+            # None: every integrator was at a usage cap, so there is no fix to keep or re-check.
+            if integrator is not None:
                 with run.lock:
-                    result["error"] = f"integration fix not kept: {exc}"
-            else:
-                check = run_checked(plan.goal_check, path, timeout=CHECK_TIMEOUT)
+                    result["fix"] = {"arm": integrator, "agent_rc": rc}
+                try:
+                    _commit_if_changed(path, f"ultra({run.id}): integration fix", branch=branch, base_sha=base_sha)
+                except CommitError as exc:
+                    # The goal check must speak for the branch, so an unkept fix is not re-checked.
+                    with run.lock:
+                        result["error"] = f"integration fix not kept: {exc}"
+                else:
+                    check = run_checked(plan.goal_check, path, timeout=CHECK_TIMEOUT)
     with run.lock:
         result.update(goal_check_passed=check.rc == 0, goal_check_rc=check.rc, goal_check_output=check.output[-4000:])
         run.save()
@@ -678,9 +932,16 @@ def _merge_unit(run: Run, unit: dict, unit_branch: str, path: Path, branch: str,
             return "merge conflict: " + ", ".join(remaining)[:160] + " (no integrator with quota)"
         run.unit(unit_id, state="resolving", resolver=resolver)
         run.step("integrating", f"{unit_id} conflicts on {len(remaining)} path(s); one pass by {resolver}")
-        _dispatch(run, resolver, pools, host,
-                  merge_prompt(unit, branch=branch, conflicted=remaining, goal=goal),
-                  path, f"merge-{unit_id}.log", FIX_TIMEOUT)
+        first = resolver
+        resolver, _, _ = _dispatch_role(
+            run, "integrator", f"resolving {unit_id}", resolver, pools, quota, host,
+            merge_prompt(unit, branch=branch, conflicted=remaining, goal=goal), path, f"merge-{unit_id}.log",
+            FIX_TIMEOUT, lambda: pick("integrator", pools, quota, host=host, allow_lower=allow_lower))
+        if resolver is None:
+            _restore(path, branch, before)
+            return "merge conflict: " + ", ".join(remaining)[:160] + " (no integrator with quota: usage caps)"
+        if resolver != first:
+            run.unit(unit_id, resolver=resolver)
         markers = _has_markers(path, remaining)
         if markers:
             _restore(path, branch, before)
@@ -714,6 +975,13 @@ def _settle(run: Run, rows: dict[str, dict]) -> None:
     """
     stats = cli.Stats()
     cells: dict[str, tuple] = {}
+    # A unit whose routed arm hit a usage cap was built by another arm (or not at all): the
+    # swarm recorded no trial for it, and grading the decision would credit or blame the wrong arm.
+    capped = {unit_id for unit_id, row in rows.items() if row.get("capped")}
+    with run.lock:
+        for unit_id in capped:
+            run.progress["units"][unit_id].update(settled=False, settle_note="routed arm hit a usage cap; not graded")
+    rows = {unit_id: row for unit_id, row in rows.items() if unit_id not in capped}
     for unit_id, row in rows.items():
         try:
             decision = stats.decision(row["decision_id"])
@@ -754,6 +1022,7 @@ def _summary(run: Run, goal: str, plan: Plan | None, arms: dict[str, str], integ
             "fix_passes": state.get("fix_passes", 0), "reason": state.get("reason"),
             "branch": state.get("branch"), "settled": state.get("settled"),
             "out_of_scope": list(state.get("out_of_scope") or []),
+            "rebuilt_after_cap": state.get("rebuilt_after_cap"),
         })
     quota = {}
     for provider in sorted(set(usage_before) | set(usage_after)):
@@ -768,7 +1037,15 @@ def _summary(run: Run, goal: str, plan: Plan | None, arms: dict[str, str], integ
         "units": units, "held": run.progress.get("held", []), "integration": integration, "quota": quota,
         "merge_command": f"git merge --no-ff {integration['branch']}" if integration.get("branch") else None,
         "run_dir": str(run.dir), "notes": run.progress.get("notes", []),
+        "quota_events": run.progress.get("quota_events", []),
+        "quota_standing": run.progress.get("quota_standing", []),
     }
+
+
+def quota_section(summary: dict) -> list[str]:
+    """The "Quota events" block every ultra summary carries when a usage cap shaped the run."""
+    events = quota_lines(summary)
+    return ["", "Quota events:"] + [f"- {line}" for line in events] if events else []
 
 
 def goal_check_verdict(integration: dict, planned: int) -> str:
@@ -808,6 +1085,7 @@ def _summary_md(summary: dict) -> str:
             if unmerged else "the goal check failed on the integration branch"))
     if summary["plan_problems"]:
         lines += ["", "Plan problems: " + "; ".join(summary["plan_problems"])]
+    lines += quota_section(summary)
     if summary["units"]:
         lines += ["", "| unit | arm | review | confirmed | fix passes | out of scope | state |",
                   "|---|---|---|---|---|---|---|"]
@@ -911,6 +1189,7 @@ def _execute(run: Run, goal: str, repo: Path, base: str, base_sha: str, context:
     usage_before = cli.fetch_usage()
     with run.lock:
         run.progress["headroom"] = dict(quota)
+    note_standing_caps(run, pools, quota)
     context_note = _context(run, context, session)
 
     planner = pick("planner", pools, quota, host=host, allow_lower=allow_lower)
@@ -918,9 +1197,16 @@ def _execute(run: Run, goal: str, repo: Path, base: str, base_sha: str, context:
         return _give_up(run, "no usable model has quota to plan (try --allow-lower-models)", json_out, usage_before)
     with run.lock:
         run.progress["planner"] = planner
-    plan, problems = _plan(run, planner, pools, host, goal, repo, base, base_sha, max_units, context_note)
+    plan, problems = _plan(run, planner, pools, quota, host, allow_lower, goal, repo, base, base_sha, max_units,
+                           context_note)
+    with run.lock:
+        planner = run.progress["planner"]  # a usage cap may have moved planning to another arm
     if plan is None:
-        return _give_up(run, "could not plan: " + "; ".join(problems), json_out, usage_before)
+        reason = "could not plan: " + "; ".join(problems)
+        if run.stranded:
+            # Every arm that could plan is at a usage cap: say so where a failed command is read.
+            print(f"route ultra: {reason}", file=sys.stderr, flush=True)
+        return _give_up(run, reason, json_out, usage_before)
 
     run.step("assigning", "choosing an arm per unit")
     arms: dict[str, str] = {}
@@ -959,17 +1245,24 @@ def _execute(run: Run, goal: str, repo: Path, base: str, base_sha: str, context:
             run.progress["held"].append(row)
         run.unit(row["id"], state="held", reason=row["reason"])
     for unit_id, row in rows.items():
+        reason = None if row["accepted"] else (
+            caps.describe({**row["capped"], "arm": row["arm"]}) if row.get("capped")
+            else f"check failed (agent exit {row['agent_rc']})")
         run.unit(unit_id, state="accepted" if row["accepted"] else "failed", decision_id=row["decision_id"],
                  branch=row["branch"], worktree=row["worktree"], log=row["log"], agent_rc=row["agent_rc"],
-                 reason=None if row["accepted"] else f"check failed (agent exit {row['agent_rc']})")
+                 reason=reason)
 
     units = {unit.id: unit.to_dict() for unit in plan.units}
     for unit_id, row in rows.items():
         _record_scope(run, units[unit_id], row, base_sha)
 
     def review_and_fix(unit_id: str, row: dict) -> bool:
-        # Each job owns one unit/worktree. Pools and quota stay read-only, and
-        # settlement's router counters are only updated after all jobs finish.
+        # Each job owns one unit/worktree. Pools stay read-only; quota only ever gains a
+        # ``critical`` key when an arm reports a usage cap. Settlement's router counters are
+        # only updated after all jobs finish.
+        if row.get("capped") and not _rebuild_unit(run, units[unit_id], row, manifest, pools, quota, host,
+                                                   allow_lower, base_sha):
+            return False
         if not row["accepted"]:
             return _fix_unit(run, units[unit_id], row, [], pools, quota, host, allow_lower, base_sha)
         confirmed = _review_unit(run, units[unit_id], row, pools, quota, host, allow_lower, repo, base_sha)
@@ -1075,6 +1368,8 @@ def ultra_status(run_id: str | None = None) -> int:
         for row in progress["units"].values():
             print(f"{row['id']}\t{row.get('arm') or '-'}\t{row['state']}\t{row.get('fix_passes', 0)}"
                   f"\t{row.get('reason') or ''}")
+    for line in quota_lines(progress):
+        print(f"quota: {line}")
     integration = progress.get("integration") or {}
     if integration.get("branch"):
         planned = len([row for row in progress["units"].values() if row["state"] != "held"])

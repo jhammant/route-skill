@@ -45,9 +45,11 @@ from .ultra_research import (
     WHERE_RULES,
     SourceIds,
     agent_cwd,
-    dispatch,
     dispatch_checked,
+    dispatch_moving,
     git_porcelain,
+    lead_arm,
+    quota_event_rows,
     quota_table,
     renames_text,
     research_mcp_config,
@@ -58,7 +60,7 @@ from .ultra_research import (
     trap_sigterm,
     worker_arm,
 )
-from .ultra_select import candidates, pick
+from .ultra_select import candidates
 
 try:
     import tomllib
@@ -915,11 +917,20 @@ def _run_analyst(run: ultra.Run, analyst: Analyst, arm: str, pools: dict[str, Po
     """One analyst on its arm, repaired once there, then retried once on the next candidate.
 
     The working directory is chosen per attempt (``agent_cwd``): Claude in
-    ``repo`` when given, Codex always in ``own_dir``.
+    ``repo`` when given, Codex always in ``own_dir``. An arm at a usage cap is
+    not one of the two tries: the analyst moves on until an arm answers or none is left.
     """
     tried: list[str] = []
     failures: list[str] = []
+    spent = 0
+    skipped: set[str] = set()
     while arm is not None and not (cancel is not None and cancel.is_set()):
+        if run.capped_since(arm, pools) is not None:
+            # Chosen before another analyst met the cap: the window is spent, so it is not asked.
+            skipped.add(arm)
+            arm = worker_arm(pools, quota, tier=analyst.tier, host=host, allow_lower=allow_lower,
+                             exclude=set(tried) | skipped)
+            continue
         tried.append(arm)
         with LOCK:
             run.unit(analyst.id, arm=arm, state="running", attempts=list(tried))
@@ -927,7 +938,7 @@ def _run_analyst(run: ultra.Run, analyst: Analyst, arm: str, pools: dict[str, Po
         analysis, repaired, why = dispatch_checked(
             run, arm, pools, host, prompt, agent_cwd(arm, pools, host, repo, own_dir), stem, ANALYST_TIMEOUT,
             mcp_config, parse=parse_analysis, error=TeamAnalysisError, begin=ANALYSIS_BEGIN, end=ANALYSIS_END,
-            header=f"Analyst id: {analyst.id}", cancel=cancel)
+            header=f"Analyst id: {analyst.id}", cancel=cancel, role="analyst", doing=f"analysing as {analyst.id}")
         if analysis is None:
             if cancel is not None and cancel.is_set():
                 with LOCK:
@@ -935,8 +946,12 @@ def _run_analyst(run: ultra.Run, analyst: Analyst, arm: str, pools: dict[str, Po
                 return {"id": analyst.id, "state": "interrupted", "arm": arm, "analysis": None,
                         "reason": "run interrupted", "attempts": tried}
             failures.append(f"{arm}: {why}")
+            event = getattr(why, "event", None)
+            spent += event is None
             arm = (worker_arm(pools, quota, tier=analyst.tier, host=host, allow_lower=allow_lower, exclude=set(tried))
-                   if len(tried) < 2 else None)
+                   if spent < 2 else None)
+            if event is not None:
+                run.cap_next(event, arm, pools)
             continue
         atomic_write(run.dir / "analysts" / f"{analyst.id}.json",
                      json.dumps({**analyst.to_dict(), "arm": arm, "attempts": tried, "repaired": repaired,
@@ -951,19 +966,6 @@ def _run_analyst(run: ultra.Run, analyst: Analyst, arm: str, pools: dict[str, Po
         run.unit(analyst.id, arm=tried[-1] if tried else None, state="failed", reason=reason, attempts=list(tried))
     return {"id": analyst.id, "state": "failed", "arm": tried[-1] if tried else None, "analysis": None,
             "reason": reason, "attempts": tried}
-
-
-def _run_verifier(run: ultra.Run, claim: Claim, index: int, arm: str, independence: str, pools: dict[str, Pool],
-                  host: str, prompt: str, cwd: Path, mcp_config: Path | None,
-                  cancel: threading.Event | None = None) -> dict:
-    """One verifier on one claim, never retried: an unusable verdict is 'uncertain'."""
-    rc, text = dispatch(run, arm, pools, host, prompt, cwd, f"verify-{claim.id}-{index}.log", VERIFIER_TIMEOUT,
-                        mcp_config)
-    if rc == 124:
-        row = {"verdict": "uncertain", "reason": "verifier timed out", "sources": []}
-    else:
-        row = parse_verdict(text)
-    return {"claim": claim.id, "arm": arm, "independence": independence, **row}
 
 
 @dataclass
@@ -993,10 +995,38 @@ class _Context:
         return agent_cwd(arm, self.pools, self.host, self.repo, self.run.dir / kind / name)
 
     def integrator(self) -> str | None:
-        arm = pick("integrator", self.pools, self.quota, host=self.host, allow_lower=self.allow_lower)
-        if arm is not None and not supported(arm, self.pools, self.host):
-            arm = next(iter(_usable(self.pools, self.quota, host=self.host, allow_lower=self.allow_lower)), None)
-        return arm
+        return lead_arm("integrator", self.pools, self.quota, host=self.host, allow_lower=self.allow_lower)
+
+
+def _run_verifier(ctx: _Context, claim: Claim, index: int, arm: str, independence: str, author_arm: str | None,
+                  prompt: str, cancel: threading.Event | None = None) -> dict:
+    """One verifier on one claim, never retried: an unusable verdict is 'uncertain'.
+
+    A verifier at a usage cap has not looked at the claim, so that is no
+    verdict: the vote moves to the next arm (another family first, as for the
+    first choice) and its independence is measured again.
+    """
+    name = f"{claim.id}-{index}"
+    first = arm
+
+    def again() -> str | None:
+        pairs = _verifier_arms(ctx, author_arm, 1)
+        return pairs[0][0] if pairs else None
+
+    arm, rc, text = dispatch_moving(ctx.run, "verifier", f"verifying {claim.id}", arm, ctx.pools, ctx.host, prompt,
+                                    lambda chosen: ctx.work_dir("verify", name, chosen), f"verify-{name}.log",
+                                    VERIFIER_TIMEOUT, ctx.mcp_config, again)
+    if arm is None:
+        return {"claim": claim.id, "arm": first, "independence": independence, "verdict": "uncertain",
+                "reason": "no verifier left: usage caps", "sources": []}
+    if arm != first:
+        family = pool_family(ctx.pools[author_arm]) if author_arm in ctx.pools else None
+        independence = "same-family" if pool_family(ctx.pools[arm]) == family else "cross-family"
+    if rc == 124:
+        row = {"verdict": "uncertain", "reason": "verifier timed out", "sources": []}
+    else:
+        row = parse_verdict(text)
+    return {"claim": claim.id, "arm": arm, "independence": independence, **row}
 
 
 def _parallel(ctx: _Context, jobs: list[tuple[str, tuple]], worker) -> dict[str, dict]:
@@ -1092,7 +1122,8 @@ def _examine(ctx: _Context, claims: list[Claim], author_arms: dict[str, str | No
             claim.verdict = NOT_EXAMINED
             continue
         budget -= 1
-        pairs = _verifier_arms(ctx, author_arms.get(claim.author), ctx.intensity.verifiers)
+        author_arm = author_arms.get(claim.author)
+        pairs = _verifier_arms(ctx, author_arm, ctx.intensity.verifiers)
         if not pairs:
             claim.verdict = NOT_EXAMINED
             ctx.run.note(f"claim {claim.id}: no usable verifier has quota")
@@ -1100,8 +1131,7 @@ def _examine(ctx: _Context, claims: list[Claim], author_arms: dict[str, str | No
         pending[claim.id] = claim
         prompt = verifier_prompt(ctx.question, claim, targets=ctx.targets, mcp_names=ctx.mcp_names)
         for index, (arm, independence) in enumerate(pairs, start=1):
-            jobs.append((f"{claim.id}-{index}", (ctx.run, claim, index, arm, independence, ctx.pools, ctx.host, prompt,
-                                                 ctx.work_dir("verify", f"{claim.id}-{index}", arm), ctx.mcp_config)))
+            jobs.append((f"{claim.id}-{index}", (ctx, claim, index, arm, independence, author_arm, prompt)))
     if jobs:
         ctx.run.step("cross-examining", f"{len(pending)} claim(s), {len(jobs)} verifier run(s)")
         results = _parallel(ctx, jobs, _run_verifier)
@@ -1123,10 +1153,14 @@ def _critic(ctx: _Context, analysts: list[Analyst], claims: list[Claim], round_n
         return None
     surviving = [claim for claim in claims if claim.verdict in ("upheld", "contested")]
     ctx.run.step("critic", f"round {round_no} by {arm}")
-    rc, text = dispatch(ctx.run, arm, ctx.pools, ctx.host, critic_prompt(ctx.question, analysts, surviving,
-                                                                        cap=CRITIC_CAP),
-                        ctx.work_dir("critic", f"round-{round_no}", arm), f"critic-{round_no}.log", CRITIC_TIMEOUT,
-                        ctx.mcp_config)
+    arm, rc, text = dispatch_moving(
+        ctx.run, "critic", f"critic round {round_no}", arm, ctx.pools, ctx.host,
+        critic_prompt(ctx.question, analysts, surviving, cap=CRITIC_CAP),
+        lambda chosen: ctx.work_dir("critic", f"round-{round_no}", chosen), f"critic-{round_no}.log", CRITIC_TIMEOUT,
+        ctx.mcp_config, ctx.integrator)
+    if arm is None:
+        ctx.run.note(f"critic round {round_no}: no usable model has quota (usage caps); stopping")
+        return None
     missing = parse_critic(text) if rc != 124 else None
     if missing is None:
         ctx.run.note(f"critic round {round_no}: no usable ULTRA-CRITIC block (exit {rc}); stopping")
@@ -1260,6 +1294,7 @@ def _summary_md(summary: dict, body: str, claims: list[Claim], session: list[Ana
                   f"  - Merge: {fix.get('merge_command') or '-'}"]
     elif fix.get("state") == "skipped":
         lines.append(f"- Fix build: skipped ({fix.get('reason')})")
+    lines += quota_event_rows(summary)
     if summary["notes"]:
         lines += ["- Notes:"] + [f"  - {note}" for note in summary["notes"][:10]]
     lines += [f"- Run directory: {summary['run_dir']}", f"- Exit: {summary['exit_code']}"]
@@ -1293,6 +1328,8 @@ def _report(ctx: _Context, body: str, claims: list[Claim], analysts: list[Analys
         "urls": list(ctx.urls), "repo": str(ctx.repo) if ctx.repo else None, "fix": fix,
         "exit_code": exit_code, "run_dir": str(run.dir), "context": run.progress.get("context"),
         "notes": run.progress.get("notes", []),
+        "quota_events": run.progress.get("quota_events", []),
+        "quota_standing": run.progress.get("quota_standing", []),
     }
     sources = {analyst_id: analysis.sources for analyst_id, analysis in analyses.items()}
     text = _summary_md(summary, body, claims, session, sources)
@@ -1424,12 +1461,16 @@ def _assign(ctx: _Context, analysts: list[Analyst], arms: dict[str, str | None])
 def _plan_team(ctx: _Context, team_size: int) -> tuple[str, str, list[Analyst], list[str]]:
     """A planner-designed team, re-planned once with the lint problems appended."""
     run = ctx.run
-    planner = pick("planner", ctx.pools, ctx.quota, host=ctx.host, allow_lower=ctx.allow_lower)
-    if planner is not None and not supported(planner, ctx.pools, ctx.host):
-        planner = next(iter(_usable(ctx.pools, ctx.quota, host=ctx.host, allow_lower=ctx.allow_lower)), None)
+
+    def planner_arm() -> str | None:
+        arm = lead_arm("planner", ctx.pools, ctx.quota, host=ctx.host, allow_lower=ctx.allow_lower)
+        if arm is not None:
+            run.progress["planner"] = arm
+        return arm
+
+    planner = planner_arm()
     if planner is None:
         return "", "", [], ["no usable model has quota to plan (try --allow-lower-models)"]
-    run.progress["planner"] = planner
     prompt = team_prompt(ctx.question, team_size=team_size, targets=ctx.targets, context_note=ctx.context_note,
                          mcp_names=ctx.mcp_names)
     problems: list[str] = []
@@ -1438,9 +1479,14 @@ def _plan_team(ctx: _Context, team_size: int) -> tuple[str, str, list[Analyst], 
         text_prompt = prompt if attempt == 1 else prompt + (
             "\n\n# Problems with your previous team (fix all of them)\n\n"
             + "\n".join(f"- {problem}" for problem in problems) + "\n")
-        rc, text = dispatch(run, planner, ctx.pools, ctx.host, text_prompt,
-                            ctx.work_dir("plan", f"attempt-{attempt}", planner), f"plan-{attempt}.log",
-                            PLANNER_TIMEOUT, ctx.mcp_config)
+        planner, rc, text = dispatch_moving(
+            run, "planner", "planning", planner, ctx.pools, ctx.host, text_prompt,
+            lambda chosen: ctx.work_dir("plan", f"attempt-{attempt}", chosen), f"plan-{attempt}.log",
+            PLANNER_TIMEOUT, ctx.mcp_config, planner_arm)
+        if planner is None:
+            # Every arm that could plan is at a usage cap; a re-plan would have nobody to ask.
+            run.stranded = ultra.capped_out(run, "planning", ctx.pools, ctx.quota, ctx.host, ctx.allow_lower)
+            return "", "", [], [run.stranded]
         try:
             if rc == 124:
                 raise TeamPlanError("planner timed out")
@@ -1546,6 +1592,7 @@ def _execute(run: ultra.Run, question: str, layout: TeamLayout | None, urls: tup
     quota = cli.fetch_quota()
     usage_before = cli.fetch_usage()
     run.progress["headroom"] = dict(quota)
+    ultra.note_standing_caps(run, pools, quota)
     context_note = ultra._context(run, context, session)
     mcp_config, mcp_info = research_mcp_config(run.dir)
     run.progress["mcp_servers"] = {"loaded": mcp_info["loaded"], "missing": mcp_info["missing"]}
@@ -1576,8 +1623,10 @@ def _execute(run: ultra.Run, question: str, layout: TeamLayout | None, urls: tup
     else:
         title, report_shape, analysts, problems = _plan_team(ctx, intensity.team_size)
         if problems:
-            return _give_up(ctx, "could not plan a team: " + "; ".join(problems), mcp_info, usage_before, json_out,
-                            layout=None)
+            reason = "could not plan a team: " + "; ".join(problems)
+            if run.stranded:
+                print(f"route ultra: {reason}", file=sys.stderr, flush=True)
+            return _give_up(ctx, reason, mcp_info, usage_before, json_out, layout=None)
     run.progress["title"] = title
 
     run.step("assigning", "choosing an arm per analyst")
@@ -1654,16 +1703,23 @@ def _execute(run: ultra.Run, question: str, layout: TeamLayout | None, urls: tup
         prompt = synthesis_prompt(question, title=title, report_shape=report_shape, surviving=surviving,
                                   refuted=refuted, unexamined=unexamined, session=session_analysts,
                                   fix_block=want_fix, repo=repo, notes=notes)
-        rc, synthesis_text = dispatch(run, synthesizer, pools, host, prompt,
-                                      agent_cwd(synthesizer, pools, host, run.dir, run.dir / "synthesis"),
-                                      "synthesis.log", SYNTHESIS_TIMEOUT, mcp_config)
-        try:
-            body = _marked_block(synthesis_text, REPORT_BEGIN, REPORT_END, TeamReportError) if rc == 0 else None
-        except TeamReportError:
-            body = None
-        if not body or not body.strip():
-            run.note(f"synthesizer {synthesizer} delivered no report (exit {rc}); writing the claims as found")
-            body = None
+        first = synthesizer
+        synthesizer, rc, synthesis_text = dispatch_moving(
+            run, "synthesizer", "synthesizing", synthesizer, pools, host, prompt,
+            lambda chosen: agent_cwd(chosen, pools, host, run.dir, run.dir / "synthesis"), "synthesis.log",
+            SYNTHESIS_TIMEOUT, mcp_config, ctx.integrator)
+        if synthesizer is None:
+            # The cap message is not a report, and must not be read for a fix block either.
+            synthesis_text = ""
+            run.note(f"synthesizer {first} delivered no report (usage caps left no arm); writing the claims as found")
+        else:
+            try:
+                body = _marked_block(synthesis_text, REPORT_BEGIN, REPORT_END, TeamReportError) if rc == 0 else None
+            except TeamReportError:
+                body = None
+            if not body or not body.strip():
+                run.note(f"synthesizer {synthesizer} delivered no report (exit {rc}); writing the claims as found")
+                body = None
     if body is None:
         synthesizer = None
         body = fallback_report(question, title, claims)

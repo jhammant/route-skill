@@ -337,6 +337,50 @@ check failed, and 2 that it could not plan or no usable model had quota. `ultra`
 `/ultra` in Claude Code, link the skill:
 `ln -s "$PWD/skill-ultra" "$HOME/.claude/skills/ultra"`.
 
+### When a model hits its usage cap
+
+A model CLI that is out of usage prints one line ("You've hit your Fable limit
+· resets Nov 23 at 3pm (Europe/London)", or Codex's "You've hit your usage
+limit") and exits. `route ultra` reads that as a cap, not as an answer, for
+every role in every mode (planner, worker, reviewer, fixer, integrator,
+researcher, analyst, verifier, critic, synthesizer):
+
+```text
+ultra: claude-work-fable hit its Fable limit (resets Nov 23 15:00); planning on claude-work (Opus) instead
+```
+
+- The role moves to the next arm in rank order. The capped arm, and every arm
+  on the same model window, is out for the rest of the run. `--pool` pins
+  hold, reviews still prefer another model family, and a capped worker's unit
+  is built again on the next arm (not counted as a fix pass, and not graded
+  against the arm that never did the work).
+- The line above goes to stderr when it happens, and into `route ultra status`
+  (`quota: ...`), `summary.md` ("Quota events") and `progress.json` and
+  `summary.json` (`quota_events`).
+- The cap is kept in `ROUTE_STATE_DIR/model-caps.json` until its reset and
+  laid over every quota snapshot as `critical`, so later runs, `route` and
+  `route auto` skip that window too. Limits claude-swarm has recorded
+  (`~/.local/state/claude-swarm/quota/<account>.cool.json`) are read the same
+  way. `route caps` lists both; `route caps --clear [ARM]` forgets route's own
+  records, for when you buy credit before the reset (claude-swarm's are its
+  own: delete that file to lift one early). A cap with no readable reset is
+  kept for an hour.
+- Only the CLI's own message counts as a cap. The limit phrase has to open one
+  of the last lines of the output and end its sentence there, or go straight
+  on to the reset; a quota error code (`usage_limit_reached`, `429 Too Many
+  Requests`) counts only inside the CLI's own `error:` line. A CLI that exited
+  0 is capped only when the cap is the first thing it printed. A worker's
+  summary ("Rate limit reached: the client now backs off"), a project's test
+  output or a diff that mentions a limit is not a cap. If one is ever read
+  wrongly, `route caps --clear [ARM]` lifts it.
+- When no arm is left to plan, the run exits 2 and says what was capped, when
+  it resets and what to try: `Rerun with --pool claude-work, or wait for the
+  reset (Nov 23 15:00)`.
+
+`route swarm` on its own records a capped unit the same way (no check is run,
+nothing is graded) but does not retry it; it names the cap and leaves the
+rerun to you.
+
 ### Research mode
 
 `--research` points ultra at a question instead of a goal. Nothing is built or

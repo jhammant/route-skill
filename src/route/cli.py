@@ -249,6 +249,11 @@ def plan_task(text: str, opts: argparse.Namespace, *, quota=None, exclude=(),
         plan["suggest"] = "pass --shape <shape> --tier <tier>"
     if result.removed_by_sensitivity:
         plan["removed_by_sensitivity"] = result.removed_by_sensitivity
+    capped = [row for row in getattr(quota, "caps", None) or []]
+    if capped:
+        # On the record: a model said it was out of usage, so its arms are out until the reset.
+        plan["usage_caps"] = [{"removes": row["keys"], "resets": row.get("resets") or None,
+                               "seen_by": row.get("source") or None} for row in capped]
     if result.veto is not None:
         plan["veto"] = {"name": result.veto.name, "reason": result.veto.reason}
     if getattr(args, "allow_network", False):
@@ -749,6 +754,29 @@ def cmd_digest(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_caps(args: argparse.Namespace) -> int:
+    """``route caps``: the usage caps models have reported and that have not reset; ``--clear`` forgets them."""
+    from . import caps
+
+    if args.clear is not None:
+        gone = caps.clear_caps(args.clear or None)
+        print(f"cleared {len(gone)} usage cap record(s)" + (": " + ", ".join(
+            row.get("arm") or ", ".join(row["keys"]) for row in gone) if gone else ""))
+        return 0
+    rows = caps.active_caps()
+    if args.json_out:
+        print(json.dumps(rows, indent=2))
+        return 0
+    if not rows:
+        print("no usage caps on record")
+        return 0
+    print("removes\tlimit\tresets\tseen by")
+    for row in rows:
+        limit = " ".join(part for part in (row.get("model"), row.get("window")) if part) or "usage"
+        print(f"{', '.join(row['keys'])}\t{limit}\t{row.get('resets') or 'unknown'}\t{row.get('source') or '-'}")
+    return 0
+
+
 def cmd_ultra(args: argparse.Namespace) -> int:
     """``route ultra "<goal>"``, ``route ultra status [RUN_ID]`` or ``route ultra cancel RUN_ID``."""
     from .ultra import run_ultra, ultra_cancel, ultra_status
@@ -818,6 +846,13 @@ def _parser(prog: str) -> argparse.ArgumentParser:
                     help="session ID (default: CLAUDE_CODE_SESSION_ID, i.e. this one)")
     dg.add_argument("--max-chars", type=_positive_int, default=DEFAULT_MAX_CHARS)
     dg.set_defaults(func=cmd_digest)
+
+    cp = sub.add_parser("caps", help="usage caps models have reported (routing skips them until they reset)")
+    cp.add_argument("--clear", nargs="?", const="", default=None, metavar="ARM_OR_KEY",
+                    help="forget route's own records: all of them, or those for one arm or quota key "
+                         "(after buying credit, or when a cap was read wrongly)")
+    cp.add_argument("--json", dest="json_out", action="store_true")
+    cp.set_defaults(func=cmd_caps)
 
     swarm = sub.add_parser("swarm", help="dispatch independently checked units across model pools")
     swarm.add_argument("manifest", help="JSON manifest path, or - for stdin")
@@ -1051,7 +1086,7 @@ def _ttl_arg(text: str) -> int:
 
 
 _SUBCOMMANDS = {"task", "stats", "outcome", "settle", "reseed", "federate", "benchmark", "ship",
-                "swarm", "swarm-log", "swarms", "digest", "ultra"}
+                "swarm", "swarm-log", "swarms", "digest", "ultra", "caps"}
 
 
 def _run(argv: list[str] | None, *, auto: bool) -> int:

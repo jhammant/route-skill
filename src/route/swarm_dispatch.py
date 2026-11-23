@@ -607,12 +607,20 @@ def _run_swarm(manifest: dict, args: argparse.Namespace, quota: dict, assignment
             if amail_binary() is None:
                 print("swarm: warning: amail is missing; continuing without a channel", file=sys.stderr)
             else:
-                channel = open_channel(manifest["slug"], members, args.ttl, directory / "amail")
-                live_status.connect(channel.hub.address, channel.group_id)
-                print(f"channel: hub: {channel.hub.address}", flush=True)
-                for name, worker in channel.workers.items():
-                    live_status.unit(name, address=worker.address)
-                    print(f"channel: {name}: {worker.address}", flush=True)
+                try:
+                    channel = open_channel(manifest["slug"], members, args.ttl, directory / "amail")
+                except ChannelError as exc:
+                    # The channel only carries progress messages: never let a-mail block the work itself.
+                    channel = None
+                    hint = " (run `amail sessions prune` to free idle session slots)" if "subagent_limit" in str(exc) else ""
+                    print(f"swarm: warning: a-mail channel unavailable: {exc}{hint}; continuing without a channel",
+                          file=sys.stderr)
+                if channel:
+                    live_status.connect(channel.hub.address, channel.group_id)
+                    print(f"channel: hub: {channel.hub.address}", flush=True)
+                    for name, worker in channel.workers.items():
+                        live_status.unit(name, address=worker.address)
+                        print(f"channel: {name}: {worker.address}", flush=True)
         prepared = []
         for a in assignments:
             worker = channel.workers.get(a.unit["id"]) if channel else None

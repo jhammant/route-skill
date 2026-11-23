@@ -94,6 +94,7 @@ class FakeCommands:
         self.fail_inbox = False
         self.malformed_first = False
         self.invalid_group = False
+        self.swarm_create_error = None
         self.addresses = []
         self.polls = []
         self.active = {}
@@ -146,6 +147,8 @@ class FakeCommands:
         if argv[1:3] == ["swarm", "end"]:
             return subprocess.CompletedProcess(argv, 0, "closed", "")
         if argv[1:3] == ["swarm", "create"]:
+            if self.swarm_create_error is not None:
+                return subprocess.CompletedProcess(argv, 1, "", self.swarm_create_error)
             directory = Path(argv[argv.index("--dir") + 1])
             workers = []
             for i, name in enumerate(argv[argv.index("--workers") + 1].split(",")):
@@ -718,19 +721,42 @@ def test_missing_amail_warns_and_dispatches_without_channel(repo, tmp_path, offl
     assert "Swarm channel" not in (directory / "briefs/one.md").read_text()
 
 
-def test_redeem_error_does_not_print_token(repo, tmp_path, offline, capsys):
+def test_redeem_error_does_not_print_token_and_work_continues(repo, tmp_path, offline, capsys):
+    # Arrange
     fake, _ = offline
     fake.fail_redeem = True
     path = manifest_file(repo, tmp_path, [unit("one", pool="codex")])
-    assert run(path) == 1
+    # Act
+    code = run(path)
+    # Assert: the channel is optional, so the unit still runs, and the token never reaches output
     output = capsys.readouterr()
+    assert code == 0
     assert "DO-NOT-LOG-REDEMPTION" not in output.out + output.err
-    assert not fake.agents
-    status, directory = live_status()
-    assert (status["state"], status["exit_code"]) == ("failed", 1)
-    assert status["finished_at"].endswith("Z")
-    assert status["units"][0]["state"] == "queued"
+    assert "a-mail channel unavailable" in output.err
+    assert len(fake.agents) == 1
+    result, _directory = summary()
+    assert result["hub"] is None
+    _status, directory = live_status()
     assert "DO-NOT-LOG-REDEMPTION" not in (directory / "status.json").read_text()
+
+
+def test_subagent_limit_warns_with_hint_and_dispatches_without_channel(repo, tmp_path, offline, capsys):
+    # Arrange: a-mail refuses the swarm, as on 23 Nov 2026 when sessions filled the sub-agent budget
+    fake, _ = offline
+    fake.group = True
+    fake.swarm_create_error = "subagent_limit: at most 32 live sub-agents\n"
+    path = manifest_file(repo, tmp_path, [unit("one", pool="codex"), unit("two", pool="codex")])
+    # Act
+    code = run(path)
+    # Assert
+    err = capsys.readouterr().err
+    assert code == 0
+    assert "subagent_limit: at most 32 live sub-agents" in err
+    assert "amail sessions prune" in err
+    assert len(fake.agents) == 2
+    result, directory = summary()
+    assert result["hub"] is None
+    assert "Swarm channel" not in (directory / "briefs/one.md").read_text()
 
 
 def test_poller_errors_warn_once_and_do_not_fail_the_swarm(repo, tmp_path, offline, capsys):
@@ -764,19 +790,17 @@ def test_poller_follows_the_amail_inbox_contract_and_keeps_the_batch(repo, tmp_p
                for secret in ("SECRET-PAYLOAD", "SECRET-PLACEHOLDER", "SECRET-KEY"))
 
 
-@pytest.mark.parametrize("failure", ["configuration", "interrupt", "invalid-group"])
+@pytest.mark.parametrize("failure", ["configuration", "interrupt"])
 def test_group_is_closed_on_failure_or_interrupt(repo, tmp_path, offline, monkeypatch, failure):
     # Arrange
     fake, _ = offline
     fake.group = True
-    if failure == "invalid-group":
-        fake.invalid_group = True
-    else:
-        def fail(*args, **kwargs):
-            if failure == "interrupt":
-                raise KeyboardInterrupt()
-            raise swarm_channel.ChannelError("configuration failed")
-        monkeypatch.setattr(swarm_dispatch, "dispatch_command", fail)
+
+    def fail(*args, **kwargs):
+        if failure == "interrupt":
+            raise KeyboardInterrupt()
+        raise swarm_channel.ChannelError("configuration failed")
+    monkeypatch.setattr(swarm_dispatch, "dispatch_command", fail)
     path = manifest_file(repo, tmp_path, [unit("one", pool="codex")])
     # Act / Assert
     assert run(path) == (130 if failure == "interrupt" else 1)
@@ -787,6 +811,24 @@ def test_group_is_closed_on_failure_or_interrupt(repo, tmp_path, offline, monkey
     assert (status["state"], status["exit_code"]) == (
         ("interrupted", 130) if failure == "interrupt" else ("failed", 1))
     assert status["finished_at"].endswith("Z")
+
+
+def test_invalid_group_is_closed_once_and_work_continues_without_channel(repo, tmp_path, offline, capsys):
+    # Arrange: a-mail creates the group but returns no usable workers
+    fake, _ = offline
+    fake.group = True
+    fake.invalid_group = True
+    path = manifest_file(repo, tmp_path, [unit("one", pool="codex")])
+    # Act
+    code = run(path)
+    # Assert: the half-made group is ended exactly once, then the unit runs without a channel
+    endings = [argv for argv, _ in fake.calls if isinstance(argv, list) and argv[1:3] == ["swarm", "end"]]
+    assert len(endings) == 1 and endings[0][-1] == "group-123"
+    assert code == 0
+    assert len(fake.agents) == 1
+    assert "a-mail channel unavailable" in capsys.readouterr().err
+    result, _directory = summary()
+    assert result["hub"] is None
 
 
 def test_stdin_manifest_and_server_override(repo, tmp_path, offline, monkeypatch):

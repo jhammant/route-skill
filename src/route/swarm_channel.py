@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import os
 import shutil
 import subprocess
@@ -25,6 +26,21 @@ def amail_binary() -> str | None:
     return binary or (str(fallback) if fallback.is_file() else None)
 
 
+# a-mail's CLI prints errors as "<code>: <message>". Only that shape is passed on,
+# and never anything that looks like a credential, so tokens can't leak into logs.
+_REASON = re.compile(r"^[a-z][a-z_]{2,40}: [^\n]{1,200}$")
+_SECRETISH = re.compile(r"am_[a-z]{1,4}_|token|secret|bearer", re.IGNORECASE)
+
+
+def _safe_reason(stderr: str | None) -> str:
+    """The a-mail error code and message, when it is safe to show; else empty."""
+    for line in (stderr or "").strip().splitlines()[-1:]:
+        line = line.strip()
+        if _REASON.match(line) and not _SECRETISH.search(line):
+            return line
+    return ""
+
+
 def _run(binary: str, args: list[str], *, env=None, timeout=30, json_output=True):
     try:
         proc = subprocess.run([binary, *args], env=dict(os.environ, **(env or {})),
@@ -32,7 +48,8 @@ def _run(binary: str, args: list[str], *, env=None, timeout=30, json_output=True
     except (OSError, subprocess.TimeoutExpired):
         raise ChannelError(f"a-mail {args[0]} could not complete") from None
     if proc.returncode:
-        raise ChannelError(f"a-mail {args[0]} failed (exit {proc.returncode})")
+        reason = _safe_reason(proc.stderr)
+        raise ChannelError(f"a-mail {args[0]} failed (exit {proc.returncode})" + (f": {reason}" if reason else ""))
     if not json_output:
         return proc.stdout
     try:

@@ -9,8 +9,9 @@
 # precheck is what keeps this safe and quiet: `hrun check . --quiet` exits 0
 # only when this repo may be sent (hrun's own deny list), is a Node or Python
 # project the pods can build, and is small enough to upload. Any other answer
-# removes the arm for that task. hrun refuses a denied repo at dispatch too, so
-# the precheck saves a wasted attempt; it is not the only guard.
+# removes the arm for that task. `--checked` makes hrun ask itself the same
+# question at dispatch and refuse before anything is uploaded, so the precheck
+# saves a wasted attempt; it is not the only guard.
 
 # Claude Code in a pod, paid for by whatever hrun is set up to use (a Claude
 # subscription or an API key: `hrun key check`). Set quota_provider to the
@@ -21,7 +22,7 @@ needs_repo = true
 remote = true
 cost = "included"
 strength = 5
-dispatch = "HOME/.local/bin/hrun task . --print --prompt {task}"
+dispatch = "HOME/.local/bin/hrun task . --checked --print --prompt {task}"
 precheck = "HOME/.local/bin/hrun check . --quiet"
 requires_subcommand = "hrun task"
 model = { name = "claude-sonnet-5-5" }
@@ -39,7 +40,7 @@ needs_repo = true
 remote = true
 cost = "free"
 strength = 2
-dispatch = "HOME/.local/bin/hrun task . --print --auth local --max-turns 30 --prompt {task}"
+dispatch = "HOME/.local/bin/hrun task . --checked --print --auth local --max-turns 30 --prompt {task}"
 precheck = "HOME/.local/bin/hrun check . --quiet --needs-local-model"
 requires_subcommand = "hrun task"
 model = { name = "qwen3-coder-30b-a3b", quant = "Q4_K_M" }

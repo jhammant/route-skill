@@ -137,6 +137,10 @@ task text
    task carrying private data can **never** land on the `free` arm.
 3. **Eligibility** — `pools.py` is a config-driven arm registry
    (`~/.config/route/pools.toml`); a new model is a config entry, not a code change.
+   An arm that can only take *some* projects declares a `precheck`: a command run in the task's
+   directory, where a non-zero exit removes the arm for that task (it fails closed on a missing tool
+   or a timeout). `examples/heata-pools.toml` uses it for a remote build cluster that asks "may this
+   repo be sent there, and can it be built there?" before it is considered.
    Delegated `codex`/`kimi` arms do not accept `batch:*`; the current host can
    handle any shape. A `coding:*` shape never yields `local-batch`.
    Arms with a health endpoint (`free`) are eligible only while it

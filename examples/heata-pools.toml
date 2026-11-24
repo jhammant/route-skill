@@ -1,0 +1,48 @@
+# A remote build cluster as worker pools: heata's home servers, through hrun
+# (https://github.com/jhammant/hswarm). Copy the tables you want into
+# ~/.config/route/pools.toml and replace HOME with your home directory.
+#
+# hrun uploads the repo to a pod on a home server, runs Claude Code on the task
+# there and applies the result to the working tree as an uncommitted patch, so
+# an arm behaves like a local `claude --print` whose tool calls run elsewhere.
+#
+# precheck is what keeps this safe and quiet: `hrun check . --quiet` exits 0
+# only when this repo may be sent (hrun's own deny list), is a Node or Python
+# project the pods can build, and is small enough to upload. Any other answer
+# removes the arm for that task. hrun refuses a denied repo at dispatch too, so
+# the precheck saves a wasted attempt; it is not the only guard.
+
+# Claude Code in a pod, paid for by whatever hrun is set up to use (a Claude
+# subscription or an API key: `hrun key check`). Set quota_provider to the
+# quotamax pool that credential spends, so a spent week removes the arm.
+[pools.heata]
+shapes = ["coding:implement", "coding:refactor", "coding:debug", "coding:test"]
+needs_repo = true
+remote = true
+cost = "included"
+strength = 5
+dispatch = "HOME/.local/bin/hrun task . --print --prompt {task}"
+precheck = "HOME/.local/bin/hrun check . --quiet"
+requires_subcommand = "hrun task"
+model = { name = "claude-sonnet-5-5" }
+parallel_limit = 4
+quota_provider = "claude"
+prior_like = "claude"
+
+# Claude Code with the open model on the cluster's graphics card as its brain:
+# free, and neither code nor prompts leave the home. Only eligible while that
+# model is up (`hllm up`), which the precheck also asks. A 30B open model, so
+# it starts where the local agent does.
+[pools.heata-local]
+shapes = ["coding:implement", "coding:test"]
+needs_repo = true
+remote = true
+cost = "free"
+strength = 2
+dispatch = "HOME/.local/bin/hrun task . --print --auth local --max-turns 30 --prompt {task}"
+precheck = "HOME/.local/bin/hrun check . --quiet --needs-local-model"
+requires_subcommand = "hrun task"
+model = { name = "qwen3-coder-30b-a3b", quant = "Q4_K_M" }
+parallel_limit = 2
+quota_provider = ""
+prior_like = "local-agent"

@@ -19,6 +19,7 @@ import functools
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import time
@@ -170,12 +171,35 @@ def subcommand_available(spec: str) -> bool:
     return spec in (proc.stdout + proc.stderr)
 
 
+PRECHECK_TIMEOUT = 20.0
+
+
+def precheck_passes(command: str, cwd: str | None = None, timeout: float = PRECHECK_TIMEOUT) -> bool:
+    """True when a pool's ``precheck`` command exits 0 in the task's directory.
+
+    Fail-closed: a missing tool, a malformed command, a timeout or any
+    non-zero exit means the arm may not take this task. Run without a shell,
+    so the command is one program and its arguments, nothing more.
+    """
+    try:
+        argv = shlex.split(command)
+        if not argv:
+            return False
+        proc = subprocess.run(argv, cwd=cwd, capture_output=True, timeout=timeout,
+                              stdin=subprocess.DEVNULL)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return False
+    return proc.returncode == 0
+
+
 def eligible_for(shape: str, pools: dict[str, Pool]) -> list[str]:
     """Step 3: arms that accept this shape at all, registry order.
 
     An arm with a ``health_url`` (the free-llm proxy) is eligible only while
     the endpoint answers — an unreachable proxy simply removes the arm. An arm
     with ``requires_subcommand`` is removed while that subcommand is missing.
+    An arm with a ``precheck`` is removed unless that command passes in the
+    current directory, which is where the task will run.
     """
     out = []
     for name, pool in pools.items():
@@ -184,6 +208,8 @@ def eligible_for(shape: str, pools: dict[str, Pool]) -> list[str]:
         if pool.health_url and not probe_health(pool.health_url):
             continue
         if pool.requires_subcommand and not subcommand_available(pool.requires_subcommand):
+            continue
+        if pool.precheck and not precheck_passes(pool.precheck):
             continue
         out.append(name)
     return out

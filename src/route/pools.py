@@ -115,6 +115,13 @@ class Pool:
     #: ``"<tool> <subcommand>"`` that must appear in ``<tool> --help`` for the
     #: arm to be eligible; a missing subcommand removes the arm.
     requires_subcommand: str = ""
+    #: Command run in the task's directory before the arm is eligible. A
+    #: non-zero exit, a missing tool or a timeout removes the arm, so it fails
+    #: closed. For arms that can only take some projects: a remote build
+    #: cluster asks "may this repo be sent there, and can it be built there?"
+    #: (``hrun check . --quiet``). Never part of dispatch: it must be quick
+    #: and must not change anything.
+    precheck: str = ""
     model: Model = field(default_factory=lambda: Model(name="unknown"))
     #: Server-authoritative fan-out limit (Kimi's /usages parallel.limit is
     #: 30 on ADVANCED). A swarm is a property of DISPATCH, never a separate
@@ -306,6 +313,7 @@ def load_pools(path: str | Path | None = None) -> dict[str, Pool]:
             endpoint=str(spec.get("endpoint", "")),
             health_url=str(spec.get("health_url", "")),
             requires_subcommand=str(spec.get("requires_subcommand", "")),
+            precheck=str(spec.get("precheck", "")),
             model=Model(
                 name=str(model_spec.get("name", "unknown")),
                 quant=str(model_spec.get("quant", "")),
